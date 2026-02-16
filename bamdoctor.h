@@ -69,6 +69,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
     int counts[1024] = {0};
     syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> sr{8, density, 423, static_cast<unsigned int>(-1)};
     charsi chs;
+    pos_scratch pos_buf;
     auto job = [&]() -> std::function<int(bam1_t *, lps *)> {
         if (job_type == "read_count"){
             return [](bam1_t *, lps *) -> int {
@@ -79,7 +80,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
             return [&, lcp_level](bam1_t *bamdata, lps *str) -> int {
                 lcp_read lr;
                 lr.clear();
-                syncmer_lcp::parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr);
+                parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr, pos_buf);
                 // if (lr.cores.size() < LCMER_L + 2) {
                 //     return 0;
                 // }

@@ -7,7 +7,7 @@
 #include <htslib/thread_pool.h>
 #include <stdio.h>
 
-#include <Eigen/Dense>
+#include <stack>
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -23,10 +23,10 @@
 #include <limits>
 #include <optional>
 #include <queue>
-#include <stack>
 #include <string>
 #include <tuple>
 #include <utility>
+#include <Eigen/Dense>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -288,6 +288,7 @@ struct assembler {
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
         charsi chs;
+        pos_scratch pos_buf;
         lcp_read lr;
         while (true) {
             if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
@@ -302,7 +303,7 @@ struct assembler {
             lr.clear();
             parse_cores_from_bam_record(bam_get_seq(data_p),
                                         data_p->core.l_qseq, lcp_level, &str,
-                                        syncmer_functor, chs, lr);
+                                        syncmer_functor, chs, lr, pos_buf);
             if (lr.cores.size() < LCMER_L + 2) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
@@ -383,6 +384,7 @@ struct assembler {
         return true;
     }
 
+
     auto construct_dbg() {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
@@ -408,7 +410,6 @@ struct assembler {
 
         if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
                            threads.io)) {
-            //Should print error in generate_data
             exit(-1);
         }
 
@@ -726,10 +727,9 @@ struct assembler {
         return layouts;
     }
 
-    /// Least-squares layout computation (based on order_prototype.py
-    /// order_lstsq). Instead of BFS traversal, this method considers ALL edges
-    /// simultaneously and finds globally optimal positions that minimize
-    /// squared error.
+    /// Least-squares layout computation (based on order_prototype.py order_lstsq).
+    /// Instead of BFS traversal, this method considers ALL edges simultaneously
+    /// and finds globally optimal positions that minimize squared error.
     auto connected_comp_plus_layout_lstsq(
         const gtl::btree_multimap<u64, rev_match> &recig) {
         gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
@@ -1395,7 +1395,7 @@ struct assembler {
                 all_n.load() - bad.load(), hits.load());
         // auto layouts = connected_comp_plus_layout(reciprocal);
         auto layouts = connected_comp_plus_layout_lstsq(reciprocal);
-#if 0
+#if 1
         int cc = 0;
         for (auto &l : layouts) {
             fprintf(stdout, "# Layout %d:\n", cc++);
@@ -1629,7 +1629,7 @@ struct assembler {
         }();
 
         auto next_tension_cores = [&]() {
-            if (next.empty()) {
+            if(next.empty()){
                 return lcp_read{};
             }
             if (!forward) {
@@ -1730,7 +1730,7 @@ struct assembler {
             int max_start = INT_MIN;
             int leftmost_span = INT_MIN;
             int rightmost_span = INT_MIN;
-            bool start_orient_forward = true;
+	    bool start_orient_forward = true;
             for (const auto &[node_id, start_end_orient] : layout) {
                 auto [start_core, end_core, orient] = start_end_orient;
                 (void)orient;
@@ -1741,7 +1741,7 @@ struct assembler {
                     (start_core == min_start && s > leftmost_span)) {
                     min_start = start_core;
                     leftmost = node_id;
-                    start_orient_forward = orient;
+		    start_orient_forward =orient;
                     leftmost_span = s;
                 }
 
@@ -1757,7 +1757,7 @@ struct assembler {
         auto &dbg = dbgi.dbg;
         u64 layout_no = 0;
         charsi chs;
-
+        u64 lcmer_index = 0;
         auto single_node_print = [&out, &layout_no, &dbg,
                                   &chs](decltype(*layouts.begin()) &layout) {
             fprintf(out, ">M%llu %zu\n", layout_no, layout.size());
@@ -1773,39 +1773,39 @@ struct assembler {
             fprintf(out, "\n");
         };
 
-        // auto iterate_until_lcmer_is_found =
-        //     [&](const lcp_read &lr, const lcmer<LCMER_L> &needle) -> long long {
-        //     // Search entire sequence thoroughly - no skipping
-        //     if (lr.cores.size() < LCMER_L) {
-        //         return -2;
-        //     }
-        //     lcmer<LCMER_L> l{lr.cores.begin()};
-        //     if (needle == l) {
-        //         return 0;
-        //     }
-        //     // Search all positions from 1 to the last valid lcmer position
-        //     for (long long i = 1;
-        //          i <= static_cast<long long>(lr.cores.size() - LCMER_L); ++i) {
-        //         uint32_t in_core = lr.cores[i + LCMER_L - 1];
-        //         l.update_lcmer(in_core);
-        //         if (needle == l) {
-        //             return i;
-        //         }
-        //     }
-        //     return -1;
-        // };
+        auto iterate_until_lcmer_is_found =
+            [&](const lcp_read &lr, const lcmer<LCMER_L> &needle) -> long long {
+            // Search entire sequence thoroughly - no skipping
+            if (lr.cores.size() < LCMER_L) {
+                return -2;
+            }
+            lcmer<LCMER_L> l{lr.cores.begin()};
+            if (needle == l) {
+                return 0;
+            }
+            // Search all positions from 1 to the last valid lcmer position
+            for (long long i = 1;
+                 i <= static_cast<long long>(lr.cores.size() - LCMER_L); ++i) {
+                uint32_t in_core = lr.cores[i + LCMER_L - 1];
+                l.update_lcmer(in_core);
+                if (needle == l) {
+                    return i;
+                }
+            }
+            return -1;
+        };
 
-        // auto find_rev_match =
-        //     [](const gtl::btree_multimap<u64, rev_match> &reciprocal, u64 left,
-        //        u64 right) -> rev_match {
-        //     auto range = reciprocal.equal_range(left);
-        //     for (auto it = range.first; it != range.second; ++it) {
-        //         if (it->second.node == right) {
-        //             return it->second;
-        //         }
-        //     }
-        //     throw std::runtime_error("No rev match found");
-        // };
+        auto find_rev_match =
+            [](const gtl::btree_multimap<u64, rev_match> &reciprocal, u64 left,
+               u64 right) -> rev_match {
+            auto range = reciprocal.equal_range(left);
+            for (auto it = range.first; it != range.second; ++it) {
+                if (it->second.node == right) {
+                    return it->second;
+                }
+            }
+            throw std::runtime_error("No rev match found");
+        };
 
         for (const auto &layout : layouts) {
             if (layout.size() <= 2) {
@@ -1819,8 +1819,7 @@ struct assembler {
                     merged_seqs;  // per entry we get hte sequences. Even
                                   // forward
 
-                auto [source, target, oriori] =
-                    identify_component_endpoints(layout);
+                auto [source, target, oriori] = identify_component_endpoints(layout);
                 auto path =
                     shortest_path_unweighted_bfs(reciprocal, source, target);
                 assert(path.size() > 0);
@@ -1835,8 +1834,8 @@ struct assembler {
                     u64 left = path[i];
                     u64 right = path[i + 1];
 
-                    // rev_match left_right_match =
-                    //     find_rev_match(reciprocal, left, right);
+                    rev_match left_right_match =
+                        find_rev_match(reciprocal, left, right);
 
                     auto left_dbg_it = dbg.find(left);
                     auto right_dbg_it = dbg.find(right);
@@ -1844,9 +1843,8 @@ struct assembler {
                     prev_anchor = find_anchors_and_extend_the_ctg_builder(
                         base, left_dbg_it->second.seq, right_dbg_it->second.seq,
                         prev_anchor, oriori);
-                    oriori = !oriori;
-                    fprintf(stderr, "Extending: %llu with %llu\n", layout_no,
-                            path[i]);
+		    oriori = !oriori;
+                    fprintf(stderr, "Extending: %llu with %llu\n", layout_no, path[i]);
                     // auto l_lr = build_lr_cores(left_dbg_it->second.seq,
                     //                            syncmer_functor, lcp_level);
                     // auto r_lr = build_lr_cores(dbg.find(right)->second.seq,
@@ -2005,16 +2003,16 @@ struct assembler {
                     fprintf(out, "%s", chs.data);
                 }
                 fprintf(out, "\n");
-                for (u64 node : path) {
-                    auto it = dbg.find(node);
-                    fprintf(out, ">Z%llu L%llu\n", node, layout_no);
-                    for (const SequenceContainerType &s : it->second.seq) {
-                        chs.require(s.len);
-                        s.convert_to_ascii((char *)chs.data);
-                        fprintf(out, "%s", chs.data);
-                    }
-                    fprintf(out, "\n");
-                }
+		for (u64 node : path) {
+			auto it = dbg.find(node);
+			fprintf(out, ">Z%llu L%llu\n", node, layout_no);
+			for (const SequenceContainerType &s : it->second.seq) {
+				chs.require(s.len);
+				s.convert_to_ascii((char *)chs.data);
+				fprintf(out, "%s", chs.data);
+			}
+			fprintf(out, "\n");
+		}
             }
             ++layout_no;
         }
@@ -2399,6 +2397,11 @@ struct assembler {
                         fprintf(out, "%s", buf_at);
                         total_len += s.len;
                     } else if (skipped + s.len > bases_to_skip) {
+                        // Partial skip: print only the suffix beyond
+                        // bases_to_skip. NOTE: The previous code printed
+                        // the entire segment, duplicating overlaps and
+                        // inflating assemblies. This fix assumes ASCII
+                        // encoding with 1 char/base.
                         const size_t local_skip = bases_to_skip - skipped;
                         buf.require(s.len + 32);
                         const char *buf_at =
@@ -2485,25 +2488,12 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
-
-
-
-    auto [recig, layouts] = as.fold_dbg_graph(dbg);
-    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Fold graph");
-
-    // GraphCleaning::run(dbg, cfg, );
-
-    FILE *out = fopen(cfg.output.c_str(), "w");
-
-
-    // assembler::print_merged_layouts(out, layouts, dbg.dbg);
-    as.merge_layouts_ultra(out, layouts, recig, dbg);
-    // assembler::print_merged_layouts_weave_majority_orientation(out,
-    // recig, std::move(layouts), dbg.dbg);
-    //  Print remaining unmerged nodes (their sequences weren't cleared)
-    // print_dbg_seqs(out, dbg);
-    fclose(out);
-    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");
+    // Later stages commented out for profiling graph building
+    {
+        FILE *out = fopen(cfg.output.c_str(), "w");
+        print_dbg_seqs(out, dbg);
+        fclose(out);
+    }
 
     return 0;
 }
