@@ -1,19 +1,19 @@
 #pragma once
-#include <cstdint>
-
-#include "nibble2base.hpp"
+#include "htslib/hts.h"
 #ifndef LCMER_H
 #define LCMER_H
 #include <htslib/sam.h>
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
 #include <string>
 
 #include "ext/lcptools/lcptools_ho.h"
+#include "nibble2base.hpp"
 using SequenceContainerType = CrumbledSubSeq64;
 
 // Makes sure we have enough scratch space
@@ -336,7 +336,7 @@ struct KmerViewOnCrumbs64 {
     KmerViewOnCrumbs64(int_type k)
         : k{k}, kmask{((int_type)1 << (2 * k)) - 1}, value{0}, prev{255} {}
 
-    static inline uint8_t base_at(const uint64_t *data_words, size_t index) {
+    static uint8_t base_at(const uint64_t *data_words, size_t index) {
         const size_t bit_index = index * 2;
         return static_cast<uint8_t>(
             (data_words[bit_index >> 6] >> (bit_index & 63)) & mask);
@@ -486,71 +486,20 @@ void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &c);
 void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
                                        charsi &c);
 
-inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
-                                    struct lps *str,
-                                    const auto &syncmer_functor) {
-    int core_index = 0;
-    const auto k = syncmer_functor.k();
-    KmerViewOnInts<uint64_t, 2> kmer_view{k};
-    int64_t it1 = kmer_view.fill_rle(data, len);
-    if (str->capacity < len * CONSTANT_FACTOR) {
-        str->capacity = 2 * len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
-    }
-    const int64_t limit = len - k;
-    auto *cores = str->cores;
-    for (; it1 < limit;) {
-        const auto kmer = kmer_view.get();
-        if (syncmer_functor(kmer)) {
-            init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1, it1 + k,
-                                     k);
-            core_index++;
-        }
-        it1 = kmer_view.move_get_rle(data, it1, len);
-    }
-    return core_index;
-}
-inline uint64_t parse1_CrumbledSubSeqs_syncmers(
-    const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
-    const auto &syncmer_functor) {
-    int core_index = 0;
-    if (sseqs.empty()) {
-        fprintf(stderr, "Error: Empty sequence list\n");
-        return core_index;
-    }
-    KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
-    size_t it1 =
-        kmer_view.fill_rle(sseqs[0].data, sseqs[0].len + sseqs[0].skip_first_n,
-                           sseqs[0].skip_first_n);
-    size_t l_so_far = 0;
-    for (size_t i = 0; i < sseqs.size(); ++i) {
-        for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
-            if (syncmer_functor(kmer_view.get())) {
-                init_core_kmer<uint32_t>(&(str->cores[core_index]),
-                                         kmer_view.get(),
-                                         l_so_far + it1 - sseqs[i].skip_first_n,
-                                         l_so_far + it1 + syncmer_functor.k() -
-                                             sseqs[i].skip_first_n,
-                                         syncmer_functor.k());
-                core_index++;
-            }
-            it1 = kmer_view.move_get_rle(sseqs[i].data, it1,
-                                         sseqs[i].len + sseqs[i].skip_first_n);
-        }
-        if (sseqs.size() > i + 1) {
-            it1 = sseqs[i + 1].skip_first_n;
-        }
-        l_so_far += sseqs[i].len;
-    }
-    return core_index;
+static void init_core1hot(struct core *cr, const uint8_t *data, uint64_t from,
+                          uint64_t distance, uint64_t start_index,
+                          uint64_t end_index) {
+    cr->start = start_index;
+    cr->end = end_index;
+    cr->label = 0;
+    cr->label |= ((distance - 2) << 6);
+    cr->label |= (seq_nt16_int[bam_seqi(data, from)] << 4);
+    cr->label |= (seq_nt16_int[bam_seqi(data, from + distance - 2)] << 2);
+    cr->label |= (seq_nt16_int[bam_seqi(data, from + distance - 1)]);
+    cr->bit_rep = 0x8000000000000000 | cr->label;
+    cr->bit_size = 2 * distance;
 }
 
-uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
-
-/// @brief Initializes an lps struct with a given sequence in the bam compressed
-// void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
-//
 inline void prepare_lps(lps *lps_ptr, size_t len) {
     lps_ptr->level = 1;
     if (lps_ptr->cores == nullptr) {
@@ -562,50 +511,487 @@ inline void prepare_lps(lps *lps_ptr, size_t len) {
         if (lps_ptr->capacity < len / CONSTANT_FACTOR) {
             lps_ptr->capacity = len / CONSTANT_FACTOR;
             lps_ptr->cores = (struct core *)realloc(
-                lps_ptr->cores, (len / CONSTANT_FACTOR) * sizeof(struct core));
+                lps_ptr->cores,
+                (len / CONSTANT_FACTOR) * sizeof(struct core));
         }
     }
 }
-inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
-                         const auto &syncmer_functor) {
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
-}
+struct base_lcp {
+    static uint64_t parse1_frombam(const uint8_t *data, int64_t len,
+                                   struct core *cores, uint64_t offset) {
+        int64_t begin = 0;
+        int64_t end = len;
+        int64_t it1 = begin;
+        int64_t it2 = end;
+        int64_t core_index = 0;
+        int64_t last_invalid_char_index = -1;
 
-inline void init_lps_crumbled(lps *lps_ptr,
-                              const gtl::vector<SequenceContainerType> &sseqs,
-                              const auto &syncmer_functor) {
-    size_t len = 0;
+        // find lcp cores
+        for (; it1 + 2 < end; it1++) {
+            // skip invalid character
+            int base = seq_nt16_int[bam_seqi(data, it1)];
+            int next_base = seq_nt16_int[bam_seqi(data, it1 + 1)];
+            int next_next_base = seq_nt16_int[bam_seqi(data, it1 + 2)];
 
-    for (auto &sseq : sseqs) {
-        len += sseq.len;
+            if (base == -1) {
+                last_invalid_char_index = it1 - begin;
+                continue;
+            }
+
+            if (base == next_base) {
+                continue;
+            }
+
+            // check for RINT core
+            if (next_base == next_next_base) {
+                // count middle characters
+                uint32_t middle_count = 1;
+                int64_t temp = it1 + 2;
+                while (temp < end && seq_nt16_int[bam_seqi(data, temp - 1)] ==
+                                         seq_nt16_int[bam_seqi(data, temp)]) {
+                    temp++;
+                    middle_count++;
+                }
+                if (temp != end) {
+                    // check if there is any SSEQ cores left behind
+                    if (it2 < it1 &&
+                        last_invalid_char_index < it2 - begin - 1) {
+                        init_core1hot(&(cores[core_index]), data, it2 - 1,
+                                      it1 - it2 + 2, it2 - begin - 1 + offset,
+                                      it1 - begin + 1 + offset);
+                        core_index++;
+                    }
+
+                    // create RINT core
+                    it2 = it1 + 2 + middle_count;
+                    init_core1hot(&(cores[core_index]), data, it1,
+                                  2 + middle_count, it1 - begin + offset,
+                                  it2 - begin + offset);
+                    core_index++;
+
+                    continue;
+                }
+            }
+
+            if (base > next_base && next_base < next_next_base) {
+                // check if there is any SSEQ cores left behind
+                if (it2 < it1 && last_invalid_char_index < it2 - begin - 1) {
+                    init_core1hot(&(cores[core_index]), data, it2 - 1,
+                                  it1 - it2 + 2, it2 - begin - 1 + offset,
+                                  it1 - begin + 1 + offset);
+                    core_index++;
+                }
+
+                // create LMIN core
+                it2 = it1 + 3;
+                init_core1hot(&(cores[core_index]), data, it1, 3,
+                              it1 - begin + offset, it2 - begin + offset);
+                core_index++;
+
+                continue;
+            }
+
+            if (begin == it1) {
+                continue;
+            }
+
+            // check for LMAX
+            if (it1 + 3 < end && base < next_base &&
+                next_base > next_next_base &&
+                seq_nt16_int[bam_seqi(data, it1 - 1)] <= base &&
+                next_next_base >= seq_nt16_int[bam_seqi(data, it1 + 3)]) {
+                // check if there is any SSEQ cores left behind
+                if (it2 < it1 && last_invalid_char_index < it2 - begin - 1) {
+                    init_core1hot(&(cores[core_index]), data, it2 - 1,
+                                  it1 - it2 + 2, it2 - begin - 1 + offset,
+                                  it1 - begin + 1 + offset);
+                    core_index++;
+                }
+
+                // create LMAX core
+                it2 = it1 + 3;
+                init_core1hot(&(cores[core_index]), data, it1, 3,
+                              it1 - begin + offset, it2 - begin + offset);
+                core_index++;
+
+                continue;
+            }
+        }
+
+        return core_index;
     }
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size =
-        parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
-    assert(lps_ptr->size < lps_ptr->capacity);
-}
+    static uint64_t parse1_from_SCT_vec(const gtl::vector<SequenceContainerType> &sseqs, struct core *cores, uint64_t offset){
+        if (sseqs.empty()) return 0;
 
+        int64_t total_len = 0;
+        for (const auto &s : sseqs) total_len += static_cast<int64_t>(s.len);
+        if (total_len < 3) return 0;
+
+        // Sequential cursor over the concatenated fragments
+        size_t cur_frag = 0, cur_local = 0;
+
+        auto cursor_valid = [&]() -> bool {
+            return cur_frag < sseqs.size();
+        };
+
+        auto read_at_cursor = [&]() -> int {
+            const auto &f = sseqs[cur_frag];
+            size_t bi = (static_cast<size_t>(f.skip_first_n) + cur_local) * 2;
+            return static_cast<int>((f.data[bi >> 6] >> (bi & 63)) & 0x3);
+        };
+
+        auto advance_cursor = [&]() {
+            if (++cur_local >= sseqs[cur_frag].len) {
+                cur_frag++;
+                cur_local = 0;
+            }
+        };
+
+        auto read_and_advance = [&]() -> int {
+            int b = read_at_cursor();
+            advance_cursor();
+            return b;
+        };
+
+        // Init core from three explicit base values (mirrors init_core1hot)
+        auto init_core_from_bases = [](struct core *cr, int first_base,
+                                       int penult_base, int last_base,
+                                       uint64_t distance, uint64_t start_index,
+                                       uint64_t end_index) {
+            cr->start = start_index;
+            cr->end = end_index;
+            cr->label = 0;
+            cr->label |= ((distance - 2) << 6);
+            cr->label |= (static_cast<uint64_t>(first_base) << 4);
+            cr->label |= (static_cast<uint64_t>(penult_base) << 2);
+            cr->label |= static_cast<uint64_t>(last_base);
+            cr->bit_rep = 0x8000000000000000 | cr->label;
+            cr->bit_size = 2 * distance;
+        };
+
+        // Sliding window: buf[0]=it1-1, buf[1]=it1, buf[2]=it1+1,
+        //                  buf[3]=it1+2, buf[4]=it1+3
+        int buf[5];
+        buf[0] = -1; // sentinel, no base before position 0
+        buf[1] = read_and_advance();
+        buf[2] = read_and_advance();
+        buf[3] = read_and_advance();
+        buf[4] = cursor_valid() ? read_and_advance() : -1;
+
+        int64_t begin = 0;
+        int64_t end = total_len;
+        int64_t it1 = begin;
+        int64_t it2 = end;
+        int64_t core_index = 0;
+        int cached_it2_base = -1; // base at position it2-1, set when it2 changes
+
+        // find lcp cores
+        for (; it1 + 2 < end; it1++) {
+            // shift the window (skip on first iteration — already filled)
+            if (it1 > begin) {
+                buf[0] = buf[1];
+                buf[1] = buf[2];
+                buf[2] = buf[3];
+                buf[3] = buf[4];
+                buf[4] = cursor_valid() ? read_and_advance() : -1;
+            }
+
+            int base = buf[1];
+            int next_base = buf[2];
+            int next_next_base = buf[3];
+
+            if (base == next_base) {
+                continue;
+            }
+
+            // check for RINT core
+            if (next_base == next_next_base) {
+                // count middle characters using buffer then cursor fork
+                uint32_t middle_count = 1;
+                int64_t temp = it1 + 2;
+                int rint_last_base = -1;
+
+                // save cursor so the forward scan doesn't consume it
+                size_t save_frag = cur_frag, save_local = cur_local;
+
+                int prev_scan = buf[2]; // base[it1+1]
+                while (temp < end) {
+                    int curr_scan;
+                    int64_t buf_idx = temp - it1 + 1;
+                    if (buf_idx <= 4) {
+                        curr_scan = buf[buf_idx];
+                    } else {
+                        if (!cursor_valid()) break;
+                        curr_scan = read_and_advance();
+                    }
+                    if (prev_scan != curr_scan) {
+                        rint_last_base = curr_scan;
+                        break;
+                    }
+                    temp++;
+                    middle_count++;
+                    prev_scan = curr_scan;
+                }
+
+                // restore cursor
+                cur_frag = save_frag;
+                cur_local = save_local;
+
+                if (temp != end) {
+                    // check if there is any SSEQ cores left behind
+                    if (it2 < it1) {
+                        init_core_from_bases(&(cores[core_index]),
+                                             cached_it2_base, buf[0], buf[1],
+                                             it1 - it2 + 2,
+                                             it2 - begin - 1 + offset,
+                                             it1 - begin + 1 + offset);
+                        core_index++;
+                    }
+
+                    // create RINT core
+                    it2 = it1 + 2 + middle_count;
+                    cached_it2_base = rint_last_base;
+                    init_core_from_bases(&(cores[core_index]),
+                                         buf[1], next_base, rint_last_base,
+                                         2 + middle_count,
+                                         it1 - begin + offset,
+                                         it2 - begin + offset);
+                    core_index++;
+
+                    continue;
+                }
+            }
+
+            if (base > next_base && next_base < next_next_base) {
+                // check if there is any SSEQ cores left behind
+                if (it2 < it1) {
+                    init_core_from_bases(&(cores[core_index]),
+                                         cached_it2_base, buf[0], buf[1],
+                                         it1 - it2 + 2,
+                                         it2 - begin - 1 + offset,
+                                         it1 - begin + 1 + offset);
+                    core_index++;
+                }
+
+                // create LMIN core
+                it2 = it1 + 3;
+                cached_it2_base = buf[3];
+                init_core_from_bases(&(cores[core_index]),
+                                     buf[1], buf[2], buf[3],
+                                     3, it1 - begin + offset,
+                                     it2 - begin + offset);
+                core_index++;
+
+                continue;
+            }
+
+            if (begin == it1) {
+                continue;
+            }
+
+            // check for LMAX
+            if (it1 + 3 < end && base < next_base &&
+                next_base > next_next_base &&
+                buf[0] <= base &&
+                next_next_base >= buf[4]) {
+                // check if there is any SSEQ cores left behind
+                if (it2 < it1) {
+                    init_core_from_bases(&(cores[core_index]),
+                                         cached_it2_base, buf[0], buf[1],
+                                         it1 - it2 + 2,
+                                         it2 - begin - 1 + offset,
+                                         it1 - begin + 1 + offset);
+                    core_index++;
+                }
+
+                // create LMAX core
+                it2 = it1 + 3;
+                cached_it2_base = buf[3];
+                init_core_from_bases(&(cores[core_index]),
+                                     buf[1], buf[2], buf[3],
+                                     3, it1 - begin + offset,
+                                     it2 - begin + offset);
+                core_index++;
+
+                continue;
+            }
+        }
+
+        return core_index;
+    }
+    static void init_lps_crumbled(
+        lps *lps_ptr, const gtl::vector<SequenceContainerType> &sseqs,
+        const auto &syncmer_functor) {
+        size_t len = 0;
+
+        for (auto &sseq : sseqs) {
+            len += sseq.len;
+        }
+        prepare_lps(lps_ptr, len);
+        lps_ptr->size =
+            parse1_from_SCT_vec(sseqs, lps_ptr->cores, 0);
+        assert(lps_ptr->size < lps_ptr->capacity);
+    }
+    static void init_lps_bam(struct lps *lps_ptr, const uint8_t *str, int len) {
+        prepare_lps(lps_ptr, len);
+        lps_ptr->size = parse1_frombam(str, len, lps_ptr->cores, 0);
+    }
+
+    static void parse_cores_from_bam_record(const uint8_t *data, size_t len,
+                                            int lcp_level, lps *str,
+                                            const auto &syncmer_functor,
+                                            charsi &chs, lcp_read &lr,
+                                            bool reversed = false) {
+        // parse1_frombam (and init_core1hot) read bases via bam_seqi() +
+        // seq_nt16_int[], so they require nibble-packed data — pass directly.
+        (void)syncmer_functor;
+        (void)chs;
+        (void)reversed; // TODO: reverse-complement not yet supported for pure_lcp BAM path
+        init_lps_bam(str, data, len);
+        lps_deepen(str, lcp_level);
+
+        for (int i = 0; i < str->size; ++i) {
+            lr.cores.emplace_back(str->cores[i].label);
+            lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
+        }
+        lr.data = data;
+    }
+};
+
+struct syncmer_lcp {
+    static uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
+                                        struct lps *str,
+                                        const auto &syncmer_functor) {
+        int core_index = 0;
+        const auto k = syncmer_functor.k();
+        KmerViewOnInts<uint64_t, 2> kmer_view{k};
+        int64_t it1 = kmer_view.fill_rle(data, len);
+        if (str->capacity < len * CONSTANT_FACTOR) {
+            str->capacity = 2 * len * CONSTANT_FACTOR;
+            str->cores = (struct core *)realloc(
+                str->cores, (str->capacity) * sizeof(struct core));
+        }
+        const int64_t limit = len - k;
+        auto *cores = str->cores;
+        for (; it1 < limit;) {
+            const auto kmer = kmer_view.get();
+            if (syncmer_functor(kmer)) {
+                init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1,
+                                         it1 + k, k);
+                core_index++;
+            }
+            it1 = kmer_view.move_get_rle(data, it1, len);
+        }
+        return core_index;
+    }
+    static uint64_t parse1_CrumbledSubSeqs_syncmers(
+        const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
+        const auto &syncmer_functor) {
+        int core_index = 0;
+        if (sseqs.empty()) {
+            fprintf(stderr, "Error: Empty sequence list\n");
+            return core_index;
+        }
+        KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
+        size_t it1 = kmer_view.fill_rle(sseqs[0].data,
+                                        sseqs[0].len + sseqs[0].skip_first_n,
+                                        sseqs[0].skip_first_n);
+        size_t l_so_far = 0;
+        for (size_t i = 0; i < sseqs.size(); ++i) {
+            for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
+                if (syncmer_functor(kmer_view.get())) {
+                    init_core_kmer<uint32_t>(
+                        &(str->cores[core_index]), kmer_view.get(),
+                        l_so_far + it1 - sseqs[i].skip_first_n,
+                        l_so_far + it1 + syncmer_functor.k() -
+                            sseqs[i].skip_first_n,
+                        syncmer_functor.k());
+                    core_index++;
+                }
+                it1 = kmer_view.move_get_rle(
+                    sseqs[i].data, it1, sseqs[i].len + sseqs[i].skip_first_n);
+            }
+            if (sseqs.size() > i + 1) {
+                it1 = sseqs[i + 1].skip_first_n;
+            }
+            l_so_far += sseqs[i].len;
+        }
+        return core_index;
+    }
+
+    uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len,
+                             struct core *cores);
+
+    /// @brief Initializes an lps struct with a given sequence in the bam
+    /// compressed
+    // void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len);
+    //
+
+    static void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
+                             const auto &syncmer_functor) {
+        prepare_lps(lps_ptr, len);
+        lps_ptr->size =
+            parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor);
+    }
+
+    static void init_lps_crumbled(
+        lps *lps_ptr, const gtl::vector<SequenceContainerType> &sseqs,
+        const auto &syncmer_functor) {
+        size_t len = 0;
+
+        for (auto &sseq : sseqs) {
+            len += sseq.len;
+        }
+        prepare_lps(lps_ptr, len);
+        lps_ptr->size =
+            parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+        assert(lps_ptr->size < lps_ptr->capacity);
+    }
+
+    static void parse_cores_from_bam_record(const uint8_t *data, size_t len,
+                                            int lcp_level, lps *str,
+                                            const auto &syncmer_functor,
+                                            charsi &chs, lcp_read &lr,
+                                            bool reversed = false) {
+        chs.require(len);
+        if (reversed) {
+            onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
+        } else {
+            onehotto2bitDNA_bivec_chs(data, len, chs);
+        }
+
+        init_lps_bam(str, chs.data, len, syncmer_functor);
+        lps_deepen(str, lcp_level);
+
+        for (int i = 0; i < str->size; ++i) {
+            lr.cores.emplace_back(str->cores[i].label);
+            lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
+        }
+        lr.data = data;
+    }
+};
+inline void init_lps_crumbled(
+    lps *lps_ptr, const gtl::vector<SequenceContainerType> &sseqs,
+    const auto &syncmer_functor) {
+    if(syncmer_functor.pure_lcp){
+        base_lcp::init_lps_crumbled(lps_ptr, sseqs, syncmer_functor);
+    }
+    else{
+        syncmer_lcp::init_lps_crumbled(lps_ptr, sseqs, syncmer_functor);
+    }
+}
 inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
                                         int lcp_level, lps *str,
                                         const auto &syncmer_functor,
                                         charsi &chs, lcp_read &lr,
                                         bool reversed = false) {
-    chs.require(len);
-    if (reversed) {
-        onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
+    if (syncmer_functor.pure_lcp) {
+        base_lcp::parse_cores_from_bam_record(
+            data, len, lcp_level, str, syncmer_functor, chs, lr, reversed);
     } else {
-        onehotto2bitDNA_bivec_chs(data, len, chs);
+        syncmer_lcp::parse_cores_from_bam_record(
+            data, len, lcp_level, str, syncmer_functor, chs, lr, reversed);
     }
-
-    init_lps_bam(str, chs.data, len, syncmer_functor);
-    lps_deepen(str, lcp_level);
-
-    for (int i = 0; i < str->size; ++i) {
-        lr.cores.emplace_back(str->cores[i].label);
-        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-    }
-    lr.data = data;
 }
 
 template <int lanes = 4>

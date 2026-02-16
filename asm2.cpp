@@ -1395,7 +1395,7 @@ struct assembler {
                 all_n.load() - bad.load(), hits.load());
         // auto layouts = connected_comp_plus_layout(reciprocal);
         auto layouts = connected_comp_plus_layout_lstsq(reciprocal);
-#if 1
+#if 0
         int cc = 0;
         for (auto &l : layouts) {
             fprintf(stdout, "# Layout %d:\n", cc++);
@@ -1757,7 +1757,7 @@ struct assembler {
         auto &dbg = dbgi.dbg;
         u64 layout_no = 0;
         charsi chs;
-        u64 lcmer_index = 0;
+
         auto single_node_print = [&out, &layout_no, &dbg,
                                   &chs](decltype(*layouts.begin()) &layout) {
             fprintf(out, ">M%llu %zu\n", layout_no, layout.size());
@@ -1773,39 +1773,39 @@ struct assembler {
             fprintf(out, "\n");
         };
 
-        auto iterate_until_lcmer_is_found =
-            [&](const lcp_read &lr, const lcmer<LCMER_L> &needle) -> long long {
-            // Search entire sequence thoroughly - no skipping
-            if (lr.cores.size() < LCMER_L) {
-                return -2;
-            }
-            lcmer<LCMER_L> l{lr.cores.begin()};
-            if (needle == l) {
-                return 0;
-            }
-            // Search all positions from 1 to the last valid lcmer position
-            for (long long i = 1;
-                 i <= static_cast<long long>(lr.cores.size() - LCMER_L); ++i) {
-                uint32_t in_core = lr.cores[i + LCMER_L - 1];
-                l.update_lcmer(in_core);
-                if (needle == l) {
-                    return i;
-                }
-            }
-            return -1;
-        };
+        // auto iterate_until_lcmer_is_found =
+        //     [&](const lcp_read &lr, const lcmer<LCMER_L> &needle) -> long long {
+        //     // Search entire sequence thoroughly - no skipping
+        //     if (lr.cores.size() < LCMER_L) {
+        //         return -2;
+        //     }
+        //     lcmer<LCMER_L> l{lr.cores.begin()};
+        //     if (needle == l) {
+        //         return 0;
+        //     }
+        //     // Search all positions from 1 to the last valid lcmer position
+        //     for (long long i = 1;
+        //          i <= static_cast<long long>(lr.cores.size() - LCMER_L); ++i) {
+        //         uint32_t in_core = lr.cores[i + LCMER_L - 1];
+        //         l.update_lcmer(in_core);
+        //         if (needle == l) {
+        //             return i;
+        //         }
+        //     }
+        //     return -1;
+        // };
 
-        auto find_rev_match =
-            [](const gtl::btree_multimap<u64, rev_match> &reciprocal, u64 left,
-               u64 right) -> rev_match {
-            auto range = reciprocal.equal_range(left);
-            for (auto it = range.first; it != range.second; ++it) {
-                if (it->second.node == right) {
-                    return it->second;
-                }
-            }
-            throw std::runtime_error("No rev match found");
-        };
+        // auto find_rev_match =
+        //     [](const gtl::btree_multimap<u64, rev_match> &reciprocal, u64 left,
+        //        u64 right) -> rev_match {
+        //     auto range = reciprocal.equal_range(left);
+        //     for (auto it = range.first; it != range.second; ++it) {
+        //         if (it->second.node == right) {
+        //             return it->second;
+        //         }
+        //     }
+        //     throw std::runtime_error("No rev match found");
+        // };
 
         for (const auto &layout : layouts) {
             if (layout.size() <= 2) {
@@ -1835,8 +1835,8 @@ struct assembler {
                     u64 left = path[i];
                     u64 right = path[i + 1];
 
-                    rev_match left_right_match =
-                        find_rev_match(reciprocal, left, right);
+                    // rev_match left_right_match =
+                    //     find_rev_match(reciprocal, left, right);
 
                     auto left_dbg_it = dbg.find(left);
                     auto right_dbg_it = dbg.find(right);
@@ -2399,11 +2399,6 @@ struct assembler {
                         fprintf(out, "%s", buf_at);
                         total_len += s.len;
                     } else if (skipped + s.len > bases_to_skip) {
-                        // Partial skip: print only the suffix beyond
-                        // bases_to_skip. NOTE: The previous code printed
-                        // the entire segment, duplicating overlaps and
-                        // inflating assemblies. This fix assumes ASCII
-                        // encoding with 1 char/base.
                         const size_t local_skip = bases_to_skip - skipped;
                         buf.require(s.len + 32);
                         const char *buf_at =
@@ -2490,12 +2485,16 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
+
+
+
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Fold graph");
 
     // GraphCleaning::run(dbg, cfg, );
 
     FILE *out = fopen(cfg.output.c_str(), "w");
+
 
     // assembler::print_merged_layouts(out, layouts, dbg.dbg);
     as.merge_layouts_ultra(out, layouts, recig, dbg);

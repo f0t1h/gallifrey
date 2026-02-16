@@ -61,7 +61,7 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level, d
     lcp_read lcps;
     while (reader.read(bamdata)) {
         lcps.clear();
-         parse_cores_from_bam_record(
+         syncmer_lcp::parse_cores_from_bam_record(
             bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &str,
             syncmer_functor, chs, lcps);
         stats["length"].update(bamdata->core.l_qseq);
