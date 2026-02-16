@@ -4,13 +4,17 @@
 #define PREV_WITH_VEC
 #define HT_SHARD_BC 8
 
+#include <atomic>
+#include <blockingconcurrentqueue.h>
 #include <cstdint>
+#include <cstdio>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
 #include <mutex>
 #include <string>
 #include <thread>
 #include <queue>
+#include <vector>
 
 #include "asm.h"
 #include "bloomfilter.h"
@@ -1272,50 +1276,165 @@ inline void print_raw_dbg(FILE *out, const dbg_index &dbgi) {
     }
 }
 
-inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi) {
-    charsi buf;
-    for (const auto &[lval, edges] : dbgi.dbg) {
-        // if (edges.redirected()) {
-        //     continue;
-        // }
-        if (edges.core_count == 0 && edges.prev.size() == 0) {
-            continue;
+__attribute__((format(printf, 2, 3)))
+static inline void vec_appendf(std::vector<char> &v, const char *fmt, ...) {
+    va_list args, args_copy;
+    va_start(args, fmt);
+    va_copy(args_copy, args);
+    int n = vsnprintf(nullptr, 0, fmt, args);
+    va_end(args);
+    if (n > 0) {
+        size_t old = v.size();
+        v.resize(old + static_cast<size_t>(n) + 1);
+        vsnprintf(v.data() + old, static_cast<size_t>(n) + 1, fmt, args_copy);
+        v.pop_back();  // drop the null terminator
+    }
+    va_end(args_copy);
+}
+
+inline void print_dbg_seqs(FILE *out, const dbg_index &dbgi,
+                           int nthreads = 0) {
+    if (nthreads <= 0)
+        nthreads = std::max(1u, std::thread::hardware_concurrency()) - 1;
+    if (nthreads < 1) nthreads = 1;
+
+    // Work item: a pointer into the dbg map (stable while we only read).
+    struct WorkItem {
+        uint64_t lval;
+        const typename dbg_index::bidbg_val *edges;
+    };
+
+    using work_q = moodycamel::BlockingConcurrentQueue<WorkItem>;
+    work_q work_queue;
+    std::atomic<bool> work_done{false};
+    std::atomic<int> active_workers{nthreads};
+    // ── Worker thread pool ──────────────────────────────────────────
+    // Each worker dequeues nodes, converts sequences to ASCII, formats
+    // the full S-line + L-lines into a vector<char>, then enqueues it.
+    // Format one node (S-line + L-lines) into line_buf.
+    auto format_node = [&](std::vector<char> &line_buf, const WorkItem &item) {
+        const auto &edges = *item.edges;
+        const uint64_t lval = item.lval;
+        line_buf.clear();
+
+        // Pre-compute total sequence length.
+        size_t sofar = 0;
+        for (const auto &s : edges.seq) {
+            sofar += s.len;
         }
 
-        //        __builtin_debugtrap();
-        if (edges.seq.size() == 0) {
-            continue;
-            // fprintf(out,
-            //         "S\tC%" PRIu64
-            //         "\t%s\tLN:i:%d\tRC:i:%u\tBE:i:%zu\tFE:i:%u\n",
-            //         lval, "", 0, edges.core_count, edges.prev.size(),
-            //         edges.forward_edge_count);
-        } else {
-            //            int i = onehotto2bitDNA2(s, buffer);
-            fprintf(out, "S\tC%" PRIu64 "\t", lval);
-            size_t sofar = 0;
-            //            for (const SequenceContainerType &s : edges.seq) {
-            // reversed
-            for (auto it = edges.seq.begin(); it != edges.seq.end(); ++it) {
-                const SequenceContainerType &s = *it;
-                buf.require(s.len + 32);
-                const char *buf_at = s.convert_to_ascii((char *)buf.data);
+        // S-line header.
+        vec_appendf(line_buf, "S\tC%" PRIu64 "\t", lval);
 
-                fprintf(out, "%s", buf_at);
-                sofar += s.len;
+        // Convert all sequence chunks directly into line_buf.
+        {
+            size_t seq_start = line_buf.size();
+            line_buf.resize(seq_start + sofar + 1);  // +1 for trailing \0
+            size_t offset = 0;
+            for (const auto &s : edges.seq) {
+                s.convert_to_ascii(line_buf.data() + seq_start + offset);
+                offset += s.len;
             }
-            fprintf(out, "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
+            line_buf.resize(seq_start + sofar);  // trim null terminator
+        }
+
+        // S-line trailer.
+        vec_appendf(line_buf,
+                    "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
                     sofar, (int)(edges.avg_core_count() * sofar),
                     edges.core_count, edges.prev.size(),
                     edges.forward_edge_count);
-        }
 
+        // L-lines for incoming edges.
         for (uint64_t nl : edges.prev) {
             if (dbgi.dbg.contains(nl))
-                fprintf(out, "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n", nl,
-                        lval, 0);
+                vec_appendf(line_buf,
+                            "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n",
+                            nl, lval, 0);
+        }
+    };
+
+
+    std::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (int i = 0; i < nthreads; ++i) {
+        workers.emplace_back([&] {
+            WorkItem item;
+            std::vector<char> line_buf;
+            line_buf.reserve(1 << 16);
+
+            while (true) {
+                if (!work_queue.wait_dequeue_timed(item,
+                                                   WAIT_QUEUE_TIMEOUT)) {
+                    if (work_done.load()) break;
+                    continue;
+                }
+                format_node(line_buf, item);
+                fwrite(line_buf.data(), line_buf.size(), 1, out);
+            }
+
+            // Drain remaining work after done flag is set.
+            while (work_queue.try_dequeue(item)) {
+                const auto &edges = *item.edges;
+                const uint64_t lval = item.lval;
+                line_buf.clear();
+
+                size_t sofar = 0;
+                for (const auto &s : edges.seq) {
+                    sofar += s.len;
+                }
+
+                vec_appendf(line_buf, "S\tC%" PRIu64 "\t", lval);
+
+                {
+                    size_t seq_start = line_buf.size();
+                    line_buf.resize(seq_start + sofar + 1);
+                    size_t offset = 0;
+                    for (const auto &s : edges.seq) {
+                        s.convert_to_ascii(line_buf.data() + seq_start +
+                                           offset);
+                        offset += s.len;
+                    }
+                    line_buf.resize(seq_start + sofar);
+                }
+
+                vec_appendf(
+                    line_buf,
+                    "\tLN:i:%zu\tRC:i:%d\tCC:i:%u\tBE:i:%zu\tFE:i:%u\n",
+                    sofar, (int)(edges.avg_core_count() * sofar),
+                    edges.core_count, edges.prev.size(),
+                    edges.forward_edge_count);
+
+                for (uint64_t nl : edges.prev) {
+                    if (dbgi.dbg.contains(nl))
+                        vec_appendf(
+                            line_buf,
+                            "L\tC%" PRIu64 "\t+\tC%" PRIu64 "\t+\t%dM\n",
+                            nl, lval, 0);
+                }
+                fwrite(line_buf.data(), line_buf.size(), 1, out);
+
+                line_buf.clear();
+            }
+            active_workers.fetch_sub(1);
+        });
+    }
+
+    // ── Producer: main thread enqueues work ─────────────────────────
+    for (const auto &[lval, edges] : dbgi.dbg) {
+        if (edges.core_count == 0 && edges.prev.size() == 0) continue;
+        if (edges.seq.size() == 0) continue;
+
+        while (!work_queue.try_enqueue(WorkItem{lval, &edges})) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
         }
     }
+    work_done.store(true);
+
+    for (auto &w : workers) w.join();
+    // All workers have exited and decremented active_workers to 0;
+    // the writer thread will notice and drain the output queue.
+
 }
 
 inline void print_dbg_dot(const dbg_index &dbgi, int i) {
