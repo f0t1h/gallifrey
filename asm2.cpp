@@ -23,6 +23,7 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <set>
 #include <stack>
 #include <string>
 #include <tuple>
@@ -2504,9 +2505,9 @@ int run_assembly(const asm_config &cfg) {
     // Find largest layout
 
     int hash_combine_len = LCMER_L;
-
+    u64 layout_idx = 0;
     for (const auto &current_layout : layouts) {
-        gtl::flat_hash_map<u64, dbg_index::bidbg_val> small_bg;
+        layout_small_graph small_bg;
         for (const auto &[ctg_id, layout] : current_layout) {
             auto [from, to, ori] = layout;
             auto nodeit = dbg.dbg.find(ctg_id);
@@ -2523,6 +2524,9 @@ int run_assembly(const asm_config &cfg) {
                 lps_deepen(&str, as.lcp_level);
                 // printf(">%llu +\n", ctg_id);
                 seqveciterator svit;
+                if (str.size > hash_combine_len) {
+                    svit.move_only(node.seq, str.cores[hash_combine_len - 1].end);
+                }
                 for (int i = 0; i < str.size; ++i) {
                     u64 before = hw;
                     hw ^= str.cores[i].label;
@@ -2556,6 +2560,9 @@ int run_assembly(const asm_config &cfg) {
                 lps_deepen(&str, as.lcp_level);
                 // printf(">%llu +\n", ctg_id);
 
+                if (str.size > hash_combine_len) {
+                    svit.move_only(rev_seqs, str.cores[hash_combine_len - 1].end);
+                }
                 for (int i = 0; i < str.size; ++i) {
                     u64 before = hw;
                     hw ^= str.cores[i].label;
@@ -2580,21 +2587,38 @@ int run_assembly(const asm_config &cfg) {
                     // str.cores[i].start, str.cores[i].end);
                 }
             }
-
-            charsi chs;
-            for (const auto &[k, v] : small_bg) {
-                printf("S\t%llu\t", k);
-                for (const SequenceContainerType &s : v.seq) {
-                    chs.require(s.len);
-                    s.convert_to_ascii((char *)chs.data);
-                    printf("%s\t", chs.data);
-                }
-                printf("\n");
-                for (const u64 pnode : v.prev) {
-                    printf("L\t%llu\t+\t%llu\t+\t0M\n", pnode, k);
-                }
-            }
         }
+        charsi chs;
+        printf("S\t%llu\t",layout_idx);
+        std::set<u64> ids_seen;
+        for (const auto &[id,s] : longest_path(small_bg) ){
+            auto it = ids_seen.find(id);
+            if(it != ids_seen.end()){
+                fprintf(stderr, "Duplicate ID: %llu\n", id);
+                __builtin_trap();
+            }
+            else{
+                ids_seen.insert(id);
+            }
+            chs.require(s[0].len);
+            s[0].convert_to_ascii((char *)chs.data);
+            printf("%s", chs.data);
+        }
+        printf("\n");
+        // charsi chs;
+        // for (const auto &[k, v] : small_bg) {
+        //     printf("S\t%llu\t", k);
+        //     for (const SequenceContainerType &s : v.seq) {
+        //         chs.require(s.len);
+        //         s.convert_to_ascii((char *)chs.data);
+        //         printf("%s\t", chs.data);
+        //     }
+        //     printf("\n");
+        //     for (const u64 pnode : v.prev) {
+        //         printf("L\t%llu\t+\t%llu\t+\t0M\n", pnode, k);
+        //     }
+        // }
+        layout_idx++;
     }
     return 0;
 }
