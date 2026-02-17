@@ -36,6 +36,7 @@
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
 #include "syncmer.h"
+#include "layout_graph.h"
 
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
