@@ -7,7 +7,7 @@
 #include <htslib/thread_pool.h>
 #include <stdio.h>
 
-#include <stack>
+#include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -23,10 +23,10 @@
 #include <limits>
 #include <optional>
 #include <queue>
+#include <stack>
 #include <string>
 #include <tuple>
 #include <utility>
-#include <Eigen/Dense>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -384,7 +384,6 @@ struct assembler {
         return true;
     }
 
-
     auto construct_dbg() {
         dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
@@ -727,9 +726,10 @@ struct assembler {
         return layouts;
     }
 
-    /// Least-squares layout computation (based on order_prototype.py order_lstsq).
-    /// Instead of BFS traversal, this method considers ALL edges simultaneously
-    /// and finds globally optimal positions that minimize squared error.
+    /// Least-squares layout computation (based on order_prototype.py
+    /// order_lstsq). Instead of BFS traversal, this method considers ALL edges
+    /// simultaneously and finds globally optimal positions that minimize
+    /// squared error.
     auto connected_comp_plus_layout_lstsq(
         const gtl::btree_multimap<u64, rev_match> &recig) {
         gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>
@@ -1395,7 +1395,7 @@ struct assembler {
                 all_n.load() - bad.load(), hits.load());
         // auto layouts = connected_comp_plus_layout(reciprocal);
         auto layouts = connected_comp_plus_layout_lstsq(reciprocal);
-#if 1
+#if 0
         int cc = 0;
         for (auto &l : layouts) {
             fprintf(stdout, "# Layout %d:\n", cc++);
@@ -1629,7 +1629,7 @@ struct assembler {
         }();
 
         auto next_tension_cores = [&]() {
-            if(next.empty()){
+            if (next.empty()) {
                 return lcp_read{};
             }
             if (!forward) {
@@ -1730,7 +1730,7 @@ struct assembler {
             int max_start = INT_MIN;
             int leftmost_span = INT_MIN;
             int rightmost_span = INT_MIN;
-	    bool start_orient_forward = true;
+            bool start_orient_forward = true;
             for (const auto &[node_id, start_end_orient] : layout) {
                 auto [start_core, end_core, orient] = start_end_orient;
                 (void)orient;
@@ -1741,7 +1741,7 @@ struct assembler {
                     (start_core == min_start && s > leftmost_span)) {
                     min_start = start_core;
                     leftmost = node_id;
-		    start_orient_forward =orient;
+                    start_orient_forward = orient;
                     leftmost_span = s;
                 }
 
@@ -1819,7 +1819,8 @@ struct assembler {
                     merged_seqs;  // per entry we get hte sequences. Even
                                   // forward
 
-                auto [source, target, oriori] = identify_component_endpoints(layout);
+                auto [source, target, oriori] =
+                    identify_component_endpoints(layout);
                 auto path =
                     shortest_path_unweighted_bfs(reciprocal, source, target);
                 assert(path.size() > 0);
@@ -1843,8 +1844,9 @@ struct assembler {
                     prev_anchor = find_anchors_and_extend_the_ctg_builder(
                         base, left_dbg_it->second.seq, right_dbg_it->second.seq,
                         prev_anchor, oriori);
-		    oriori = !oriori;
-                    fprintf(stderr, "Extending: %llu with %llu\n", layout_no, path[i]);
+                    oriori = !oriori;
+                    fprintf(stderr, "Extending: %llu with %llu\n", layout_no,
+                            path[i]);
                     // auto l_lr = build_lr_cores(left_dbg_it->second.seq,
                     //                            syncmer_functor, lcp_level);
                     // auto r_lr = build_lr_cores(dbg.find(right)->second.seq,
@@ -2003,16 +2005,16 @@ struct assembler {
                     fprintf(out, "%s", chs.data);
                 }
                 fprintf(out, "\n");
-		for (u64 node : path) {
-			auto it = dbg.find(node);
-			fprintf(out, ">Z%llu L%llu\n", node, layout_no);
-			for (const SequenceContainerType &s : it->second.seq) {
-				chs.require(s.len);
-				s.convert_to_ascii((char *)chs.data);
-				fprintf(out, "%s", chs.data);
-			}
-			fprintf(out, "\n");
-		}
+                for (u64 node : path) {
+                    auto it = dbg.find(node);
+                    fprintf(out, ">Z%llu L%llu\n", node, layout_no);
+                    for (const SequenceContainerType &s : it->second.seq) {
+                        chs.require(s.len);
+                        s.convert_to_ascii((char *)chs.data);
+                        fprintf(out, "%s", chs.data);
+                    }
+                    fprintf(out, "\n");
+                }
             }
             ++layout_no;
         }
@@ -2496,6 +2498,103 @@ int run_assembly(const asm_config &cfg) {
     }
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph printing");
 
+    // ultra
+    auto [recig, layouts] = as.fold_dbg_graph(dbg);
+    // Find largest layout
+
+    int hash_combine_len = LCMER_L;
+
+    for (const auto &current_layout : layouts) {
+        gtl::flat_hash_map<u64, dbg_index::bidbg_val> small_bg;
+        for (const auto &[ctg_id, layout] : current_layout) {
+            auto [from, to, ori] = layout;
+            auto nodeit = dbg.dbg.find(ctg_id);
+            if (nodeit == dbg.dbg.end()) {
+                fprintf(stderr, "Error: Node %llu not found in graph\n",
+                        ctg_id);
+                exit(EXIT_FAILURE);
+            }
+            auto &node = nodeit->second;
+            lps str = {0, 0, 0, 0};
+            u64 hw = 0;
+            if (ori) {
+                init_lps_crumbled(&str, node.seq, as.syncmer_functor);
+                lps_deepen(&str, as.lcp_level);
+                // printf(">%llu +\n", ctg_id);
+                seqveciterator svit;
+                for (int i = 0; i < str.size; ++i) {
+                    u64 before = hw;
+                    hw ^= str.cores[i].label;
+                    hw &= (0x00000000FFFFFFFFull);
+                    hw |= ((u64)str.cores[i].label << 32);
+
+                    if (i >= hash_combine_len) {
+                        hw ^= (str.cores[i - hash_combine_len].label);
+                        auto it_and_result =
+                            small_bg.try_emplace(hw, 1, before);
+                        if (!it_and_result.second) {  // Otherw
+                            it_and_result.first->second.core_count++;
+                            it_and_result.first->second.emplace_prev(before);
+                            svit.move_only(node.seq, str.cores[i].end);
+                        } else {  // If this is a new emplacement. Add its seq
+                            it_and_result.first->second.seq.emplace_back(
+                                svit.get_and_move(node.seq, str.cores[i].end));
+                        }
+                    }
+                    // printf("%llu %u %llu %llu %llu\n", hw,
+                    // str.cores[i].label, str.cores[i].bit_rep,
+                    // str.cores[i].start, str.cores[i].end);
+                }
+            } else {
+                gtl::vector<SequenceContainerType> rev_seqs;
+                for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
+                    rev_seqs.emplace_back(it->reverse_complement());
+                }
+                seqveciterator svit;
+                init_lps_crumbled(&str, rev_seqs, as.syncmer_functor);
+                lps_deepen(&str, as.lcp_level);
+                // printf(">%llu +\n", ctg_id);
+
+                for (int i = 0; i < str.size; ++i) {
+                    u64 before = hw;
+                    hw ^= str.cores[i].label;
+                    hw &= (0x00000000FFFFFFFFull);
+                    hw |= ((u64)str.cores[i].label << 32);
+
+                    if (i >= hash_combine_len) {
+                        hw ^= (str.cores[i - hash_combine_len].label);
+                        auto it_and_result =
+                            small_bg.try_emplace(hw, 1, before);
+                        if (!it_and_result.second) {  // Otherw
+                            it_and_result.first->second.core_count++;
+                            it_and_result.first->second.emplace_prev(before);
+                            svit.move_only(rev_seqs, str.cores[i].end);
+                        } else {  // If this is a new emplacement. Add its seq
+                            it_and_result.first->second.seq.emplace_back(
+                                svit.get_and_move(rev_seqs, str.cores[i].end));
+                        }
+                    }
+                    // printf("%llu %u %llu %llu %llu\n", hw,
+                    // str.cores[i].label, str.cores[i].bit_rep,
+                    // str.cores[i].start, str.cores[i].end);
+                }
+            }
+
+            charsi chs;
+            for (const auto &[k, v] : small_bg) {
+                printf("S\t%llu\t", k);
+                for (const SequenceContainerType &s : v.seq) {
+                    chs.require(s.len);
+                    s.convert_to_ascii((char *)chs.data);
+                    printf("%s\t", chs.data);
+                }
+                printf("\n");
+                for (const u64 pnode : v.prev) {
+                    printf("L\t%llu\t+\t%llu\t+\t0M\n", pnode, k);
+                }
+            }
+        }
+    }
     return 0;
 }
 
