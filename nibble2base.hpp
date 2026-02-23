@@ -579,11 +579,16 @@ struct CrumbledSubSeq64 {
     CrumbledSubSeq64(size_t length, uint8_t skip_bases) noexcept
         : len(length),
           skip_first_n(static_cast<uint8_t>(skip_bases & 63)),
-          data(new uint64_t[storage_size(length + skip_bases)]()) {}
+          data(new uint64_t[storage_size(length + skip_bases)]()),
+          origin_node(0) {}
     CrumbledSubSeq64() noexcept : CrumbledSubSeq64(0, 0) {}
     CrumbledSubSeq64(CrumbledSubSeq64 &&other) noexcept
-        : len(other.len), skip_first_n(other.skip_first_n), data(other.data) {
+        : len(other.len),
+          skip_first_n(other.skip_first_n),
+          data(other.data),
+          origin_node(other.origin_node) {
         other.data = nullptr;
+        other.origin_node = 0;
     }
 
     CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t start_idx, size_t from,
@@ -685,7 +690,9 @@ struct CrumbledSubSeq64 {
             data = other.data;
             skip_first_n = other.skip_first_n;
             len = other.len;
+            origin_node = other.origin_node;
             other.data = nullptr;
+            other.origin_node = 0;
         }
         return *this;
     }

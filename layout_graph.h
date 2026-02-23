@@ -4,15 +4,120 @@
 #include <gtl/vector.hpp>
 #include <gtl/phmap_fwd_decl.hpp>
 #include "graph.h"
+#include <algorithm>
+#include <cstring>
+#include <functional>
 #include <queue>
 
 using layout_small_graph = gtl::flat_hash_map<uint64_t, dbg_index::bidbg_val>;
+
+// Break cycles by duplicating the cycling sub-path.
+// Each cycle found via DFS is unrolled once: nodes are copied with fresh IDs
+// and the back-edge is redirected to the copy, turning the cycle into a linear tail.
+inline void unroll_cycles(layout_small_graph &lsg) {
+    u64 next_id = 0;
+    for (const auto &[id, _] : lsg)
+        next_id = std::max(next_id, id);
+    ++next_id;
+
+    for (;;) {
+        // Build forward adjacency from prev lists.
+        gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
+        for (const auto &[id, val] : lsg)
+            for (u64 p : val.prev)
+                if (lsg.contains(p))
+                    fwd[p].push_back(id);
+
+        // DFS to find one cycle.
+        gtl::flat_hash_set<u64> visited, on_stack;
+        gtl::flat_hash_map<u64, u64> parent;
+        gtl::vector<u64> cycle;
+        bool found = false;
+
+        std::function<void(u64)> dfs = [&](u64 u) {
+            if (found) return;
+            visited.insert(u);
+            on_stack.insert(u);
+            for (u64 v : fwd[u]) {
+                if (found) return;
+                if (on_stack.contains(v)) {
+                    // Back-edge u→v. Extract cycle: v → ... → u
+                    cycle.push_back(v);
+                    for (u64 cur = u; cur != v; cur = parent[cur])
+                        cycle.push_back(cur);
+                    std::reverse(cycle.begin(), cycle.end());
+                    found = true;
+                    return;
+                }
+                if (!visited.contains(v)) {
+                    parent[v] = u;
+                    dfs(v);
+                }
+            }
+            on_stack.erase(u);
+        };
+
+        for (const auto &[id, _] : lsg) {
+            if (!visited.contains(id)) dfs(id);
+            if (found) break;
+        }
+
+        if (!found) break; // DAG — done.
+
+        fprintf(stderr, "Unrolling cycle of %zu nodes (graph size: %zu)\n",
+                cycle.size(), lsg.size());
+
+        // Duplicate cycle nodes with fresh IDs.
+        // First pass: collect data from originals (before any inserts invalidate refs).
+        struct dup_info {
+            u64 orig_id, dup_id;
+            unsigned core_count;
+            gtl::vector<SequenceContainerType> seq;
+        };
+        gtl::vector<dup_info> dups;
+        dups.reserve(cycle.size());
+        gtl::flat_hash_map<u64, u64> orig_to_dup;
+        for (u64 id : cycle) {
+            u64 dup_id = next_id++;
+            orig_to_dup[id] = dup_id;
+            auto &orig = lsg.find(id)->second;
+            gtl::vector<SequenceContainerType> seq_copy;
+            seq_copy.reserve(orig.seq.size());
+            for (const auto &s : orig.seq) {
+                size_t n_words = SequenceContainerType::storage_size(s.len + s.skip_first_n);
+                uint64_t *buf = new uint64_t[n_words];
+                std::memcpy(buf, s.data, n_words * sizeof(uint64_t));
+                seq_copy.emplace_back(s.len, s.skip_first_n, buf, s.origin_node);
+            }
+            dups.push_back({id, dup_id, orig.core_count, std::move(seq_copy)});
+        }
+        // Second pass: insert duplicates into the map.
+        for (auto &d : dups) {
+            auto [it, _ins] = lsg.emplace(d.dup_id, d.core_count);
+            it->second.seq = std::move(d.seq);
+        }
+
+        // Wire the duplicated chain.
+        // dup[0].prev = {cycle.back()}  — the back-edge now leads into the copy
+        lsg.find(orig_to_dup[cycle[0]])->second.prev = {cycle.back()};
+        for (size_t i = 1; i < cycle.size(); ++i)
+            lsg.find(orig_to_dup[cycle[i]])->second.prev = {orig_to_dup[cycle[i - 1]]};
+
+        // Remove the back-edge from the original: drop cycle.back() from cycle[0].prev
+        auto &head_prev = lsg.find(cycle[0])->second.prev;
+        head_prev.erase(
+            std::remove(head_prev.begin(), head_prev.end(), cycle.back()),
+            head_prev.end());
+    }
+}
 
 // Find the longest path in the DAG by node count.
 // Returns pairs of (node_id, sequences) along the path (source → sink order).
 inline gtl::vector<std::pair<u64, gtl::vector<SequenceContainerType>>>
 longest_path(layout_small_graph &lsg) {
     if (lsg.empty()) return {};
+
+    // unroll_cycles(lsg);
 
     // Build forward adjacency list and in-degree map.
     gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
@@ -92,6 +197,92 @@ longest_path(layout_small_graph &lsg) {
     return result;
 }
 
+
+struct layout_boundary {
+    gtl::flat_hash_set<u64> incoming_fwd;   // predecessors of forward-oriented layout contigs
+    gtl::flat_hash_set<u64> incoming_rev;   // predecessors of reverse-oriented layout contigs
+    gtl::flat_hash_set<u64> outgoing_fwd;   // successors of forward-oriented layout contigs
+    gtl::flat_hash_set<u64> outgoing_rev;   // successors of reverse-oriented layout contigs
+    gtl::vector<u64> contained;             // non-layout nodes fully between layout nodes
+
+    // Convenience: all incoming / all outgoing regardless of orientation.
+    gtl::flat_hash_set<u64> all_incoming() const {
+        gtl::flat_hash_set<u64> s(incoming_fwd);
+        s.insert(incoming_rev.begin(), incoming_rev.end());
+        return s;
+    }
+    gtl::flat_hash_set<u64> all_outgoing() const {
+        gtl::flat_hash_set<u64> s(outgoing_fwd);
+        s.insert(outgoing_rev.begin(), outgoing_rev.end());
+        return s;
+    }
+};
+
+// Given the original graph, active node set, and a map of layout node IDs to
+// their orientation (true = forward, false = reverse), find non-layout nodes
+// that border or are contained within the layout.
+// Incoming = non-layout nodes in a layout node's prev list (topological predecessors).
+// Outgoing = non-layout nodes whose prev list contains a layout node (topological successors).
+// Each set is split by the orientation of the connected layout contig.
+inline layout_boundary find_layout_boundary(
+    const dbg_index::dbg_map_t &dbg,
+    const auto &active_nodes,
+    const gtl::flat_hash_map<u64, bool> &layout_ori) {
+
+    layout_boundary result;
+
+    // Build a flat set for quick membership checks.
+    gtl::flat_hash_set<u64> layout_set;
+    layout_set.reserve(layout_ori.size());
+    for (const auto &[id, _] : layout_ori) {
+        layout_set.insert(id);
+    }
+
+    // 1. Incoming: scan layout nodes' prev — active predecessors not in layout.
+    //    Split by the orientation of the layout contig they connect to.
+    for (const auto &[lid, ori] : layout_ori) {
+        auto it = dbg.find(lid);
+        if (it == dbg.end()) continue;
+        for (u64 p : it->second.prev) {
+            if (!layout_set.contains(p) && active_nodes.contains(p)) {
+                if (ori) {
+                    result.incoming_fwd.insert(p);
+                } else {
+                    result.incoming_rev.insert(p);
+                }
+            }
+        }
+    }
+
+    // 2. Outgoing: active non-layout nodes whose prev contains a layout node.
+    //    Split by the orientation of the layout contig they point back to.
+    for (u64 id : active_nodes) {
+        if (layout_set.contains(id)) continue;
+        auto it = dbg.find(id);
+        if (it == dbg.end()) continue;
+        for (u64 p : it->second.prev) {
+            auto oit = layout_ori.find(p);
+            if (oit != layout_ori.end()) {
+                if (oit->second) {
+                    result.outgoing_fwd.insert(id);
+                } else {
+                    result.outgoing_rev.insert(id);
+                }
+            }
+        }
+    }
+
+    // 3. Contained: nodes that appear in both incoming and outgoing (any orientation).
+    auto all_in = result.all_incoming();
+    auto all_out = result.all_outgoing();
+    for (u64 id : all_in) {
+        if (all_out.contains(id)) {
+            result.contained.push_back(id);
+        }
+    }
+
+    return result;
+}
 
 //TODO if needed
 struct lsg_cleaning{

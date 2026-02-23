@@ -21,6 +21,7 @@
 #include <gtl/vector.hpp>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <queue>
 #include <set>
@@ -2434,6 +2435,346 @@ struct assembler {
     }
 };
 
+static void append_seqvec_ascii(const gtl::vector<SequenceContainerType> &seqs,
+                                std::string &dst, charsi &buf) {
+    for (const auto &s : seqs) {
+        buf.require(s.len + 32);
+        s.convert_to_ascii((char *)buf.data);
+        dst.append((const char *)buf.data, s.len);
+    }
+}
+
+struct ultra_layout_node_info {
+    u64 id;
+    int from;
+    int to;
+    bool ori;
+};
+
+struct ultra_layout_job {
+    u64 layout_idx;
+    gtl::vector<ultra_layout_node_info> lnodes;
+};
+
+static std::string build_layout_sequence_from_nodes(
+    assembler &as, dbg_index &dbg,
+    const gtl::vector<ultra_layout_node_info> &lnodes, int hash_combine_len) {
+    layout_small_graph small_bg;
+    for (const auto &n : lnodes) {
+        auto nodeit = dbg.dbg.find(n.id);
+        if (nodeit == dbg.dbg.end()) {
+            fprintf(stderr, "Error: Node %llu not found in graph\n",
+                    (unsigned long long)n.id);
+            exit(EXIT_FAILURE);
+        }
+        auto &node = nodeit->second;
+        lps str = {0, 0, 0, 0};
+        u64 hw = 0;
+
+        if (n.ori) {
+            init_lps_crumbled(&str, node.seq, as.syncmer_functor);
+            lps_deepen(&str, as.lcp_level);
+            seqveciterator svit;
+            if (str.size > hash_combine_len) {
+                svit.move_only(node.seq, str.cores[hash_combine_len - 1].end);
+            }
+            for (int i = 0; i < str.size; ++i) {
+                u64 before = hw;
+                hw ^= str.cores[i].label;
+                hw &= (0x00000000FFFFFFFFull);
+                hw |= ((u64)str.cores[i].label << 32);
+                if (i >= hash_combine_len) {
+                    hw ^= str.cores[i - hash_combine_len].label;
+                    auto it_and_result = small_bg.try_emplace(hw, 1, before);
+                    if (!it_and_result.second) {
+                        it_and_result.first->second.core_count++;
+                        it_and_result.first->second.emplace_prev(before);
+                        svit.move_only(node.seq, str.cores[i].end);
+                    } else {
+                        it_and_result.first->second.seq.emplace_back(
+                            svit.get_and_move(node.seq, str.cores[i].end));
+                    }
+                }
+            }
+        } else {
+            gtl::vector<SequenceContainerType> rev_seqs;
+            rev_seqs.reserve(node.seq.size());
+            for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
+                rev_seqs.emplace_back(it->reverse_complement());
+            }
+            seqveciterator svit;
+            init_lps_crumbled(&str, rev_seqs, as.syncmer_functor);
+            lps_deepen(&str, as.lcp_level);
+            if (str.size > hash_combine_len) {
+                svit.move_only(rev_seqs, str.cores[hash_combine_len - 1].end);
+            }
+            for (int i = 0; i < str.size; ++i) {
+                u64 before = hw;
+                hw ^= str.cores[i].label;
+                hw &= (0x00000000FFFFFFFFull);
+                hw |= ((u64)str.cores[i].label << 32);
+                if (i >= hash_combine_len) {
+                    hw ^= str.cores[i - hash_combine_len].label;
+                    auto it_and_result = small_bg.try_emplace(hw, 1, before);
+                    if (!it_and_result.second) {
+                        it_and_result.first->second.core_count++;
+                        it_and_result.first->second.emplace_prev(before);
+                        svit.move_only(rev_seqs, str.cores[i].end);
+                    } else {
+                        it_and_result.first->second.seq.emplace_back(
+                            svit.get_and_move(rev_seqs, str.cores[i].end));
+                    }
+                }
+            }
+        }
+    }
+
+    std::string merged_seq;
+    charsi chs;
+    auto lp = longest_path(small_bg);
+    for (auto &[id, seqs] : lp) {
+        (void)id;
+        append_seqvec_ascii(seqs, merged_seq, chs);
+    }
+    return merged_seq;
+}
+
+static gtl::vector<std::string> build_layout_sequences_parallel(
+    assembler &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs,
+    int hash_combine_len) {
+    gtl::vector<std::string> out_seqs(jobs.size());
+    if (jobs.empty()) return out_seqs;
+
+    using job_q_t = moodycamel::BlockingConcurrentQueue<size_t>;
+    job_q_t job_queue;
+    std::atomic<bool> done{false};
+
+    int nthreads = as.threads.work;
+    if (nthreads < 1) nthreads = 1;
+    nthreads = std::min<int>(nthreads, jobs.size());
+
+    gtl::vector<std::thread> workers;
+    workers.reserve(nthreads);
+    for (int tid = 0; tid < nthreads; ++tid) {
+        workers.emplace_back([&]() {
+            size_t job_idx = 0;
+            while (true) {
+                if (!job_queue.wait_dequeue_timed(job_idx, WAIT_QUEUE_TIMEOUT)) {
+                    if (done.load()) break;
+                    continue;
+                }
+                out_seqs[job_idx] = build_layout_sequence_from_nodes(
+                    as, dbg, jobs[job_idx].lnodes, hash_combine_len);
+            }
+            while (job_queue.try_dequeue(job_idx)) {
+                out_seqs[job_idx] = build_layout_sequence_from_nodes(
+                    as, dbg, jobs[job_idx].lnodes, hash_combine_len);
+            }
+        });
+    }
+
+    for (size_t i = 0; i < jobs.size(); ++i) {
+        while (!job_queue.try_enqueue(i)) {
+            std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+        }
+    }
+    done.store(true);
+    for (auto &worker : workers) {
+        worker.join();
+    }
+
+    return out_seqs;
+}
+
+static void emit_ultra_merged_graph_stdout(assembler &as, dbg_index &dbg) {
+    auto [recig, layouts] = as.fold_dbg_graph(dbg);
+    (void)recig;
+
+    static constexpr uint8_t SIDE_START = 1;
+    static constexpr uint8_t SIDE_END = 2;
+    auto side_label = [&](uint8_t side) -> const char * {
+        if (side == SIDE_START) return "start";
+        if (side == SIDE_END) return "end";
+        return "na";
+    };
+    auto ori_char = [](bool ori) -> char { return ori ? '+' : '-'; };
+
+    struct supernode_out {
+        std::string name;
+        std::string seq;
+        bool is_layout;
+        u64 aux_id;
+    };
+    struct edge_agg {
+        u64 src_super = 0;
+        u64 dst_super = 0;
+        char src_ori = '+';
+        char dst_ori = '+';
+        uint8_t src_side = 0;
+        uint8_t dst_side = 0;
+        u64 example_from = 0;
+        u64 example_to = 0;
+        size_t count = 0;
+    };
+
+    gtl::vector<supernode_out> supernodes;
+    gtl::flat_hash_map<u64, u64> node_to_super;
+    gtl::flat_hash_set<u64> nodes_in_layouts;
+    gtl::flat_hash_map<u64, bool> node_layout_ori;
+    gtl::flat_hash_map<u64, uint8_t> node_boundary_mask;
+    node_to_super.reserve(dbg.active_set.size() + 8);
+    nodes_in_layouts.reserve(dbg.active_set.size() + 8);
+
+    const int hash_combine_len = LCMER_L;
+    gtl::vector<ultra_layout_job> layout_jobs;
+    layout_jobs.reserve(layouts.size());
+
+    u64 layout_idx = 0;
+    for (const auto &current_layout : layouts) {
+        gtl::vector<ultra_layout_node_info> lnodes;
+        lnodes.reserve(current_layout.size());
+        int min_start = INT_MAX;
+        int max_end = INT_MIN;
+        for (const auto &[ctg_id, layout] : current_layout) {
+            auto [from, to, ori] = layout;
+            lnodes.push_back({ctg_id, from, to, ori});
+            min_start = std::min(min_start, from);
+            max_end = std::max(max_end, to);
+        }
+        if (lnodes.empty()) {
+            ++layout_idx;
+            continue;
+        }
+        std::sort(lnodes.begin(), lnodes.end(),
+                  [](const ultra_layout_node_info &a,
+                     const ultra_layout_node_info &b) {
+                      if (a.from != b.from) return a.from < b.from;
+                      return a.id < b.id;
+                  });
+
+        const int span = std::max(1, max_end - min_start);
+        const int fuzzy = std::max<int>(LCMER_L * 2, span / 20);
+        for (const auto &n : lnodes) {
+            uint8_t mask = 0;
+            if (n.from <= min_start + fuzzy) mask |= SIDE_START;
+            if (n.to >= max_end - fuzzy) mask |= SIDE_END;
+            if (mask == 0) {
+                int d_start = n.from - min_start;
+                if (d_start < 0) d_start = -d_start;
+                int d_end = max_end - n.to;
+                if (d_end < 0) d_end = -d_end;
+                mask = (d_start <= d_end) ? SIDE_START : SIDE_END;
+            }
+            node_boundary_mask[n.id] |= mask;
+            node_layout_ori[n.id] = n.ori;
+            nodes_in_layouts.insert(n.id);
+        }
+
+        layout_jobs.push_back({layout_idx, std::move(lnodes)});
+        ++layout_idx;
+    }
+
+    auto layout_seqs = build_layout_sequences_parallel(as, dbg, layout_jobs,
+                                                       hash_combine_len);
+    for (size_t i = 0; i < layout_jobs.size(); ++i) {
+        const auto &job = layout_jobs[i];
+        const u64 sid = supernodes.size();
+        supernodes.push_back({"M" + std::to_string(job.layout_idx),
+                              std::move(layout_seqs[i]), true, job.layout_idx});
+        for (const auto &n : job.lnodes) {
+            node_to_super[n.id] = sid;
+        }
+    }
+
+    // Add non-layout active unitigs as standalone nodes.
+    charsi chs;
+    for (u64 node_id : dbg.active_set) {
+        if (nodes_in_layouts.contains(node_id)) continue;
+        auto it = dbg.dbg.find(node_id);
+        if (it == dbg.dbg.end()) continue;
+        if (it->second.redirected() || it->second.seq.empty()) continue;
+
+        std::string seq;
+        append_seqvec_ascii(it->second.seq, seq, chs);
+        const u64 sid = supernodes.size();
+        supernodes.push_back(
+            {"C" + std::to_string(node_id), std::move(seq), false, node_id});
+        node_to_super[node_id] = sid;
+    }
+
+    using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
+    std::map<edge_key, edge_agg> merged_edges;
+    for (const auto &[to_id, to_node] : dbg.dbg) {
+        if (to_node.redirected()) continue;
+        auto to_super_it = node_to_super.find(to_id);
+        if (to_super_it == node_to_super.end()) continue;
+
+        for (u64 from_id : to_node.prev) {
+            auto from_super_it = node_to_super.find(from_id);
+            if (from_super_it == node_to_super.end()) continue;
+            if (from_super_it->second == to_super_it->second) continue;
+
+            bool accept = true;
+            uint8_t src_side = 0, dst_side = 0;
+            char src_ori = '+', dst_ori = '+';
+
+            if (nodes_in_layouts.contains(from_id)) {
+                bool ori = node_layout_ori[from_id];
+                src_ori = ori_char(ori);
+                src_side = ori ? SIDE_START : SIDE_END;
+                if ((node_boundary_mask[from_id] & src_side) == 0) {
+                    accept = false;
+                }
+            }
+            if (nodes_in_layouts.contains(to_id)) {
+                bool ori = node_layout_ori[to_id];
+                dst_ori = ori_char(ori);
+                dst_side = ori ? SIDE_END : SIDE_START;
+                if ((node_boundary_mask[to_id] & dst_side) == 0) {
+                    accept = false;
+                }
+            }
+            if (!accept) continue;
+
+            edge_key k{from_super_it->second, to_super_it->second, src_ori,
+                       dst_ori, src_side, dst_side};
+            auto &agg = merged_edges[k];
+            if (agg.count == 0) {
+                agg.src_super = from_super_it->second;
+                agg.dst_super = to_super_it->second;
+                agg.src_ori = src_ori;
+                agg.dst_ori = dst_ori;
+                agg.src_side = src_side;
+                agg.dst_side = dst_side;
+                agg.example_from = from_id;
+                agg.example_to = to_id;
+            }
+            agg.count++;
+        }
+    }
+
+    for (const auto &sn : supernodes) {
+        if (sn.is_layout) {
+            printf("S\t%s\t%s\tTP:Z:layout\tLY:i:%llu\n", sn.name.c_str(),
+                   sn.seq.c_str(), (unsigned long long)sn.aux_id);
+        } else {
+            printf("S\t%s\t%s\tTP:Z:unitig\tUI:i:%llu\n", sn.name.c_str(),
+                   sn.seq.c_str(), (unsigned long long)sn.aux_id);
+        }
+    }
+    for (const auto &[_, edge] : merged_edges) {
+        const auto &src_name = supernodes[edge.src_super].name;
+        const auto &dst_name = supernodes[edge.dst_super].name;
+        printf("L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
+               "EC:i:%zu\tFN:i:%llu\tTN:i:%llu\n",
+               src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
+               edge.src_ori, edge.dst_ori, side_label(edge.src_side),
+               side_label(edge.dst_side), edge.count,
+               (unsigned long long)edge.example_from,
+               (unsigned long long)edge.example_to);
+    }
+}
+
 // TODO do not use extensions to identify input type.
 input_type identify_input(const std::string &input) {
     std::string_view sv(input);
@@ -2500,6 +2841,9 @@ int run_assembly(const asm_config &cfg) {
     }
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph printing");
 
+    emit_ultra_merged_graph_stdout(as, dbg);
+
+#if 0
     // ultra
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
     // Find largest layout
@@ -2620,6 +2964,7 @@ int run_assembly(const asm_config &cfg) {
         // }
         layout_idx++;
     }
+#endif
     return 0;
 }
 
