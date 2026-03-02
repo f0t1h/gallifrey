@@ -598,7 +598,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         gtl::vector<size_t> tos;
         for (int casei = 0; casei < N_RANDOM_CASES; ++casei) {
             int to = rand() % (seqlen - 100) + 100;
-            int from = to - 100 - (rand() % 12);
+            int back = 100 + (rand() % 12);
+            int from = (to > back) ? (to - back) : 0;
             copied.emplace_back(bam_get_seq(rec), from, to, 0,
                                 CrumbledSubSeq64::from_nibbles{});
             froms.push_back(from);
@@ -624,8 +625,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     SUBCASE(
         "Compare two windowing functions to see if they produce the same "
         "lcmers") {
-        lps str1;
-        lps str2;
+        lps str1 = {0, 0, 0, nullptr};
+        lps str2 = {0, 0, 0, nullptr};
         using SYNCMER_HASHER = syncmer::MurMur;
         using SyncmerType =
             syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
