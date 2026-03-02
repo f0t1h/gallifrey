@@ -1,23 +1,24 @@
 #ifndef _LAYOUT_GRAPH_H
 #define _LAYOUT_GRAPH_H
 
-#include <gtl/vector.hpp>
-#include <gtl/phmap_fwd_decl.hpp>
-#include "graph.h"
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <gtl/phmap_fwd_decl.hpp>
+#include <gtl/vector.hpp>
 #include <queue>
+
+#include "graph.h"
 
 using layout_small_graph = gtl::flat_hash_map<uint64_t, dbg_index::bidbg_val>;
 
 // Break cycles by duplicating the cycling sub-path.
 // Each cycle found via DFS is unrolled once: nodes are copied with fresh IDs
-// and the back-edge is redirected to the copy, turning the cycle into a linear tail.
+// and the back-edge is redirected to the copy, turning the cycle into a linear
+// tail.
 inline void unroll_cycles(layout_small_graph &lsg) {
     u64 next_id = 0;
-    for (const auto &[id, _] : lsg)
-        next_id = std::max(next_id, id);
+    for (const auto &[id, _] : lsg) next_id = std::max(next_id, id);
     ++next_id;
 
     for (;;) {
@@ -25,8 +26,7 @@ inline void unroll_cycles(layout_small_graph &lsg) {
         gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
         for (const auto &[id, val] : lsg)
             for (u64 p : val.prev)
-                if (lsg.contains(p))
-                    fwd[p].push_back(id);
+                if (lsg.contains(p)) fwd[p].push_back(id);
 
         // DFS to find one cycle.
         gtl::flat_hash_set<u64> visited, on_stack;
@@ -62,13 +62,14 @@ inline void unroll_cycles(layout_small_graph &lsg) {
             if (found) break;
         }
 
-        if (!found) break; // DAG — done.
+        if (!found) break;  // DAG — done.
 
         fprintf(stderr, "Unrolling cycle of %zu nodes (graph size: %zu)\n",
                 cycle.size(), lsg.size());
 
         // Duplicate cycle nodes with fresh IDs.
-        // First pass: collect data from originals (before any inserts invalidate refs).
+        // First pass: collect data from originals (before any inserts
+        // invalidate refs).
         struct dup_info {
             u64 orig_id, dup_id;
             unsigned core_count;
@@ -84,10 +85,12 @@ inline void unroll_cycles(layout_small_graph &lsg) {
             gtl::vector<SequenceContainerType> seq_copy;
             seq_copy.reserve(orig.seq.size());
             for (const auto &s : orig.seq) {
-                size_t n_words = SequenceContainerType::storage_size(s.len + s.skip_first_n);
+                size_t n_words =
+                    SequenceContainerType::storage_size(s.len + s.skip_first_n);
                 uint64_t *buf = new uint64_t[n_words];
                 std::memcpy(buf, s.data, n_words * sizeof(uint64_t));
-                seq_copy.emplace_back(s.len, s.skip_first_n, buf, s.origin_node);
+                seq_copy.emplace_back(s.len, s.skip_first_n, buf,
+                                      s.origin_node);
             }
             dups.push_back({id, dup_id, orig.core_count, std::move(seq_copy)});
         }
@@ -101,9 +104,11 @@ inline void unroll_cycles(layout_small_graph &lsg) {
         // dup[0].prev = {cycle.back()}  — the back-edge now leads into the copy
         lsg.find(orig_to_dup[cycle[0]])->second.prev = {cycle.back()};
         for (size_t i = 1; i < cycle.size(); ++i)
-            lsg.find(orig_to_dup[cycle[i]])->second.prev = {orig_to_dup[cycle[i - 1]]};
+            lsg.find(orig_to_dup[cycle[i]])->second.prev = {
+                orig_to_dup[cycle[i - 1]]};
 
-        // Remove the back-edge from the original: drop cycle.back() from cycle[0].prev
+        // Remove the back-edge from the original: drop cycle.back() from
+        // cycle[0].prev
         auto &head_prev = lsg.find(cycle[0])->second.prev;
         head_prev.erase(
             std::remove(head_prev.begin(), head_prev.end(), cycle.back()),
@@ -174,13 +179,15 @@ longest_path(layout_small_graph &lsg) {
     }
 
     if (processed < lsg.size()) {
-        fprintf(stderr, "Warning: layout graph contains cycles (%zu of %zu nodes unreachable)\n",
+        fprintf(stderr,
+                "Warning: layout graph contains cycles (%zu of %zu nodes "
+                "unreachable)\n",
                 lsg.size() - processed, lsg.size());
     }
 
     // Reconstruct path and collect node_id + sequences (source → sink).
     gtl::vector<u64> path;
-    for (u64 cur = best_node;; ) {
+    for (u64 cur = best_node;;) {
         path.push_back(cur);
         auto it = pred.find(cur);
         if (it == pred.end()) break;
@@ -197,13 +204,16 @@ longest_path(layout_small_graph &lsg) {
     return result;
 }
 
-
 struct layout_boundary {
-    gtl::flat_hash_set<u64> incoming_fwd;   // predecessors of forward-oriented layout contigs
-    gtl::flat_hash_set<u64> incoming_rev;   // predecessors of reverse-oriented layout contigs
-    gtl::flat_hash_set<u64> outgoing_fwd;   // successors of forward-oriented layout contigs
-    gtl::flat_hash_set<u64> outgoing_rev;   // successors of reverse-oriented layout contigs
-    gtl::vector<u64> contained;             // non-layout nodes fully between layout nodes
+    gtl::flat_hash_set<u64>
+        incoming_fwd;  // predecessors of forward-oriented layout contigs
+    gtl::flat_hash_set<u64>
+        incoming_rev;  // predecessors of reverse-oriented layout contigs
+    gtl::flat_hash_set<u64>
+        outgoing_fwd;  // successors of forward-oriented layout contigs
+    gtl::flat_hash_set<u64>
+        outgoing_rev;  // successors of reverse-oriented layout contigs
+    gtl::vector<u64> contained;  // non-layout nodes fully between layout nodes
 
     // Convenience: all incoming / all outgoing regardless of orientation.
     gtl::flat_hash_set<u64> all_incoming() const {
@@ -221,14 +231,13 @@ struct layout_boundary {
 // Given the original graph, active node set, and a map of layout node IDs to
 // their orientation (true = forward, false = reverse), find non-layout nodes
 // that border or are contained within the layout.
-// Incoming = non-layout nodes in a layout node's prev list (topological predecessors).
-// Outgoing = non-layout nodes whose prev list contains a layout node (topological successors).
-// Each set is split by the orientation of the connected layout contig.
+// Incoming = non-layout nodes in a layout node's prev list (topological
+// predecessors). Outgoing = non-layout nodes whose prev list contains a layout
+// node (topological successors). Each set is split by the orientation of the
+// connected layout contig.
 inline layout_boundary find_layout_boundary(
-    const dbg_index::dbg_map_t &dbg,
-    const auto &active_nodes,
+    const dbg_index::dbg_map_t &dbg, const auto &active_nodes,
     const gtl::flat_hash_map<u64, bool> &layout_ori) {
-
     layout_boundary result;
 
     // Build a flat set for quick membership checks.
@@ -272,7 +281,8 @@ inline layout_boundary find_layout_boundary(
         }
     }
 
-    // 3. Contained: nodes that appear in both incoming and outgoing (any orientation).
+    // 3. Contained: nodes that appear in both incoming and outgoing (any
+    // orientation).
     auto all_in = result.all_incoming();
     auto all_out = result.all_outgoing();
     for (u64 id : all_in) {
@@ -284,26 +294,18 @@ inline layout_boundary find_layout_boundary(
     return result;
 }
 
-//TODO if needed
-struct lsg_cleaning{
-    void cut_tips(layout_small_graph &lsg){
-
-    }
-    void pop_bubbles(layout_small_graph &lsg){
-
-    }
-    void simplify_simple_paths(layout_small_graph &lsg, gtl::vector<u64> &to_fix){
-
-    }
-    void fix_edges(layout_small_graph &lsg, gtl::vector<u64> &to_fix){
-
-    }
-    void run(layout_small_graph &lsg, int iterations, int threads){
-
+// TODO if needed
+struct lsg_cleaning {
+    void cut_tips(layout_small_graph &lsg) {}
+    void pop_bubbles(layout_small_graph &lsg) {}
+    void simplify_simple_paths(layout_small_graph &lsg,
+                               gtl::vector<u64> &to_fix) {}
+    void fix_edges(layout_small_graph &lsg, gtl::vector<u64> &to_fix) {}
+    void run(layout_small_graph &lsg, int iterations, int threads) {
         gtl::vector<u64> to_fix;
         simplify_simple_paths(lsg, to_fix);
         fix_edges(lsg, to_fix);
-        for(int i = 0; i < iterations; ++i){
+        for (int i = 0; i < iterations; ++i) {
             cut_tips(lsg);
             pop_bubbles(lsg);
             simplify_simple_paths(lsg, to_fix);

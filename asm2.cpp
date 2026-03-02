@@ -24,7 +24,6 @@
 #include <map>
 #include <optional>
 #include <queue>
-#include <set>
 #include <stack>
 #include <string>
 #include <tuple>
@@ -35,10 +34,10 @@
 #include "config.h"
 #include "ext/doctest.h"
 #include "graph.h"
+#include "layout_graph.h"
 #include "lcmer.h"
 #include "lcptools/lcptools_ho.h"
 #include "syncmer.h"
-#include "layout_graph.h"
 
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
@@ -1760,7 +1759,6 @@ struct assembler {
         auto &dbg = dbgi.dbg;
         u64 layout_no = 0;
         charsi chs;
-        u64 lcmer_index = 0;
         auto single_node_print = [&out, &layout_no, &dbg,
                                   &chs](decltype(*layouts.begin()) &layout) {
             fprintf(out, ">M%llu %zu\n", layout_no, layout.size());
@@ -2559,7 +2557,8 @@ static gtl::vector<std::string> build_layout_sequences_parallel(
         workers.emplace_back([&]() {
             size_t job_idx = 0;
             while (true) {
-                if (!job_queue.wait_dequeue_timed(job_idx, WAIT_QUEUE_TIMEOUT)) {
+                if (!job_queue.wait_dequeue_timed(job_idx,
+                                                  WAIT_QUEUE_TIMEOUT)) {
                     if (done.load()) break;
                     continue;
                 }
@@ -2674,8 +2673,8 @@ static void emit_ultra_merged_graph_stdout(assembler &as, dbg_index &dbg) {
         ++layout_idx;
     }
 
-    auto layout_seqs = build_layout_sequences_parallel(as, dbg, layout_jobs,
-                                                       hash_combine_len);
+    auto layout_seqs =
+        build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
         const u64 sid = supernodes.size();
@@ -2721,7 +2720,7 @@ static void emit_ultra_merged_graph_stdout(assembler &as, dbg_index &dbg) {
             if (nodes_in_layouts.contains(from_id)) {
                 bool ori = node_layout_ori[from_id];
                 src_ori = ori_char(ori);
-                src_side = ori ? SIDE_START : SIDE_END;
+                src_side = ori ? SIDE_END : SIDE_START;
                 if ((node_boundary_mask[from_id] & src_side) == 0) {
                     accept = false;
                 }
@@ -2729,15 +2728,19 @@ static void emit_ultra_merged_graph_stdout(assembler &as, dbg_index &dbg) {
             if (nodes_in_layouts.contains(to_id)) {
                 bool ori = node_layout_ori[to_id];
                 dst_ori = ori_char(ori);
-                dst_side = ori ? SIDE_END : SIDE_START;
+                dst_side = ori ? SIDE_START : SIDE_END;
                 if ((node_boundary_mask[to_id] & dst_side) == 0) {
                     accept = false;
                 }
             }
             if (!accept) continue;
 
-            edge_key k{from_super_it->second, to_super_it->second, src_ori,
-                       dst_ori, src_side, dst_side};
+            edge_key k{from_super_it->second,
+                       to_super_it->second,
+                       src_ori,
+                       dst_ori,
+                       src_side,
+                       dst_side};
             auto &agg = merged_edges[k];
             if (agg.count == 0) {
                 agg.src_super = from_super_it->second;
@@ -2765,13 +2768,14 @@ static void emit_ultra_merged_graph_stdout(assembler &as, dbg_index &dbg) {
     for (const auto &[_, edge] : merged_edges) {
         const auto &src_name = supernodes[edge.src_super].name;
         const auto &dst_name = supernodes[edge.dst_super].name;
-        printf("L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
-               "EC:i:%zu\tFN:i:%llu\tTN:i:%llu\n",
-               src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
-               edge.src_ori, edge.dst_ori, side_label(edge.src_side),
-               side_label(edge.dst_side), edge.count,
-               (unsigned long long)edge.example_from,
-               (unsigned long long)edge.example_to);
+        printf(
+            "L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
+            "EC:i:%zu\tFN:i:%llu\tTN:i:%llu\n",
+            src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
+            edge.src_ori, edge.dst_ori, side_label(edge.src_side),
+            side_label(edge.dst_side), edge.count,
+            (unsigned long long)edge.example_from,
+            (unsigned long long)edge.example_to);
     }
 }
 
@@ -3468,5 +3472,49 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
         // these test sequences
         INFO("Total cores: ", lr.cores.size());
         CHECK(found_spanning_seq);
+    }
+}
+
+TEST_CASE("CrumbledSubSeq64 iterator-range constructor concatenates represented sequence") {
+    const char *src = "TTTTACGTACGTGGGGCCAAATTTCCGG";
+    gtl::vector<SequenceContainerType> frags;
+    frags.emplace_back(src, 3, 9, 101, SequenceContainerType::from_ascii{});
+    frags.emplace_back(src, 10, 18, 102, SequenceContainerType::from_ascii{});
+    frags.emplace_back(src, 20, 27, 103, SequenceContainerType::from_ascii{});
+
+    auto to_ascii = [](const SequenceContainerType &s) {
+        std::string out;
+        out.resize(s.len);
+        if (!out.empty()) {
+            s.convert_to_ascii(out.data());
+        }
+        return out;
+    };
+
+    SUBCASE("full range") {
+        SequenceContainerType merged(frags.begin(), frags.end());
+        const std::string expected =
+            std::string(src + 3, 9 - 3) + std::string(src + 10, 18 - 10) +
+            std::string(src + 20, 27 - 20);
+        CHECK_EQ(merged.len, expected.size());
+        CHECK_EQ(to_ascii(merged), expected);
+        CHECK_EQ(merged.skip_first_n, 0);
+        CHECK_EQ(merged.origin_node, 103);
+    }
+
+    SUBCASE("sub range") {
+        SequenceContainerType merged(frags.begin() + 1, frags.end());
+        const std::string expected =
+            std::string(src + 10, 18 - 10) + std::string(src + 20, 27 - 20);
+        CHECK_EQ(merged.len, expected.size());
+        CHECK_EQ(to_ascii(merged), expected);
+        CHECK_EQ(merged.origin_node, 103);
+    }
+
+    SUBCASE("empty range") {
+        SequenceContainerType merged(frags.begin(), frags.begin());
+        CHECK_EQ(merged.len, 0);
+        CHECK_EQ(merged.skip_first_n, 0);
+        CHECK_EQ(merged.origin_node, 0);
     }
 }

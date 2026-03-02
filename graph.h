@@ -895,7 +895,6 @@ struct GraphCleaning {
             thread.join();
         }
 
-
         for (auto &node : dbg) {
             int self_idx = -1;
             for (auto &p : node.second.prev) {
@@ -940,7 +939,8 @@ struct GraphCleaning {
                 attempt_simplify_one_path_lockless(dbg, redirect_deleted, node,
                                                    current, to_delete);
             } else if (current->second.prev.size() > 1) {
-                std::sort(current->second.prev.begin(), current->second.prev.end());
+                std::sort(current->second.prev.begin(),
+                          current->second.prev.end());
                 for (auto &prev_id : current->second.prev) {
                     auto prev_it = dbg.find(prev_id);
                     if (prev_it != dbg.end() &&
@@ -1211,6 +1211,98 @@ struct GraphCleaning {
             }
         }
     }
+    static void open_simple_loopsv2(dbg_map_t &dbg,
+                                    [[maybe_unused]] lcmer_index_t &lci,
+                                    gtl::btree_set<u64> &active_set) {
+        gtl::vector<u64> to_rm;
+        for (auto &node : active_set) {
+            auto current = dbg.find(node);
+            if (current == dbg.end() || current->second.redirected()) {
+                continue;
+            }
+            if (current->second.forward_edge_count == 2 &&
+                current->second.prev.size() == 2) {
+                // 2 in 2 out
+                //
+                //      o----->[-Cur-]----->o
+                //             |     ^
+                //             v     |
+                //             [-Pre-]
+                //
+                // for (auto &pnode : current->second.prev) {
+                int merged_node_index_in_prev = [&]() -> int{
+                    for (size_t i = 0; i < current->second.prev.size(); ++i) {
+                        auto pnode = current->second.prev[i];
+                        const auto &pit = dbg.find(pnode);
+                        if (pit == dbg.end() || pit->second.redirected()) {
+                            continue;
+                        }
+                        if (pit->second.forward_edge_count != 1 ||
+                            pit->second.prev.size() != 1) {  // Prev is simple
+                            continue;
+                        }
+                        if (pit->second.prev[0] == node) {  // Loop confirmed.
+                            // Try to find other Since we confirmed 2 node
+                            // exist, we can flip it for other
+                            auto other_prev = current->second.prev[1 - i];
+                            double curr_depth =
+                                current->second.avg_core_count();
+                            double pr_depth = pit->second.avg_core_count();
+                            double other_depth = [&]() {
+                                // If we can find the depth, use it
+                                // otherwise use currentdepth to set diff
+                                // to 1
+                                auto other_it = dbg.find(other_prev);
+                                if (other_it == dbg.end()) {
+                                    return curr_depth;
+                                } else {
+                                    return other_it->second.avg_core_count();
+                                }
+                            }();
+                            // Lets combine the sequences here.
+                            SequenceContainerType cur_seq{
+                                current->second.seq.begin(),
+                                current->second.seq.end()};
+                            SequenceContainerType pre_seq{
+                                pit->second.seq.begin(), pit->second.seq.end()};
+
+                            for (double covered = 0;
+                                 covered <
+                                 curr_depth -
+                                     other_depth;  // 1 less iteration, I want
+                                                   // to move the combined seqs.
+                                 covered += other_depth) {
+                                current->second.seq.push_back(
+                                    SequenceContainerType::copy_of(pre_seq));
+                                current->second.seq.push_back(
+                                    SequenceContainerType::copy_of(cur_seq));
+                            }
+                            current->second.seq.push_back(std::move(pre_seq));
+                            current->second.seq.push_back(std::move(cur_seq));
+
+                            // Get rid of the looping node
+                            return i;
+                        }
+                    }
+                    return -1;
+                }();
+                if (merged_node_index_in_prev == -1){
+                    continue;
+                }
+                to_rm.push_back(current->second.prev[merged_node_index_in_prev]);
+                // active_set.erase(current->second.prev[merged_node_index_in_prev]);
+                current->second.forward_edge_count = 1;
+                if(merged_node_index_in_prev == 0){
+                    current->second.prev[0] = current->second.prev[1];
+                }
+                current->second.prev.pop_back();
+            }
+        }
+        for (auto node : to_rm) {
+            active_set.erase(node);
+        }
+    }
+
     static void open_simple_loops(dbg_map_t &dbg,
                                   [[maybe_unused]] lcmer_index_t &lci,
                                   auto &active_set) {
@@ -1227,10 +1319,10 @@ struct GraphCleaning {
                     for (auto pp = prepre.begin(); pp != prepre.end(); ++pp) {
                         if (*pp == node) {  // Loop here
                             *pp = std::numeric_limits<u64>::max();
-                            if (current->second.core_count >=
+                            if (current->second.avg_core_count() >=
                                 2 * prev_it->second
-                                        .core_count) {  // TODO: this is
-                                                        // not right.
+                                        .avg_core_count()) {  // TODO: this is
+                                                              // not right.
                                 // Need to duplicate the
                                 // sequence
                                 auto &tomerge = current->second.seq;
@@ -1335,9 +1427,9 @@ struct GraphCleaning {
                 // pop_bubbles(dbgi.dbg, dbgi.lci,
                 //             cfg.min_bubble_depth_difference_percentage,
                 //             active_set);
-                // cut_low_support_edges(dbgi.dbg, dbgi.lci, active_set);
+                cut_low_support_edges(dbgi.dbg, dbgi.lci, active_set);
                 // open_simple_loops(dbgi.dbg, dbgi.lci, active_set);
-
+                open_simple_loopsv2(dbgi.dbg, dbgi.lci, active_set);
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;

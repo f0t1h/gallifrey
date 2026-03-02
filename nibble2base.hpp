@@ -2,8 +2,11 @@
 #define NIBBLE2BASE_HPP
 // #include <sys/_types/_u_char.h>
 #include <cassert>
+#include <concepts>
 #include <cstdint>
+#include <cstring>
 #include <gtl/vector.hpp>
+#include <iterator>
 
 
 #include "htslib/hts.h"
@@ -511,6 +514,14 @@ struct CrumbledSubSeq64 {
     static constexpr size_t storage_size(size_t bases) noexcept {
         return bases / bases_per_word + 1;  // extra word for padding
     }
+    template <std::forward_iterator It>
+    static size_t combined_length(It first, It last) {
+        size_t total = 0;
+        for (auto it = first; it != last; ++it) {
+            total += static_cast<size_t>((*it).len);
+        }
+        return total;
+    }
 
     static inline uint8_t base_to_code(char c) {
         switch (c) {
@@ -589,6 +600,28 @@ struct CrumbledSubSeq64 {
           origin_node(other.origin_node) {
         other.data = nullptr;
         other.origin_node = 0;
+    }
+
+    template <std::forward_iterator It>
+    CrumbledSubSeq64(It first, It last)
+        : len(combined_length(first, last)),
+          skip_first_n(0),
+          data(new uint64_t[storage_size(len + 32)]()),
+          origin_node(0) {
+        size_t dest_pos = 0;
+        for (auto it = first; it != last; ++it) {
+            const auto &frag = *it;
+            for (size_t b = 0; b < frag.len; ++b) {
+                const size_t src_bit =
+                    (static_cast<size_t>(frag.skip_first_n) + b) * 2;
+                const uint64_t code =
+                    (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                const size_t dst_bit = dest_pos * 2;
+                data[dst_bit >> 6] |= code << (dst_bit & 63);
+                ++dest_pos;
+            }
+            origin_node = frag.origin_node;
+        }
     }
 
     CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t start_idx, size_t from,
@@ -675,12 +708,13 @@ struct CrumbledSubSeq64 {
           skip_first_n{skip_first_n},
           data(data),
           origin_node(origin_node) {}
-    // static CrumbledSubSeq64 copy(const CrumbledSubSeq64 &other) { //Buggy fix this first
-    //     decltype(other.data) data = new uint64_t[storage_size(other.len + 32)];
-    //     memcpy(data, other.data, storage_size(other.len));
-    //     return CrumbledSubSeq64(other.len, other.skip_first_n, data,
-    //                             other.origin_node);
-    // }
+    static CrumbledSubSeq64 copy_of(const CrumbledSubSeq64 &other) {
+        const size_t words = storage_size(other.len + other.skip_first_n);
+        uint64_t *copied_data = new uint64_t[words]();
+        std::memcpy(copied_data, other.data, words * sizeof(uint64_t));
+        return CrumbledSubSeq64(other.len, other.skip_first_n, copied_data,
+                                other.origin_node);
+    }
     CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
     CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
     ~CrumbledSubSeq64() { delete[] data; }
