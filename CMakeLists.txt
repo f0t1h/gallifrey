@@ -45,7 +45,7 @@ include_directories(${HTS_INCLUDE_DIRS})
 link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
-set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp layout/layout.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp)
 include_directories(./ext)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
