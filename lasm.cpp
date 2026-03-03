@@ -86,6 +86,11 @@ int asm_program(CLI::App &parent) {
                     "Minimum difference between the two ends of the bubbles to "
                     "pop. if depth(P1) * arg > depth(P2) then pop();")
         ->capture_default_str();
+    gcg->add_flag(
+           "--open-simple-loops", p->graph_cleaning.enable_loop_opening,
+           "Enable simple loop opening during graph cleaning. Warning: may "
+           "cause misassembly if loop copy counts are mispredicted.")
+        ->capture_default_str();
     app.callback([=]() {
         int ret = run_assembly(*p);
         delete p;

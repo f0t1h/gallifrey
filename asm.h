@@ -107,6 +107,7 @@ struct asm_config {
         int max_tip_length = LCMER_L * 2;
         int min_bubble_length_difference = 2;
         double min_bubble_depth_difference_percentage = 2;
+        bool enable_loop_opening = false;
     } graph_cleaning;
 
     void print_cfg(FILE *f) const {
@@ -125,10 +126,11 @@ struct asm_config {
         fprintf(f,
                 "Graph Cleaning Parameters: \n\tIterations: %d\n\tMax Tip "
                 "Length: %d\n\tMin Bubble Length Difference: %d\n\tMin Bubble "
-                "Depth Difference Rate: %.2f\n",
+                "Depth Difference Rate: %.2f\n\tOpen Simple Loops: %s\n",
                 graph_cleaning.iterations, graph_cleaning.max_tip_length,
                 graph_cleaning.min_bubble_length_difference,
-                graph_cleaning.min_bubble_depth_difference_percentage);
+                graph_cleaning.min_bubble_depth_difference_percentage,
+                graph_cleaning.enable_loop_opening ? "true" : "false");
     }
 };
 

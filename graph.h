@@ -8,10 +8,13 @@
 #include <blockingconcurrentqueue.h>
 
 #include <atomic>
+#include <cassert>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
+#include <limits>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -640,6 +643,200 @@ struct GraphCleaning {
     using dbg_map_t = dbg_index::dbg_map_t;
     using lcmer_index_t = dbg_index::lcmer_index_t;
     using redir_map = gtl::parallel_flat_hash_map_d<u64, u64, 4, std::mutex>;
+    struct avg_core_count_stats {
+        double baseline = 0.0;
+    };
+    static double median_of_sorted(const gtl::vector<double> &vals) {
+        if (vals.empty()) return 0.0;
+        const size_t mid = vals.size() / 2;
+        if (vals.size() % 2 == 1) return vals[mid];
+        return (vals[mid - 1] + vals[mid]) / 2.0;
+    }
+
+    static avg_core_count_stats collect_active_avg_core_count_stats(
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set) {
+        avg_core_count_stats stats;
+        constexpr size_t kMinDepthSample = 16;
+        struct depth_len_sample {
+            double depth;
+            size_t len_proxy;
+            bool topology_stable;
+        };
+        gtl::vector<depth_len_sample> samples;
+        samples.reserve(active_set.size());
+        gtl::vector<size_t> lengths;
+        lengths.reserve(active_set.size());
+
+        for (u64 node : active_set) {
+            auto it = dbg.find(node);
+            if (it == dbg.end() || it->second.redirected()) continue;
+            if (it->second.seq.empty()) continue;
+            const double d = it->second.avg_core_count();
+            if (d <= 0.0) continue;
+
+            const size_t len_proxy = it->second.seq.size();
+            const bool topology_stable =
+                (it->second.prev.size() <= 1 && it->second.forward_edge_count <= 1);
+            samples.push_back({d, len_proxy, topology_stable});
+            lengths.push_back(len_proxy);
+        }
+        if (samples.empty()) return stats;
+
+        std::sort(lengths.begin(), lengths.end());
+        const size_t len_q75 = lengths[(lengths.size() - 1) * 3 / 4];
+
+        auto collect_depths = [&](auto pred) {
+            gtl::vector<double> out;
+            out.reserve(samples.size());
+            for (const auto &s : samples) {
+                if (pred(s)) out.push_back(s.depth);
+            }
+            return out;
+        };
+
+        gtl::vector<double> depths = collect_depths([&](const auto &s) {
+            return s.topology_stable && s.len_proxy >= len_q75;
+        });
+        if (depths.size() < kMinDepthSample) {
+            depths = collect_depths(
+                [&](const auto &s) { return s.len_proxy >= len_q75; });
+        }
+        if (depths.size() < kMinDepthSample) {
+            depths = collect_depths([](const auto &) { return true; });
+        }
+
+        std::sort(depths.begin(), depths.end());
+        const auto qidx = [n = depths.size()](double q) -> size_t {
+            const size_t idx = static_cast<size_t>(q * static_cast<double>(n - 1));
+            return std::min(idx, n - 1);
+        };
+        const double raw_q1 = depths[qidx(0.25)];
+        const double raw_q3 = depths[qidx(0.75)];
+        const double iqr = raw_q3 - raw_q1;
+        const double lower = raw_q1 - 1.5 * iqr;
+        const double upper = raw_q3 + 1.5 * iqr;
+
+        gtl::vector<double> filtered;
+        filtered.reserve(depths.size());
+        for (double d : depths) {
+            if (d >= lower && d <= upper) filtered.push_back(d);
+        }
+        const auto &pool = filtered.empty() ? depths : filtered;
+        stats.baseline = median_of_sorted(pool);
+        return stats;
+    }
+    static void dump_initial_clean_contig_stats(
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set,
+        const std::string &out_tsv_path) {
+        FILE *out = std::fopen(out_tsv_path.c_str(), "w");
+        if (out == nullptr) {
+            std::fprintf(stderr,
+                         "WARN: failed to write initial clean contig stats to "
+                         "%s\n",
+                         out_tsv_path.c_str());
+            return;
+        }
+        std::fprintf(out, "contig_id\tcontig_len_proxy\tavg_core_count\n");
+        for (u64 node_id : active_set) {
+            auto it = dbg.find(node_id);
+            if (it == dbg.end()) continue;
+            const auto &node = it->second;
+            if (node.redirected() || node.seq.empty()) continue;
+            const size_t len_proxy = node.seq.size();
+            const double avg_cc = node.avg_core_count();
+            std::fprintf(out, "%" PRIu64 "\t%zu\t%.6f\n", node_id, len_proxy,
+                         avg_cc);
+        }
+        std::fclose(out);
+    }
+
+    struct loop_copy_estimate {
+        double base_cn = 1.0;
+        int base_cn_rounded = 1;
+        int other_cn_rounded = 1;
+        double global_ref_depth = 0.0;
+        double raw_loop_cn = 1.0;
+        double raw_curr_cn = 2.0;
+        int loop_cn_rounded = 1;
+        int curr_cn_rounded = 2;
+        int loop_turns = 1;
+        double turn_event_gain = 0.0;
+        double turn_event_threshold = 0.0;
+        int turn_forced_single = 0;
+        double score = std::numeric_limits<double>::infinity();
+    };
+
+    static loop_copy_estimate infer_loop_copy_numbers(
+        double other_in_depth, double loop_depth, double curr_depth,
+        const avg_core_count_stats &depth_stats) {
+        assert(depth_stats.baseline > 0.0);
+        constexpr int kMaxSearchTurns = 64;
+        constexpr int kMaxSearchBaseCn = 64;
+        constexpr double kBaseCnPriorWeight = 0.35;
+        constexpr double kTurnGainBaseThreshold = 0.25;
+
+        const double baseline = depth_stats.baseline;
+        const double other_base_cn = std::max(1.0, other_in_depth / baseline);
+
+        loop_copy_estimate est;
+        est.global_ref_depth = baseline;
+        est.base_cn = other_base_cn;
+        est.base_cn_rounded = std::max(1, static_cast<int>(std::llround(est.base_cn)));
+        est.other_cn_rounded = est.base_cn_rounded;
+        est.raw_loop_cn = loop_depth / baseline;
+        est.raw_curr_cn = curr_depth / baseline;
+        est.loop_cn_rounded =
+            std::max(1, static_cast<int>(std::llround(est.raw_loop_cn)));
+        est.curr_cn_rounded =
+            std::max(1, static_cast<int>(std::llround(est.raw_curr_cn)));
+
+        double best_err = std::numeric_limits<double>::infinity();
+        int best_t = 1;
+        int best_b = est.base_cn_rounded;
+        double best_err_t1 = std::numeric_limits<double>::infinity();
+        int best_b_t1 = est.base_cn_rounded;
+        const auto fit_err = [&](int b, int t) {
+            const double exp_loop = static_cast<double>(t * b);
+            const double exp_curr = static_cast<double>((t + 1) * b);
+            return std::abs(est.raw_loop_cn - exp_loop) +
+                   std::abs(est.raw_curr_cn - exp_curr) +
+                   kBaseCnPriorWeight *
+                       std::abs(est.base_cn - static_cast<double>(b));
+        };
+        for (int b = 1; b <= kMaxSearchBaseCn; ++b) {
+            for (int t = 1; t <= kMaxSearchTurns; ++t) {
+                const double err = fit_err(b, t);
+                if (err < best_err ||
+                    (err == best_err &&
+                     (t < best_t || (t == best_t && b < best_b)))) {
+                    best_err = err;
+                    best_t = t;
+                    best_b = b;
+                }
+                if (t == 1 && err < best_err_t1) {
+                    best_err_t1 = err;
+                    best_b_t1 = b;
+                }
+            }
+        }
+        const double turn_gain = best_err_t1 - best_err;
+        const double turn_threshold =
+            kTurnGainBaseThreshold * static_cast<double>(est.other_cn_rounded);
+        if (best_t > 1 && turn_gain < turn_threshold) {
+            best_t = 1;
+            best_b = best_b_t1;
+            best_err = best_err_t1;
+            est.turn_forced_single = 1;
+        }
+
+        est.base_cn_rounded = best_b;
+        est.loop_turns = best_t;
+        est.turn_event_gain = turn_gain;
+        est.turn_event_threshold = turn_threshold;
+        est.score = best_err;
+        return est;
+    }
+
     static auto attempt_simplify_one_path(dbg_map_t &dbg,
                                           redir_map &redirect_deleted, u64 id,
                                           auto starting_from, auto &to_delete)
@@ -1213,7 +1410,8 @@ struct GraphCleaning {
     }
     static void open_simple_loopsv2(dbg_map_t &dbg,
                                     [[maybe_unused]] lcmer_index_t &lci,
-                                    gtl::btree_set<u64> &active_set) {
+                                    gtl::btree_set<u64> &active_set,
+                                    const avg_core_count_stats &depth_stats) {
         gtl::vector<u64> to_rm;
         for (auto &node : active_set) {
             auto current = dbg.find(node);
@@ -1245,20 +1443,16 @@ struct GraphCleaning {
                             // Try to find other Since we confirmed 2 node
                             // exist, we can flip it for other
                             auto other_prev = current->second.prev[1 - i];
-                            double curr_depth =
-                                current->second.avg_core_count();
+                            double curr_depth = current->second.avg_core_count();
                             double pr_depth = pit->second.avg_core_count();
-                            double other_depth = [&]() {
-                                // If we can find the depth, use it
-                                // otherwise use currentdepth to set diff
-                                // to 1
-                                auto other_it = dbg.find(other_prev);
-                                if (other_it == dbg.end()) {
-                                    return curr_depth;
-                                } else {
-                                    return other_it->second.avg_core_count();
-                                }
-                            }();
+                            assert(depth_stats.baseline > 0.0);
+                            double other_depth = depth_stats.baseline;
+                            if (auto other_it = dbg.find(other_prev);
+                                other_it != dbg.end() &&
+                                !other_it->second.redirected()) {
+                                const double d = other_it->second.avg_core_count();
+                                if (d > 0.0) other_depth = d;
+                            }
                             // Lets combine the sequences here.
                             SequenceContainerType cur_seq{
                                 current->second.seq.begin(),
@@ -1266,12 +1460,43 @@ struct GraphCleaning {
                             SequenceContainerType pre_seq{
                                 pit->second.seq.begin(), pit->second.seq.end()};
 
-                            for (double covered = 0;
-                                 covered <
-                                 curr_depth -
-                                     other_depth;  // 1 less iteration, I want
-                                                   // to move the combined seqs.
-                                 covered += other_depth) {
+                            const auto copy_est = infer_loop_copy_numbers(
+                                other_depth, pr_depth, curr_depth, depth_stats);
+                            const int extra_turns =
+                                std::max(0, copy_est.loop_turns - 1);
+                            const double baseline = depth_stats.baseline;
+                            const double curr_cn = curr_depth / baseline;
+                            const double loop_cn = pr_depth / baseline;
+                            const double other_in_cn = other_depth / baseline;
+                            fprintf(stderr,
+                                    "[open_simple_loopsv2] cur=%llu loop=%llu "
+                                    "other_in=%llu curr_d=%.3f loop_d=%.3f "
+                                    "other_in_d=%.3f "
+                                    "baseline=%.3f curr_cn=%.3f loop_cn=%.3f "
+                                    "other_in_cn=%.3f "
+                                    "global_ref_d=%.3f raw(loop/curr)=%.3f/%.3f "
+                                    "rounded(loop/curr)=%d/%d "
+                                    "other_cn_round=%d turn_gain/thr=%.3f/%.3f "
+                                    "force_t1=%d "
+                                    "base_cn(real/round)=%.3f/%d "
+                                    "loop_turns=%d extra_turns=%d score=%.3f\n",
+                                    (unsigned long long)node,
+                                    (unsigned long long)pnode,
+                                    (unsigned long long)other_prev, curr_depth,
+                                    pr_depth, other_depth,
+                                    baseline, curr_cn, loop_cn, other_in_cn,
+                                    copy_est.global_ref_depth, copy_est.raw_loop_cn,
+                                    copy_est.raw_curr_cn, copy_est.loop_cn_rounded,
+                                    copy_est.curr_cn_rounded,
+                                    copy_est.other_cn_rounded,
+                                    copy_est.turn_event_gain,
+                                    copy_est.turn_event_threshold,
+                                    copy_est.turn_forced_single,
+                                    copy_est.base_cn,
+                                    copy_est.base_cn_rounded,
+                                    copy_est.loop_turns, extra_turns, copy_est.score);
+
+                            for (int turn = 0; turn < extra_turns; ++turn) {
                                 current->second.seq.push_back(
                                     SequenceContainerType::copy_of(pre_seq));
                                 current->second.seq.push_back(
@@ -1300,45 +1525,7 @@ struct GraphCleaning {
         }
         for (auto node : to_rm) {
             active_set.erase(node);
-        }
-    }
-
-    static void open_simple_loops(dbg_map_t &dbg,
-                                  [[maybe_unused]] lcmer_index_t &lci,
-                                  auto &active_set) {
-        for (auto &node : active_set) {
-            auto current = dbg.find(node);
-            if (current == dbg.end() || current->second.redirected()) {
-                continue;
-            }
-            if (current->second.forward_edge_count == 1 &&
-                current->second.prev.size() == 1) {
-                auto prev_it = dbg.find(current->second.prev[0]);
-                if (prev_it != dbg.end() && !prev_it->second.redirected()) {
-                    auto &prepre = prev_it->second.prev;
-                    for (auto pp = prepre.begin(); pp != prepre.end(); ++pp) {
-                        if (*pp == node) {  // Loop here
-                            *pp = std::numeric_limits<u64>::max();
-                            if (current->second.avg_core_count() >=
-                                2 * prev_it->second
-                                        .avg_core_count()) {  // TODO: this is
-                                                              // not right.
-                                // Need to duplicate the
-                                // sequence
-                                auto &tomerge = current->second.seq;
-                                for (auto it = tomerge.begin();
-                                     it != tomerge.end(); ++it) {
-                                    prev_it->second.seq.emplace_back(
-                                        std::move(*it));
-                                }
-                            }
-
-                            prev_it->second.forward_edge_count--;
-                            dbg.erase(current);
-                        }
-                    }
-                }
-            }
+            // dbg.erase(node);
         }
     }
     static void fix_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,
@@ -1385,7 +1572,6 @@ struct GraphCleaning {
     //         pop_bubbles(dbgi.dbg, dbgi.lci,
     //                     cfg.min_bubble_depth_difference_percentage);
     //         // cut_low_support_edges(dbgi.dbg, dbgi.lci);
-    //         open_simple_loops(dbgi.dbg, dbgi.lci);
     //         fix_edges(dbgi.dbg, dbgi.lci);
     //         redirect_deleted.clear();
     //         simplify_simple_paths(dbgi.dbg, dbgi.lci, redirect_deleted);
@@ -1419,6 +1605,11 @@ struct GraphCleaning {
             //                       active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
+            dump_initial_clean_contig_stats(
+                dbgi.dbg, active_set,
+                acfg.output + ".initial_clean_contig_stats.tsv");
+            const auto initial_depth_stats =
+                collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
                 fix_edges(dbgi.dbg, dbgi.lci, active_set);
 
@@ -1428,8 +1619,10 @@ struct GraphCleaning {
                 //             cfg.min_bubble_depth_difference_percentage,
                 //             active_set);
                 cut_low_support_edges(dbgi.dbg, dbgi.lci, active_set);
-                // open_simple_loops(dbgi.dbg, dbgi.lci, active_set);
-                open_simple_loopsv2(dbgi.dbg, dbgi.lci, active_set);
+                if (cfg.enable_loop_opening) {
+                    open_simple_loopsv2(dbgi.dbg, dbgi.lci, active_set,
+                                        initial_depth_stats);
+                }
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
                 //     return node.second.id == lci_type::max_id;
