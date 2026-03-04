@@ -557,85 +557,324 @@ inline void append_seqvec_ascii(const gtl::vector<SequenceContainerType> &seqs,
 
 template <class AssemblerT>
 inline std::string build_layout_sequence_from_nodes(
-    AssemblerT &as, dbg_index &dbg,
-    const gtl::vector<ultra_layout_node_info> &lnodes, int hash_combine_len) {
-    layout_small_graph small_bg;
+    [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
+    const gtl::vector<ultra_layout_node_info> &lnodes,
+    [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
+    struct lane_node {
+        u64 id = 0;
+        int from = 0;
+        int to = 0;
+        bool is_forward_lane = true;
+        std::string seq;
+        lcp_read lr;
+    };
+    if (lnodes.empty()) return {};
+
+    gtl::vector<lane_node> nodes;
+    nodes.reserve(lnodes.size());
+    charsi chs;
+
     for (const auto &n : lnodes) {
-        auto nodeit = dbg.dbg.find(n.id);
-        if (nodeit == dbg.dbg.end()) {
-            std::fprintf(stderr, "Error: Node %llu not found in graph\n",
-                         (unsigned long long)n.id);
-            std::exit(EXIT_FAILURE);
-        }
-        auto &node = nodeit->second;
-        lps str = {0, 0, 0, 0};
-        u64 hw = 0;
+        auto it = dbg.dbg.find(n.id);
+        if (it == dbg.dbg.end()) continue;
+        if (it->second.seq.empty()) continue;
+
+        lane_node ln;
+        ln.id = n.id;
+        ln.from = n.from;
+        ln.to = n.to;
+        ln.is_forward_lane = n.ori;
 
         if (n.ori) {
-            init_lps_crumbled(&str, node.seq, as.syncmer_functor);
-            lps_deepen(&str, as.lcp_level);
-            seqveciterator svit;
-            if (str.size > hash_combine_len) {
-                svit.move_only(node.seq, str.cores[hash_combine_len - 1].end);
-            }
-            for (int i = 0; i < str.size; ++i) {
-                u64 before = hw;
-                hw ^= str.cores[i].label;
-                hw &= (0x00000000FFFFFFFFull);
-                hw |= ((u64)str.cores[i].label << 32);
-                if (i >= hash_combine_len) {
-                    hw ^= str.cores[i - hash_combine_len].label;
-                    auto it_and_result = small_bg.try_emplace(hw, 1, before);
-                    if (!it_and_result.second) {
-                        it_and_result.first->second.core_count++;
-                        it_and_result.first->second.emplace_prev(before);
-                        svit.move_only(node.seq, str.cores[i].end);
-                    } else {
-                        it_and_result.first->second.seq.emplace_back(
-                            svit.get_and_move(node.seq, str.cores[i].end));
-                    }
-                }
-            }
+            append_seqvec_ascii(it->second.seq, ln.seq, chs);
+            ln.lr = AssemblerT::build_lr_cores(it->second.seq, as.syncmer_functor,
+                                               as.lcp_level);
         } else {
             gtl::vector<SequenceContainerType> rev_seqs;
-            rev_seqs.reserve(node.seq.size());
-            for (auto it = node.seq.rbegin(); it != node.seq.rend(); ++it) {
-                rev_seqs.emplace_back(it->reverse_complement());
+            rev_seqs.reserve(it->second.seq.size());
+            for (auto rit = it->second.seq.rbegin(); rit != it->second.seq.rend();
+                 ++rit) {
+                rev_seqs.emplace_back(rit->reverse_complement());
             }
-            seqveciterator svit;
-            init_lps_crumbled(&str, rev_seqs, as.syncmer_functor);
-            lps_deepen(&str, as.lcp_level);
-            if (str.size > hash_combine_len) {
-                svit.move_only(rev_seqs, str.cores[hash_combine_len - 1].end);
-            }
-            for (int i = 0; i < str.size; ++i) {
-                u64 before = hw;
-                hw ^= str.cores[i].label;
-                hw &= (0x00000000FFFFFFFFull);
-                hw |= ((u64)str.cores[i].label << 32);
-                if (i >= hash_combine_len) {
-                    hw ^= str.cores[i - hash_combine_len].label;
-                    auto it_and_result = small_bg.try_emplace(hw, 1, before);
-                    if (!it_and_result.second) {
-                        it_and_result.first->second.core_count++;
-                        it_and_result.first->second.emplace_prev(before);
-                        svit.move_only(rev_seqs, str.cores[i].end);
-                    } else {
-                        it_and_result.first->second.seq.emplace_back(
-                            svit.get_and_move(rev_seqs, str.cores[i].end));
+            append_seqvec_ascii(rev_seqs, ln.seq, chs);
+            ln.lr = AssemblerT::build_lr_cores(rev_seqs, as.syncmer_functor,
+                                               as.lcp_level);
+        }
+        if (!ln.seq.empty()) nodes.push_back(std::move(ln));
+    }
+    if (nodes.empty()) return {};
+
+    gtl::vector<size_t> fw_idx;
+    gtl::vector<size_t> rv_idx;
+    fw_idx.reserve(nodes.size());
+    rv_idx.reserve(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        if (nodes[i].is_forward_lane) {
+            fw_idx.push_back(i);
+        } else {
+            rv_idx.push_back(i);
+        }
+    }
+
+    auto by_layout_pos = [&](size_t ia, size_t ib) {
+        const auto &a = nodes[ia];
+        const auto &b = nodes[ib];
+        if (a.from != b.from) return a.from < b.from;
+        if (a.to != b.to) return a.to < b.to;
+        return a.id < b.id;
+    };
+    std::sort(fw_idx.begin(), fw_idx.end(), by_layout_pos);
+    std::sort(rv_idx.begin(), rv_idx.end(), by_layout_pos);
+
+    if (fw_idx.empty()) {
+        // Fallback to ordered full list when there are no forward-lane anchors.
+        gtl::vector<size_t> all_idx(nodes.size());
+        for (size_t i = 0; i < nodes.size(); ++i) all_idx[i] = i;
+        std::sort(all_idx.begin(), all_idx.end(), by_layout_pos);
+        fw_idx = std::move(all_idx);
+        rv_idx.clear();
+    }
+    std::fprintf(stderr,
+                 "[layout-stitch] layout=%llu nodes=%zu fw=%zu rv=%zu\n",
+                 (unsigned long long)layout_idx, nodes.size(), fw_idx.size(),
+                 rv_idx.size());
+
+    auto has_adj = [&](u64 a, u64 b) -> bool {
+        auto has_prev = [&](u64 to, u64 from) -> bool {
+            auto it = dbg.dbg.find(to);
+            if (it == dbg.dbg.end()) return false;
+            const auto &pv = it->second.prev;
+            return std::find(pv.begin(), pv.end(), from) != pv.end();
+        };
+        return has_prev(a, b) || has_prev(b, a);
+    };
+
+    auto estimate_trim_from_coords = [&](const lane_node &src,
+                                         const lane_node &dst) -> size_t {
+        // Layout intervals are inclusive; convert to overlap length.
+        int overlap_cores = src.to - dst.from + 1;
+        if (overlap_cores <= 0) return 0;
+        const int src_core_len = std::max(1, src.to - src.from);
+        const int dst_core_len = std::max(1, dst.to - dst.from);
+        const double src_scale =
+            static_cast<double>(src.seq.size()) / static_cast<double>(src_core_len);
+        const double dst_scale =
+            static_cast<double>(dst.seq.size()) / static_cast<double>(dst_core_len);
+        const double local_scale = 0.5 * (src_scale + dst_scale);
+        double overlap_bases = static_cast<double>(overlap_cores) * local_scale;
+        if (overlap_bases <= 0.0) return 0;
+        size_t trim = static_cast<size_t>(std::llround(overlap_bases));
+        if (trim > dst.seq.size()) trim = dst.seq.size();
+        return trim;
+    };
+
+    auto estimate_trim_from_cores = [&](const lane_node &src,
+                                        const lane_node &dst) -> size_t {
+        auto core_suffix_prefix_k = [&](const lane_node &a,
+                                        const lane_node &b) -> size_t {
+            const size_t a_n = a.lr.cores.size();
+            const size_t b_n = b.lr.cores.size();
+            if (a_n == 0 || b_n == 0) return 0;
+
+            const size_t max_k = std::min(a_n, b_n);
+            for (size_t k = max_k; k > 0; --k) {
+                const size_t a_off = a_n - k;
+                bool ok = true;
+                for (size_t i = 0; i < k; ++i) {
+                    if (a.lr.cores[a_off + i] != b.lr.cores[i]) {
+                        ok = false;
+                        break;
                     }
                 }
+                if (ok) return k;
+            }
+            return 0;
+        };
+
+        const size_t best_k = core_suffix_prefix_k(src, dst);
+        const size_t min_overlap_cores = std::max<size_t>(2, LCMER_L / 3);
+        if (best_k < min_overlap_cores) return 0;
+        if (dst.lr.pos.empty()) return 0;
+        const size_t pos_idx = std::min(best_k - 1, dst.lr.pos.size() - 1);
+        size_t trim = dst.lr.pos[pos_idx].second;
+        if (!dst.lr.pos.empty()) {
+            const size_t start0 = dst.lr.pos[0].first;
+            if (trim > start0) trim -= start0;
+        }
+        if (trim > dst.seq.size()) trim = dst.seq.size();
+        return trim;
+    };
+
+    gtl::flat_hash_map<u64, size_t> id_to_node_idx;
+    id_to_node_idx.reserve(nodes.size() + 8);
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        id_to_node_idx[nodes[i].id] = i;
+    }
+
+    gtl::vector<gtl::vector<size_t>> adj_idx(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        auto it = dbg.dbg.find(nodes[i].id);
+        if (it == dbg.dbg.end()) continue;
+        for (u64 p : it->second.prev) {
+            auto jt = id_to_node_idx.find(p);
+            if (jt == id_to_node_idx.end()) continue;
+            const size_t j = jt->second;
+            adj_idx[i].push_back(j);
+            adj_idx[j].push_back(i);
+        }
+    }
+
+    auto find_internal_path = [&](size_t left_idx, size_t right_idx,
+                                  bool reverse_only_internal)
+        -> gtl::vector<size_t> {
+        gtl::vector<int> parent(nodes.size(), -2);
+        std::queue<size_t> q;
+        parent[left_idx] = -1;
+        q.push(left_idx);
+
+        bool found = false;
+        while (!q.empty() && !found) {
+            const size_t u = q.front();
+            q.pop();
+            for (size_t v : adj_idx[u]) {
+                if (parent[v] != -2) continue;
+                if (reverse_only_internal &&
+                    v != right_idx && nodes[v].is_forward_lane) {
+                    continue;
+                }
+                parent[v] = static_cast<int>(u);
+                if (v == right_idx) {
+                    found = true;
+                    break;
+                }
+                q.push(v);
             }
         }
+        if (!found) return {};
+
+        gtl::vector<size_t> full_path;
+        for (size_t cur = right_idx; cur != left_idx;
+             cur = static_cast<size_t>(parent[cur])) {
+            full_path.push_back(cur);
+        }
+        full_path.push_back(left_idx);
+        std::reverse(full_path.begin(), full_path.end());
+
+        gtl::vector<size_t> internal_only;
+        for (size_t k = 1; k + 1 < full_path.size(); ++k) {
+            size_t idx = full_path[k];
+            if (!reverse_only_internal || !nodes[idx].is_forward_lane) {
+                internal_only.push_back(idx);
+            }
+        }
+        return internal_only;
+    };
+
+    // Build F-(R*)-F chain: forward lane as backbone, reverse lane as a path.
+    gtl::vector<size_t> chain;
+    chain.reserve(fw_idx.size() * 4);
+    for (size_t i = 0; i < fw_idx.size(); ++i) {
+        const size_t fi = fw_idx[i];
+        chain.push_back(fi);
+        if (i + 1 >= fw_idx.size() || rv_idx.empty()) continue;
+
+        const auto &left = nodes[fi];
+        const auto &right = nodes[fw_idx[i + 1]];
+        gtl::vector<size_t> bridge_path =
+            find_internal_path(fi, fw_idx[i + 1], true);
+        bool used_mixed_fallback = false;
+        if (bridge_path.empty()) {
+            bridge_path = find_internal_path(fi, fw_idx[i + 1], false);
+            used_mixed_fallback = !bridge_path.empty();
+        }
+        if (!bridge_path.empty()) {
+            // Avoid immediate bounce pattern ...R, F, R... across adjacent gaps.
+            // This typically re-introduces the same connector sequence twice.
+            std::fprintf(stderr,
+                         "[layout-stitch] layout=%llu bridge left=%llu "
+                         "right=%llu pick_path_len=%zu mode=%s path:",
+                         (unsigned long long)layout_idx,
+                         (unsigned long long)left.id,
+                         (unsigned long long)right.id, bridge_path.size(),
+                         used_mixed_fallback ? "mixed" : "reverse-only");
+            for (size_t ridx : bridge_path) {
+                const auto &r = nodes[ridx];
+                std::fprintf(stderr, " %llu%c[%d,%d]",
+                             (unsigned long long)r.id,
+                             r.is_forward_lane ? 'F' : 'R', r.from, r.to);
+                chain.push_back(ridx);
+            }
+            std::fprintf(stderr, "\n");
+        } else {
+            const bool direct_adj = has_adj(left.id, right.id);
+            std::fprintf(stderr,
+                         "[layout-stitch] layout=%llu bridge left=%llu "
+                         "right=%llu pick_path_len=0 direct_adj=%d\n",
+                         (unsigned long long)layout_idx,
+                         (unsigned long long)left.id,
+                         (unsigned long long)right.id, direct_adj ? 1 : 0);
+        }
+    }
+    if (chain.empty()) return {};
+
+    {
+        std::fprintf(stderr, "[layout-stitch] layout=%llu chain:",
+                     (unsigned long long)layout_idx);
+        for (size_t idx : chain) {
+            const auto &n = nodes[idx];
+            std::fprintf(stderr, " %llu%c[%d,%d]", (unsigned long long)n.id,
+                         n.is_forward_lane ? 'F' : 'R', n.from, n.to);
+        }
+        std::fprintf(stderr, "\n");
     }
 
     std::string merged_seq;
-    charsi chs;
-    auto lp = longest_path(small_bg);
-    for (auto &[id, seqs] : lp) {
-        (void)id;
-        append_seqvec_ascii(seqs, merged_seq, chs);
+    merged_seq = nodes[chain[0]].seq;
+    const size_t unresolved_gap_n = 64;
+    size_t last_kept_idx = chain[0];
+    for (size_t i = 1; i < chain.size(); ++i) {
+        const auto &prev = nodes[last_kept_idx];
+        const auto &cur = nodes[chain[i]];
+        const size_t core_trim = estimate_trim_from_cores(prev, cur);
+        const size_t coord_trim = estimate_trim_from_coords(prev, cur);
+        const bool adj = has_adj(prev.id, cur.id);
+        size_t trim = 0;
+        if (core_trim > 0) {
+            trim = std::max(core_trim, coord_trim);
+        } else if (adj) {
+            trim = coord_trim;
+        } else {
+            std::fprintf(
+                stderr,
+                "[layout-stitch] layout=%llu edge %llu%c->%llu%c core_trim=%zu "
+                "coord_trim=%zu chosen_trim=0 cur_len=%zu append=%zu "
+                "skip=0 reason=unresolved_gap\n",
+                (unsigned long long)layout_idx, (unsigned long long)prev.id,
+                prev.is_forward_lane ? 'F' : 'R', (unsigned long long)cur.id,
+                cur.is_forward_lane ? 'F' : 'R', core_trim, coord_trim,
+                cur.seq.size(), cur.seq.size());
+            merged_seq.append(unresolved_gap_n, 'N');
+            merged_seq.append(cur.seq);
+            last_kept_idx = chain[i];
+            continue;
+        }
+        if (trim > cur.seq.size()) trim = cur.seq.size();
+        const size_t append_len = (trim < cur.seq.size()) ? (cur.seq.size() - trim) : 0;
+        std::fprintf(
+            stderr,
+            "[layout-stitch] layout=%llu edge %llu%c->%llu%c core_trim=%zu "
+            "coord_trim=%zu chosen_trim=%zu cur_len=%zu append=%zu\n",
+            (unsigned long long)layout_idx, (unsigned long long)prev.id,
+            prev.is_forward_lane ? 'F' : 'R', (unsigned long long)cur.id,
+            cur.is_forward_lane ? 'F' : 'R', core_trim, coord_trim, trim,
+            cur.seq.size(), append_len);
+        if (trim < cur.seq.size()) {
+            merged_seq.append(cur.seq.data() + trim, cur.seq.size() - trim);
+        }
+        last_kept_idx = chain[i];
     }
+    std::fprintf(stderr, "[layout-stitch] layout=%llu result_len=%zu\n",
+                 (unsigned long long)layout_idx, merged_seq.size());
     return merged_seq;
 }
 
@@ -665,11 +904,13 @@ inline gtl::vector<std::string> build_layout_sequences_parallel(
                     continue;
                 }
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, hash_combine_len);
+                    as, dbg, jobs[job_idx].lnodes, hash_combine_len,
+                    jobs[job_idx].layout_idx);
             }
             while (job_queue.try_dequeue(job_idx)) {
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
-                    as, dbg, jobs[job_idx].lnodes, hash_combine_len);
+                    as, dbg, jobs[job_idx].lnodes, hash_combine_len,
+                    jobs[job_idx].layout_idx);
             }
         });
     }
@@ -690,7 +931,6 @@ inline gtl::vector<std::string> build_layout_sequences_parallel(
 template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
-    (void)recig;
 
     static constexpr uint8_t SIDE_START = 1;
     static constexpr uint8_t SIDE_END = 2;
@@ -1521,6 +1761,15 @@ inline void merge_layouts_ldbg(
     }
 }
 }  // namespace layout_graph_emit
+
+namespace layout_graph_lago{
+    struct lago{
+        gtl::vector<u64> forward_lane;
+        gtl::vector<u64> reverse_lane;
+        
+
+    };
+}
 
 // TODO if needed
 struct lsg_cleaning {
