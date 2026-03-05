@@ -1525,7 +1525,7 @@ struct GraphCleaning {
         }
         for (auto node : to_rm) {
             active_set.erase(node);
-            // dbg.erase(node);
+            dbg.erase(node);
         }
     }
     static void fix_edges(dbg_map_t &dbg, [[maybe_unused]] lcmer_index_t &lci,

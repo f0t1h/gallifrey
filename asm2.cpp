@@ -1185,9 +1185,11 @@ int run_assembly(const asm_config &cfg) {
         print_dbg_seqs(out, dbg);
         fclose(out);
     }
+
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph printing");
 
     layout_graph_emit::emit_ultra_merged_graph_stdout(as, dbg);
+    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged");
 
 #if 0
     // ultra
