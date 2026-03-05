@@ -547,17 +547,10 @@ struct ultra_layout_job {
     gtl::vector<ultra_layout_node_info> lnodes;
 };
 
-inline void append_seqvec_ascii(const gtl::vector<SequenceContainerType> &seqs,
-                                std::string &dst, charsi &buf) {
-    for (const auto &s : seqs) {
-        buf.require(s.len + 32);
-        s.convert_to_ascii((char *)buf.data);
-        dst.append((const char *)buf.data, s.len);
-    }
-}
+// append_seqvec_ascii removed — ASCII conversion deferred to print time
 
 template <class AssemblerT>
-inline std::string build_layout_sequence_from_nodes(
+inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
     const gtl::vector<ultra_layout_node_info> &lnodes,
     [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
@@ -572,9 +565,6 @@ inline std::string build_layout_sequence_from_nodes(
     };
 
     if (lnodes.empty()) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED: lnodes empty\n",
-                     (unsigned long long)layout_idx);
         return {};
     }
 
@@ -582,11 +572,10 @@ inline std::string build_layout_sequence_from_nodes(
     gtl::vector<lane_node> nodes;
     nodes.reserve(lnodes.size());
 
-    size_t skipped_not_found = 0, skipped_empty_seq = 0;
     for (const auto &n : lnodes) {
         auto it = dbg.dbg.find(n.id);
-        if (it == dbg.dbg.end()) { ++skipped_not_found; continue; }
-        if (it->second.seq.empty()) { ++skipped_empty_seq; continue; }
+        if (it == dbg.dbg.end()) continue;
+        if (it->second.seq.empty()) continue;
 
         lane_node ln;
         ln.id = n.id;
@@ -596,21 +585,7 @@ inline std::string build_layout_sequence_from_nodes(
         ln.raw_seqs = &it->second.seq;
         nodes.push_back(std::move(ln));
     }
-    if (skipped_not_found > 0 || skipped_empty_seq > 0) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED nodes: "
-                     "not_in_dbg=%zu empty_seq=%zu\n",
-                     (unsigned long long)layout_idx,
-                     skipped_not_found, skipped_empty_seq);
-    }
-    if (nodes.empty()) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED: all %zu lnodes "
-                     "filtered out (not_in_dbg=%zu empty_seq=%zu)\n",
-                     (unsigned long long)layout_idx, lnodes.size(),
-                     skipped_not_found, skipped_empty_seq);
-        return {};
-    }
+    if (nodes.empty()) return {};
 
     // Sort all contigs by layout position
     gtl::vector<size_t> sorted_idx(nodes.size());
@@ -624,27 +599,24 @@ inline std::string build_layout_sequence_from_nodes(
                   return a.id < b.id;
               });
 
-    // ── Fast path: 2 contigs (1 fw + 1 rv) → return the larger ──
-    if (nodes.size() == 2) {
-        size_t fi = SIZE_MAX, ri = SIZE_MAX;
-        for (size_t i = 0; i < nodes.size(); ++i) {
-            if (nodes[i].is_forward_lane) fi = i; else ri = i;
+    // ── Fast path: single contig → return its raw seqs directly ──
+    if (sorted_idx.size() == 1) {
+        size_t ci = sorted_idx[0];
+        if (!nodes[ci].is_forward_lane) {
+            const auto &raw = *nodes[ci].raw_seqs;
+            gtl::vector<SequenceContainerType> rev;
+            rev.reserve(raw.size());
+            for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
+                rev.emplace_back(rit->reverse_complement());
+            return rev;
         }
-        if (fi != SIZE_MAX && ri != SIZE_MAX) {
-            charsi fast_chs;
-            std::string fw_seq;
-            append_seqvec_ascii(*nodes[fi].raw_seqs, fw_seq, fast_chs);
-            std::string rv_seq;
-            {
-                const auto &raw = *nodes[ri].raw_seqs;
-                gtl::vector<SequenceContainerType> rev;
-                rev.reserve(raw.size());
-                for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
-                    rev.emplace_back(rit->reverse_complement());
-                append_seqvec_ascii(rev, rv_seq, fast_chs);
-            }
-            return fw_seq.size() >= rv_seq.size() ? fw_seq : rv_seq;
-        }
+        // Forward: need to construct from the iterator-pair ctor
+        // that concatenates fragments into one CrumbledSubSeq64
+        const auto &raw = *nodes[ci].raw_seqs;
+        gtl::vector<SequenceContainerType> result;
+        result.reserve(1);
+        result.emplace_back(raw.begin(), raw.end());
+        return result;
     }
 
     // ── Per-contig core sequences ─────────────────────────────────────
@@ -672,31 +644,20 @@ inline std::string build_layout_sequence_from_nodes(
             *seqs_ptr, as.syncmer_functor, as.lcp_level);
 
         if (lr.cores.empty()) {
-            // Synthetic single-core fallback so contig doesn't disappear
-            std::string fallback_seq;
-            charsi chs_fb;
-            append_seqvec_ascii(*seqs_ptr, fallback_seq, chs_fb);
-            if (fallback_seq.empty()) {
-                std::fprintf(stderr,
-                             "[layout-dag] layout=%llu SKIPPED contig=%llu: "
-                             "empty cores AND empty fallback seq\n",
-                             (unsigned long long)layout_idx,
-                             (unsigned long long)nodes[ci].id);
-                continue;
-            }
-            SequenceContainerType synth(fallback_seq.size(), 0);
-            for (size_t b = 0; b < fallback_seq.size(); ++b) {
-                uint8_t code = CrumbledSubSeq64::base_to_code(fallback_seq[b]);
-                size_t bit = b * 2;
-                synth.data[bit >> 6] |= static_cast<uint64_t>(code)
-                                        << (bit & 63);
-            }
+            // Synthetic single-core fallback — concatenate fragments
+            // directly without ASCII round-trip
+            const auto &frags = *seqs_ptr;
+            size_t total_len = 0;
+            for (const auto &f : frags) total_len += f.len;
+            if (total_len == 0) continue;
+
+            SequenceContainerType synth(frags.begin(), frags.end());
             gtl::vector<SequenceContainerType> synth_vec;
             synth_vec.push_back(std::move(synth));
             lcp_read synth_lr;
             synth_lr.cores.push_back(0);
             synth_lr.pos.emplace_back(0u,
-                static_cast<uint32_t>(fallback_seq.size()));
+                static_cast<uint32_t>(total_len));
             contig_lr[ci] = std::move(synth_lr);
             contig_core_seqs[ci] = std::move(synth_vec);
             contig_order.push_back(ci);
@@ -1116,18 +1077,18 @@ inline std::string build_layout_sequence_from_nodes(
               });
 
 
-    // ── Phase 3: Emit sequence ─────────────────────────────────────────
-    // For each node on the path, emit from a consistent contig to avoid
-    // boundary mismatches at merged nodes. Track the "current contig" and
-    // only switch when the current contig doesn't pass through a node.
-    std::string merged_seq;
-    merged_seq.reserve(n * 64);
-    charsi chs;
-    const size_t unresolved_gap_n = 64;
+    // ── Phase 3: Collect output sequences ──────────────────────────────
+    // For each node on the path, pick a consistent contig to avoid
+    // boundary mismatches at merged nodes. Collect CrumbledSubSeq64
+    // objects directly — defer ASCII conversion to print time.
+    gtl::vector<SequenceContainerType> merged_seqs;
+    merged_seqs.reserve(n);
 
     for (size_t ci = 0; ci < comp_paths.size(); ++ci) {
-        if (ci > 0 && !merged_seq.empty())
-            merged_seq.append(unresolved_gap_n, 'N');
+        if (ci > 0 && !merged_seqs.empty()) {
+            // Sentinel: zero-len entry signals N-gap between components
+            merged_seqs.emplace_back(0, 0);
+        }
 
         const auto &path = comp_paths[ci].path;
         size_t emit_contig = SIZE_MAX;
@@ -1150,8 +1111,7 @@ inline std::string build_layout_sequence_from_nodes(
             }
 
             // If current contig doesn't pass through this node, switch.
-            // Prefer the contig that also appears in the NEXT node (for
-            // continuity).
+            // Prefer the contig that also appears in the NEXT node.
             if (use_contig == SIZE_MAX) {
                 if (pi + 1 < path.size()) {
                     const auto &nc_next = node_contigs[path[pi + 1]];
@@ -1165,7 +1125,6 @@ inline std::string build_layout_sequence_from_nodes(
                         }
                     }
                 }
-                // Fallback: use the first contig in this node
                 if (!nc.empty()) {
                     use_contig = nc[0].first;
                     use_core = nc[0].second;
@@ -1179,30 +1138,24 @@ inline std::string build_layout_sequence_from_nodes(
             auto cs_it = contig_core_seqs.find(use_contig);
             if (cs_it != contig_core_seqs.end() &&
                 use_core < cs_it->second.size()) {
-                const auto &core_seq = cs_it->second[use_core];
+                auto &core_seq = cs_it->second[use_core];
                 if (core_seq.len > 0) {
-                    chs.require(core_seq.len + 32);
-                    core_seq.convert_to_ascii((char *)chs.data);
-                    merged_seq.append((const char *)chs.data, core_seq.len);
+                    merged_seqs.push_back(std::move(core_seq));
                 }
             }
         }
     }
 
-    if (merged_seq.empty()) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED: POA produced empty "
-                     "sequence (poa_nodes=%zu components=%d)\n",
-                     (unsigned long long)layout_idx, n, num_comps);
-    }
-    return merged_seq;
+    return merged_seqs;
 }
 
+using layout_seq_t = gtl::vector<SequenceContainerType>;
+
 template <class AssemblerT>
-inline gtl::vector<std::string> build_layout_sequences_parallel(
+inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
     AssemblerT &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs,
     int hash_combine_len) {
-    gtl::vector<std::string> out_seqs(jobs.size());
+    gtl::vector<layout_seq_t> out_seqs(jobs.size());
     if (jobs.empty()) return out_seqs;
 
     using job_q_t = moodycamel::BlockingConcurrentQueue<size_t>;
@@ -1263,7 +1216,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 
     struct supernode_out {
         std::string name;
-        std::string seq;
+        gtl::vector<SequenceContainerType> seqs;
         bool is_layout;
         u64 aux_id;
     };
@@ -1342,24 +1295,24 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         const auto &job = layout_jobs[i];
         const u64 sid = supernodes.size();
         supernodes.push_back({"M" + std::to_string(job.layout_idx),
-                              std::move(layout_seqs[i]), true, job.layout_idx});
+                              std::move(layout_seqs[i]),
+                              true, job.layout_idx});
         for (const auto &n : job.lnodes) {
             node_to_super[n.id] = sid;
         }
     }
 
-    charsi chs;
     for (u64 node_id : dbg.active_set) {
         if (nodes_in_layouts.contains(node_id)) continue;
         auto it = dbg.dbg.find(node_id);
         if (it == dbg.dbg.end()) continue;
         if (it->second.redirected() || it->second.seq.empty()) continue;
 
-        std::string seq;
-        append_seqvec_ascii(it->second.seq, seq, chs);
         const u64 sid = supernodes.size();
         supernodes.push_back(
-            {"C" + std::to_string(node_id), std::move(seq), false, node_id});
+            {"C" + std::to_string(node_id),
+             std::move(it->second.seq),
+             false, node_id});
         node_to_super[node_id] = sid;
     }
 
@@ -1418,16 +1371,30 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
     }
 
+    // Print supernodes — convert CrumbledSubSeq64 to ASCII only now
+    constexpr size_t N_GAP_LEN = 64;
+    charsi chs;
     for (const auto &sn : supernodes) {
-        if (sn.is_layout) {
-            std::fprintf(out, "S\t%s\t%s\tTP:Z:layout\tLY:i:%llu\n",
-                         sn.name.c_str(), sn.seq.c_str(),
-                         (unsigned long long)sn.aux_id);
-        } else {
-            std::fprintf(out, "S\t%s\t%s\tTP:Z:unitig\tUI:i:%llu\n",
-                         sn.name.c_str(), sn.seq.c_str(),
-                         (unsigned long long)sn.aux_id);
+        const char *tp = sn.is_layout ? "layout" : "unitig";
+        const char *id_tag = sn.is_layout ? "LY" : "UI";
+        std::fprintf(out, "S\t%s\t", sn.name.c_str());
+        bool any_printed = false;
+        for (const auto &s : sn.seqs) {
+            if (s.len == 0) {
+                // N-gap sentinel
+                for (size_t i = 0; i < N_GAP_LEN; ++i)
+                    std::fputc('N', out);
+                any_printed = true;
+                continue;
+            }
+            chs.require(s.len + 32);
+            s.convert_to_ascii((char *)chs.data);
+            std::fwrite(chs.data, 1, s.len, out);
+            any_printed = true;
         }
+        if (!any_printed) std::fputc('*', out);
+        std::fprintf(out, "\tTP:Z:%s\t%s:i:%llu\n",
+                     tp, id_tag, (unsigned long long)sn.aux_id);
     }
     for (const auto &[_, edge] : merged_edges) {
         const auto &src_name = supernodes[edge.src_super].name;
