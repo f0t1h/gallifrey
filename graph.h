@@ -118,9 +118,9 @@ struct dbg_index_base {
         // lci_type(u64 _id) : id(_id), pos(-1) {}
     };
     using lcmer_index_t = gtl::parallel_flat_hash_map<
-        lcmer<LCMER_L>, lci_type, std::hash<lcmer<LCMER_L>>,
-        gtl::priv::hash_default_eq<lcmer<LCMER_L>>,
-        std::allocator<std::pair<const lcmer<LCMER_L>, lci_type>>, HT_SHARD_BC,
+        LCmer, lci_type, std::hash<LCmer>,
+        gtl::priv::hash_default_eq<LCmer>,
+        std::allocator<std::pair<const LCmer, lci_type>>, HT_SHARD_BC,
         mutex_type>;
 
     dbg_map_t dbg;
@@ -135,7 +135,7 @@ struct dbg_index_base {
         : bf{false_positive_rate, projected_count, seed} {}
 
     // dbg_index(const dbg_index &other)
-    lci_type get(const lcmer<LCMER_L> &l) const {
+    lci_type get(const LCmer &l) const {
         auto it = lci.find(l);
         return it == lci.end() ? lci_type::empty() : it->second;
         // if (lci.contains(l)) {
@@ -557,7 +557,7 @@ struct dbg_index_base {
     //     //     }
     //     // }
     // }
-    u64 emplace_nobloomfilter(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+    u64 emplace_nobloomfilter(const LCmer &l, u64 &idx, int tid) {
         auto vv = lci.try_emplace(l, idx | tid);
         if (vv.second) {  // Means new item on the table
             idx += lcindex_increment;
@@ -565,7 +565,7 @@ struct dbg_index_base {
         }
         return vv.first->second.id;
     }
-    u64 emplace(const lcmer<LCMER_L> &l, u64 &idx, int tid) {
+    u64 emplace(const LCmer &l, u64 &idx, int tid) {
         auto new_hash = lci.hash(l);
         if (!bf.contains(new_hash)) {
             bf.insert(new_hash);

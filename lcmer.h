@@ -196,13 +196,51 @@ struct lcmer {
         return l;
     }
 
-    uint32_t update_lcmer(uint32_t new_core) {
+    uint32_t update_lcmer(uint32_t new_core, [[maybe_unused]] uint32_t outcore) {
         uint32_t old_core = data[0];
         for (int i = 1; i < N; ++i) {
             data[i - 1] = data[i];
         }
         data[N - 1] = new_core;
         return old_core;
+    }
+};
+
+template <int N>
+union litecmer {
+    uint32_t parts[2];
+    uint64_t value;
+
+    litecmer() : value(0) {}
+    litecmer(const litecmer<N> &other)
+        : value{other.value} {}
+    litecmer(std::forward_iterator auto it) : value{0}{
+        for (int i = 0; i < N - 1; ++i) {
+            parts[0] ^= *(it++);
+        }
+        parts[1] = *it;
+    }
+
+    litecmer<N> &operator=(const litecmer<N> &other) {
+        value = other.value;
+        return *this;
+    }
+
+    void update_lcmer(uint32_t new_core, uint32_t out_core) {
+        parts[0] ^= parts[1];
+        parts[0] ^= out_core;
+        parts[1] = new_core;
+    }
+
+    constexpr auto operator<=>(const litecmer &other) const {return value <=> other.value;};
+    constexpr bool operator==(const litecmer &other) const {return value == other.value;}
+};
+using LCmer = litecmer<LCMER_L>;
+
+template <int N>
+struct std::hash<litecmer<N>> {
+    std::size_t operator()(const litecmer<N> &l) const noexcept {
+        return l.value;
     }
 };
 

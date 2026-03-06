@@ -20,11 +20,7 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
-#include <limits>
-#include <map>
-#include <optional>
-#include <queue>
-#include <stack>
+
 #include <string>
 #include <tuple>
 #include <utility>
@@ -153,7 +149,7 @@ struct assembler {
     }
     static gtl::vector<uint64_t> find_lcmers(const lcp_read &lr,
                                              const dbg_index &dbgi) {
-        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1};  // Skip first core;
 
         gtl::vector<uint64_t> ll(1, 0);
         ll.reserve(lr.cores.size() - LCMER_L + 3);
@@ -161,7 +157,7 @@ struct assembler {
         ll.push_back(lval.id);
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
             lval = dbgi.get(l);
             ll.push_back(lval.id);
         }
@@ -175,11 +171,11 @@ struct assembler {
         if (lr.cores.size() <
             static_cast<size_t>(LCMER_L + skip_first + skip_last)) {
             return gtl::vector<
-                std::tuple<u64, u64, u64, lcmer<LCMER_L>, lcmer<LCMER_L>>>{};
+                std::tuple<u64, u64, u64, LCmer, LCmer>>{};
         }
 
-        lcmer<LCMER_L> l{lr.cores.begin() + skip_first};  // Skip first core;
-        gtl::vector<std::tuple<u64, u64, u64, lcmer<LCMER_L>, lcmer<LCMER_L>>>
+        LCmer l{lr.cores.begin() + skip_first};  // Skip first core;
+        gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>>
             llr;
 
         dbg_index::lci_type lval = dbgi.get(l);
@@ -188,7 +184,7 @@ struct assembler {
         for (long long i = skip_first + 1;
              i < ((long long)lr.cores.size() - LCMER_L - skip_last); ++i) {
             uint32_t in_core = lr.cores[i + LCMER_L - 1];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i - 1]);
             lval = dbgi.get(l);
             if (lval.id == std::get<0>(llr.back())) {  // Extend the previous
                 std::get<2>(llr.back()) = i;
@@ -202,7 +198,7 @@ struct assembler {
     template <class BFT>
     static void process_cores(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
                               int thread_id, uint64_t &lcmer_index) {
-        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1};  // Skip first core;
         gtl::vector<std::tuple<u64, u64, u64>> llr;
 
         gtl::vector<uint64_t> ll(1, 0);
@@ -210,7 +206,7 @@ struct assembler {
         ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
         for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
             ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
         }
         ll.push_back(0);
@@ -238,7 +234,7 @@ struct assembler {
         // Layouting will be done in core-index space. Only at the final
         // emission step will we scale core-space layout positions into base
         // offsets.
-        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1};  // Skip first core;
 
         uint64_t val = dbgi.get(l).id;
 
@@ -256,7 +252,7 @@ struct assembler {
                 }
             });
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
             val = dbgi.get(l).id;
         }
     }
@@ -545,10 +541,10 @@ struct assembler {
         //
         // These indices are later used to "switch" between SequenceContainer
         // streams at overlap boundaries without base-offset arithmetic.
-        lcmer<LCMER_L> first_matching_lcmer_query;
-        lcmer<LCMER_L> last_matching_lcmer_query;
-        lcmer<LCMER_L> first_matching_lcmer_target;
-        lcmer<LCMER_L> last_matching_lcmer_target;
+        LCmer first_matching_lcmer_query;
+        LCmer last_matching_lcmer_query;
+        LCmer first_matching_lcmer_target;
+        LCmer last_matching_lcmer_target;
     };
 
     auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
@@ -643,11 +639,11 @@ struct assembler {
             return;
         }
         gtl::vector<u64> ll = {0};
-        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1};  // Skip first core;
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
         for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
             uint32_t in_core = lr.cores[i + LCMER_L];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i- LCMER_L]);
             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
         }
         ll.push_back(0);
@@ -917,14 +913,14 @@ struct assembler {
             free_lps(&str);
             return {};
         }
-        lcmer<LCMER_L> l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1};  // Skip first core;
         gtl::vector<u64> ll;
 
         u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
         ll.emplace_back(lval);
         for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
             uint32_t in_core = lr.cores[i + LCMER_L];
-            l.update_lcmer(in_core);
+            l.update_lcmer(in_core, lr.cores[i- LCMER_L]);
             lval = dbgi.emplace_nobloomfilter(l, idx, tid);
             ll.emplace_back(lval);
         }
@@ -1329,7 +1325,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
 //         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
 //     }
-//     lcmer<LCMER_L> l(mock_cores.begin());
+//     LCmer l(mock_cores.begin());
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
@@ -1406,7 +1402,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
 //         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
 //     }
-//     lcmer<LCMER_L> l(mock_cores.begin());
+//     LCmer l(mock_cores.begin());
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
@@ -1424,7 +1420,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 
 //     ll.clear();
 //     mock_cores[MOCK_CORE_COUNT / 2] = 123123123;
-//     l = lcmer<LCMER_L>(mock_cores.begin());
+//     l = LCmer(mock_cores.begin());
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
 //     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
@@ -1465,7 +1461,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     for (int i = 0; i < MOCK_CORE_COUNT; i++) {
 //         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
 //     }
-//     lcmer<LCMER_L> l(mock_cores.begin());
+//     LCmer l(mock_cores.begin());
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
@@ -1485,7 +1481,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     }
 //     ll.clear();
 //     mock_cores[12] = 123123123;
-//     l = lcmer<LCMER_L>(mock_cores.begin());
+//     l = LCmer(mock_cores.begin());
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
 //     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
@@ -1516,7 +1512,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 // TEST_CASE("Graph simplification Tips (Incoming)") {
 //     dbg_index dbgi{0.95, 10, 0};
 //     gtl::vector<u32> mock_cores;
-//     lcmer<LCMER_L> l;
+//     LCmer l;
 //     gtl::vector<u64> ll;
 
 //     u64 idx = 0;
@@ -1525,7 +1521,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //         mock_cores.push_back(MurmurHash3_32(&i, sizeof(int), 156));
 //     }
 //     for (int DEPTH = 0; DEPTH < 10; ++DEPTH) {
-//         l = lcmer<LCMER_L>(mock_cores.begin());
+//         l = LCmer(mock_cores.begin());
 
 //         ll.push_back(0);
 
@@ -1545,7 +1541,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     }
 //     ll.push_back(0);
 //     mock_cores[8] = 123123123;
-//     l = lcmer<LCMER_L>(mock_cores.begin() + 7);
+//     l = LCmer(mock_cores.begin() + 7);
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
 //     for (int i = LCMER_L + 7; i < MOCK_CORE_COUNT - 1; ++i) {
