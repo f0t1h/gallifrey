@@ -8,10 +8,12 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
 #include <string>
+#include <type_traits>
 
 #include "ext/lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
@@ -196,7 +198,8 @@ struct lcmer {
         return l;
     }
 
-    uint32_t update_lcmer(uint32_t new_core, [[maybe_unused]] uint32_t outcore) {
+    uint32_t update_lcmer(uint32_t new_core,
+                          [[maybe_unused]] uint32_t outcore) {
         uint32_t old_core = data[0];
         for (int i = 1; i < N; ++i) {
             data[i - 1] = data[i];
@@ -206,41 +209,116 @@ struct lcmer {
     }
 };
 
-template <int N>
-union litecmer {
-    uint32_t parts[2];
-    uint64_t value;
+struct litecmer {
+    struct words_t {
+        uint32_t hi;
+        uint32_t lo;
+    };
+    words_t words;
+    static constexpr uint32_t kPolyBase = 0x9e3779b1u;
+    static_assert(sizeof(words_t) == sizeof(uint64_t));
+    static_assert(std::is_trivially_copyable_v<words_t>);
 
-    litecmer() : value(0) {}
-    litecmer(const litecmer<N> &other)
-        : value{other.value} {}
-    litecmer(std::forward_iterator auto it) : value{0}{
-        for (int i = 0; i < N - 1; ++i) {
-            parts[0] ^= *(it++);
+    litecmer() : words{0, 0} {}
+    litecmer(const litecmer &other) : words(other.words) {}
+    litecmer(std::forward_iterator auto it, int n) : words{0, 0} {
+        if (n > 1) {
+            uint32_t h = 0;
+            for (int i = 0; i < n - 1; ++i) {
+                h = h * kPolyBase + *(it++);
+            }
+            words.hi = h;
+            words.lo = *it;
+        } else {
+            words.lo = *it;
         }
-        parts[1] = *it;
     }
 
-    litecmer<N> &operator=(const litecmer<N> &other) {
-        value = other.value;
+    litecmer &operator=(const litecmer &other) {
+        words = other.words;
         return *this;
     }
 
-    void update_lcmer(uint32_t new_core, uint32_t out_core) {
-        parts[0] ^= parts[1];
-        parts[0] ^= out_core;
-        parts[1] = new_core;
+    constexpr uint32_t hi() const { return words.hi; }
+    constexpr uint32_t lo() const { return words.lo; }
+    constexpr uint64_t native_bitcast_value() const {
+        return std::bit_cast<uint64_t>(words);
+    }
+    constexpr uint64_t value() const {
+        return (static_cast<uint64_t>(words.hi) << 32) |
+               static_cast<uint64_t>(words.lo);
     }
 
-    constexpr auto operator<=>(const litecmer &other) const {return value <=> other.value;};
-    constexpr bool operator==(const litecmer &other) const {return value == other.value;}
+    static uint32_t poly_pow(uint32_t base, int exp) {
+        uint32_t out = 1;
+        for (int i = 0; i < exp; ++i) {
+            out *= base;
+        }
+        return out;
+    }
+
+    static litecmer make_poly(std::forward_iterator auto it, int n) {
+        return litecmer(it, n);
+    }
+
+    static litecmer make_xor(std::forward_iterator auto it, int n) {
+        litecmer l;
+        for (int i = 0; i < n - 1; ++i) {
+            l.words.hi ^= *(it++);
+        }
+        l.words.lo = *it;
+        return l;
+    }
+
+    void update_lcmer_xor(uint32_t new_core, uint32_t out_core) {
+        words.hi ^= words.lo;
+        words.hi ^= out_core;
+        words.lo = new_core;
+    }
+
+    // Order-sensitive rolling update for first N-1 cores.
+    // Requires state initialized by make_poly().
+    void update_lcmer_poly(uint32_t new_core, uint32_t out_core, int n) {
+        if (n > 1) {
+            const uint32_t kOutMul = poly_pow(kPolyBase, n - 2);
+            uint32_t h = words.hi;
+            h -= out_core * kOutMul;
+            h = h * kPolyBase + words.lo;
+            words.hi = h;
+        }
+        words.lo = new_core;
+    }
+
+    void update_lcmer(uint32_t new_core, uint32_t out_core, int n) {
+        update_lcmer_poly(new_core, out_core, n);
+    }
+
+    constexpr auto operator<=>(const litecmer &other) const {
+        return value() <=> other.value();
+    };
+    constexpr bool operator==(const litecmer &other) const {
+        return value() == other.value();
+    }
 };
-using LCmer = litecmer<LCMER_L>;
+using LCmer = litecmer;
 
 template <int N>
-struct std::hash<litecmer<N>> {
-    std::size_t operator()(const litecmer<N> &l) const noexcept {
-        return l.value;
+struct combined_lcmer {
+    lcmer<N> full;
+    litecmer lite;
+
+    combined_lcmer(std::forward_iterator auto it) : full(it), lite(it, N) {}
+
+    void update_lcmer(uint32_t new_core, uint32_t out_core) {
+        full.update_lcmer(new_core, out_core);
+        lite.update_lcmer(new_core, out_core, N);
+    }
+};
+
+template <>
+struct std::hash<litecmer> {
+    std::size_t operator()(const litecmer &l) const noexcept {
+        return l.value();
     }
 };
 

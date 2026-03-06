@@ -88,6 +88,8 @@ struct assembler {
     uint64_t seed;
     decltype(asm_config::syncmer) syncmer_params;
     SyncmerType syncmer_functor;
+    int dbg_lcmer_l;
+    int olc_lcmer_l;
 
     assembler(const asm_config &cfg)
         : input{cfg.input},
@@ -97,7 +99,9 @@ struct assembler {
           bloom{cfg.bloom},
           seed{cfg.seed},
           syncmer_params{cfg.syncmer},
-          syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)} {}
+          syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
+          dbg_lcmer_l{cfg.dbg_lcmer_l},
+          olc_lcmer_l{cfg.dbg_lcmer_l} {}
 
     template <class BFT>
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
@@ -114,7 +118,7 @@ struct assembler {
                 return dbgi.dbg.lazy_emplace_l(
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
-                        val.second.core_count++;
+                        val.second.counts.core_count++;
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
                         ctr(ll[i], typename index_type::bidbg_val{1});
@@ -138,7 +142,7 @@ struct assembler {
                     ll[i],
                     [&](index_type::dbg_map_t::value_type &val) {
                         val.second.emplace_prev(ll[i - 1]);
-                        val.second.core_count++;
+                        val.second.counts.core_count++;
                     },
                     [&](const index_type::dbg_map_t::constructor &ctr) {
                         ctr(ll[i],
@@ -148,43 +152,46 @@ struct assembler {
         }
     }
     static gtl::vector<uint64_t> find_lcmers(const lcp_read &lr,
-                                             const dbg_index &dbgi) {
-        LCmer l{lr.cores.begin() + 1};  // Skip first core;
+                                             const dbg_index &dbgi,
+                                             int lcmer_l) {
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
 
         gtl::vector<uint64_t> ll(1, 0);
-        ll.reserve(lr.cores.size() - LCMER_L + 3);
+        ll.reserve(lr.cores.size() - lcmer_l + 3);
         dbg_index::lci_type lval = dbgi.get(l);
         ll.push_back(lval.id);
-        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
+             ++i) {
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
+            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
             lval = dbgi.get(l);
             ll.push_back(lval.id);
         }
         ll.push_back(0);
         return ll;
     }
-    static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi) {
-        long skip_first = LCMER_L;
-        long skip_last = 2 * LCMER_L;
+    static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
+                                  int lcmer_l) {
+        long skip_first = lcmer_l;
+        long skip_last = 2 * lcmer_l;
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
-            static_cast<size_t>(LCMER_L + skip_first + skip_last)) {
+            static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
             return gtl::vector<
                 std::tuple<u64, u64, u64, LCmer, LCmer>>{};
         }
 
-        LCmer l{lr.cores.begin() + skip_first};  // Skip first core;
+        LCmer l{lr.cores.begin() + skip_first, lcmer_l};  // Skip first core;
         gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>>
             llr;
 
         dbg_index::lci_type lval = dbgi.get(l);
         llr.emplace_back(lval.id, skip_first, skip_first, l, l);
-        // Fix: ensure we don't go out of bounds when accessing i + LCMER_L
+        // Fix: ensure we don't go out of bounds when accessing i + runtime_lcmer_l
         for (long long i = skip_first + 1;
-             i < ((long long)lr.cores.size() - LCMER_L - skip_last); ++i) {
-            uint32_t in_core = lr.cores[i + LCMER_L - 1];
-            l.update_lcmer(in_core, lr.cores[i - 1]);
+             i < ((long long)lr.cores.size() - lcmer_l - skip_last); ++i) {
+            uint32_t in_core = lr.cores[i + lcmer_l - 1];
+            l.update_lcmer(in_core, lr.cores[i - 1], lcmer_l);
             lval = dbgi.get(l);
             if (lval.id == std::get<0>(llr.back())) {  // Extend the previous
                 std::get<2>(llr.back()) = i;
@@ -197,16 +204,18 @@ struct assembler {
     }
     template <class BFT>
     static void process_cores(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
-                              int thread_id, uint64_t &lcmer_index) {
-        LCmer l{lr.cores.begin() + 1};  // Skip first core;
+                              int thread_id, uint64_t &lcmer_index,
+                              int lcmer_l) {
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
         gtl::vector<std::tuple<u64, u64, u64>> llr;
 
         gtl::vector<uint64_t> ll(1, 0);
-        ll.reserve(lr.cores.size() - LCMER_L + 3);
+        ll.reserve(lr.cores.size() - lcmer_l + 3);
         ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
-        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
+             ++i) {
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
+            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
             ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
         }
         ll.push_back(0);
@@ -216,17 +225,18 @@ struct assembler {
                 // Lets try atomic
                 dbgi.dbg.modify_if(
                     ll[i],
-                    [&lr, i](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
+                    [&lr, i, lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type
+                                          &val) {
                         val.second.seq.emplace_back(
-                            lr.data, lr.pos[i + LCMER_L - 1].second,
-                            lr.pos[i + LCMER_L].second, val.first);
+                            lr.data, lr.pos[i + lcmer_l - 1].second,
+                            lr.pos[i + lcmer_l].second, val.first);
                     });
             }
         }
     }
     static void process_cores_for_basespace(
         const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
-        [[maybe_unused]] uint64_t &lcmer_index) {
+        [[maybe_unused]] uint64_t &lcmer_index, int lcmer_l) {
         // Keep the DBG node sequences in BASE space (actual substrings), but do
         // NOT convert overlap/layout coordinates to base space during
         // layouting/merging.
@@ -234,11 +244,12 @@ struct assembler {
         // Layouting will be done in core-index space. Only at the final
         // emission step will we scale core-space layout positions into base
         // offsets.
-        LCmer l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
 
         uint64_t val = dbgi.get(l).id;
 
-        for (size_t i = LCMER_L + 1; i < lr.cores.size() - 1; ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
+             ++i) {
             uint64_t from = lr.pos[i - 1].second;
             uint64_t to = lr.pos[i].second;
 
@@ -252,7 +263,7 @@ struct assembler {
                 }
             });
             uint32_t in_core = lr.cores[i];
-            l.update_lcmer(in_core, lr.cores[i - LCMER_L]);
+            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
             val = dbgi.get(l).id;
         }
     }
@@ -279,9 +290,8 @@ struct assembler {
     static auto process_data(
         int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
         dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
-        int &all_reads,
-        decltype(assembler::process_cores<DefaultBF>) Process_Func,
-        SyncmerType syncmer_functor) {
+        int &all_reads, auto Process_Func, SyncmerType syncmer_functor,
+        int lcmer_l) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
@@ -302,13 +312,13 @@ struct assembler {
             parse_cores_from_bam_record(bam_get_seq(data_p),
                                         data_p->core.l_qseq, lcp_level, &str,
                                         syncmer_functor, chs, lr, pos_buf);
-            if (lr.cores.size() < LCMER_L + 2) {
+            if (lr.cores.size() < static_cast<size_t>(lcmer_l + 2)) {
                 // printf("Skipping read %lld, cores.size()=%zu\n", here,
                 // lr.cores.size());
                 goto pd_cleanup;
             }
             ++processed_read_count;
-            Process_Func(lr, dbgi, thread_id, lcmer_index);
+            Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
         pd_cleanup:
             if (!recycle_queue.try_dequeue(data_p)) {
                 bam_destroy1(data_p);
@@ -398,11 +408,12 @@ struct assembler {
 
         for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back(
-                process_data, tid, lcp_level, std::ref(data_queue),
-                std::ref(recycle_queue), std::ref(dbgi), std::ref(done),
-                std::ref(valid_read_counts[tid - 1]),
-                std::ref(all_read_counts[tid - 1]), process_cores<DefaultBF>,
-                std::cref(syncmer_functor));
+                [&, tid]() {
+                    process_data(
+                        tid, lcp_level, data_queue, recycle_queue, dbgi, done,
+                        valid_read_counts[tid - 1], all_read_counts[tid - 1],
+                        process_cores<DefaultBF>, syncmer_functor, dbg_lcmer_l);
+                });
         }
 
         if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
@@ -437,11 +448,13 @@ struct assembler {
 
         for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back(
-                process_data, tid, lcp_level, std::ref(data_queue),
-                std::ref(recycle_queue), std::ref(dbgi), std::ref(done),
-                std::ref(valid_read_counts[tid - 1]),
-                std::ref(all_read_counts[tid - 1]), process_cores_for_basespace,
-                std::cref(syncmer_functor));
+                [&, tid]() {
+                    process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
+                                 done, valid_read_counts[tid - 1],
+                                 all_read_counts[tid - 1],
+                                 process_cores_for_basespace, syncmer_functor,
+                                 dbg_lcmer_l);
+                });
         }
         if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
                            threads.io)) {
@@ -633,17 +646,17 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        if (lr.cores.size() < LCMER_L + 1) {
+        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
             // good_n.fetch_sub(1);
             free_lps(&str);
             return;
         }
         gtl::vector<u64> ll = {0};
-        LCmer l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
-            uint32_t in_core = lr.cores[i + LCMER_L];
-            l.update_lcmer(in_core, lr.cores[i- LCMER_L]);
+        for (size_t i = 2; i < lr.cores.size() - olc_lcmer_l - 1; ++i) {
+            uint32_t in_core = lr.cores[i + olc_lcmer_l];
+            l.update_lcmer(in_core, lr.cores[i - olc_lcmer_l], olc_lcmer_l);
             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
         }
         ll.push_back(0);
@@ -652,10 +665,10 @@ struct assembler {
             if (insert_lcmer_helper(ll, i, dbgi)) {
                 dbgi.dbg.modify_if(
                     ll[i],
-                    [&lr, i, &subseqs](dbg_index::dbg_map_t::value_type &val) {
+                    [&lr, i, &subseqs, this](dbg_index::dbg_map_t::value_type &val) {
                         val.second.seq.emplace_back(
-                            subseqs, lr.pos[i + LCMER_L - 1].second,
-                            lr.pos[i + LCMER_L].second);
+                            subseqs, lr.pos[i + olc_lcmer_l - 1].second,
+                            lr.pos[i + olc_lcmer_l].second);
                     });
             }
         }
@@ -675,7 +688,7 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        // if (lr.cores.size() < LCMER_L + 2) {
+        // if (lr.cores.size() < runtime_lcmer_l + 2) {
         //     // free_lps(&str);
         //     return {};
         // }
@@ -789,7 +802,7 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        // if (lr.cores.size() < LCMER_L + 2) {
+        // if (lr.cores.size() < runtime_lcmer_l + 2) {
         //     // free_lps(&str);
         //     return {};
         // }
@@ -909,25 +922,25 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        if (lr.cores.size() < LCMER_L + 2) {
+        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 2)) {
             free_lps(&str);
             return {};
         }
-        LCmer l{lr.cores.begin() + 1};  // Skip first core;
+        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
         gtl::vector<u64> ll;
 
         u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
         ll.emplace_back(lval);
-        for (size_t i = 2; i < lr.cores.size() - LCMER_L - 1; ++i) {
-            uint32_t in_core = lr.cores[i + LCMER_L];
-            l.update_lcmer(in_core, lr.cores[i- LCMER_L]);
+        for (size_t i = 2; i < lr.cores.size() - olc_lcmer_l - 1; ++i) {
+            uint32_t in_core = lr.cores[i + olc_lcmer_l];
+            l.update_lcmer(in_core, lr.cores[i - olc_lcmer_l], olc_lcmer_l);
             lval = dbgi.emplace_nobloomfilter(l, idx, tid);
             ll.emplace_back(lval);
         }
         gtl::vector<SequenceContainerType> seqs;
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            seqs.emplace_back(rev_seqs, lr.pos[i + LCMER_L - 1].second,
-                              lr.pos[i + LCMER_L].second);
+            seqs.emplace_back(rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
+                              lr.pos[i + olc_lcmer_l].second);
             seqs.back().origin_node = ll[i];
         }
         // TODO: index it if needed
@@ -935,7 +948,6 @@ struct assembler {
     }
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
-        fprintf(stderr, "lci_size: %zu\n", dbgi.lci.size());
 
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
@@ -974,7 +986,7 @@ struct assembler {
                     lr.cores.emplace_back(str.cores[i].label);
                     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
                 }
-                if (lr.cores.size() < LCMER_L + 1) {
+                if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
                     bad.fetch_add(1);
                     // good_n.fetch_sub(1);
                     free_lps(&str);
@@ -984,7 +996,7 @@ struct assembler {
                 // `find_lcmer_ranges()` already returns [from_core,to_core] in
                 // core indices (inclusive), which is the correct coordinate
                 // system for connected_comp_plus_layout().
-                auto found_ranges = find_lcmer_ranges(lr, dbgi);
+                auto found_ranges = find_lcmer_ranges(lr, dbgi, olc_lcmer_l);
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
@@ -1069,15 +1081,15 @@ struct assembler {
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
                         //     "llu\t%llu\t%llu\t%llu\t%d\n",
-                        //     k, match.size + LCMER_L, match.from,
-                        //     match.to + LCMER_L, match.node, ff->size +
-                        //     LCMER_L, ff->from, ff->to + LCMER_L, ff->to -
+                        //     k, match.size + runtime_lcmer_l, match.from,
+                        //     match.to + runtime_lcmer_l, match.node, ff->size +
+                        //     runtime_lcmer_l, ff->from, ff->to + runtime_lcmer_l, ff->to -
                         //     ff->from, ff->to - ff->from, 250);
                     } else {  // Handle after reciprocals are good
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
                         //     "d\t%d\t%d\n",
-                        //     k, match.size + LCMER_L, match.from, match.to,
+                        //     k, match.size + runtime_lcmer_l, match.from, match.to,
                         //     match.node, -1, -1, -1, -1, -1, 250);
                     }
                     // }
@@ -1192,7 +1204,7 @@ int run_assembly(const asm_config &cfg) {
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
     // Find largest layout
 
-    int hash_combine_len = LCMER_L;
+    int hash_combine_len = as.olc_lcmer_l;
     u64 layout_idx = 0;
     for (const auto &current_layout : layouts) {
         layout_small_graph small_bg;
@@ -1226,7 +1238,7 @@ int run_assembly(const asm_config &cfg) {
                         auto it_and_result =
                             small_bg.try_emplace(hw, 1, before);
                         if (!it_and_result.second) {  // Otherw
-                            it_and_result.first->second.core_count++;
+                            it_and_result.first->second.counts.core_count++;
                             it_and_result.first->second.emplace_prev(before);
                             svit.move_only(node.seq, str.cores[i].end);
                         } else {  // If this is a new emplacement. Add its seq
@@ -1262,7 +1274,7 @@ int run_assembly(const asm_config &cfg) {
                         auto it_and_result =
                             small_bg.try_emplace(hw, 1, before);
                         if (!it_and_result.second) {  // Otherw
-                            it_and_result.first->second.core_count++;
+                            it_and_result.first->second.counts.core_count++;
                             it_and_result.first->second.emplace_prev(before);
                             svit.move_only(rev_seqs, str.cores[i].end);
                         } else {  // If this is a new emplacement. Add its seq
@@ -1329,9 +1341,9 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L + 1; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l + 1; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1350,16 +1362,16 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     SUBCASE("Pre simplify dbg") {
 //         for (auto &node : dbgi.dbg) {
 //             INFO(node.first, "\t.\t.\t", node.second.seq.size());
-//             CHECK(node.second.core_count < 2);
+//             CHECK(node.second.counts.core_count < 2);
 //             CHECK(node.second.prev.size() < 2);
 //         }
 //         CAPTURE(dbgi.dbg.size());
-//         CHECK(dbgi.lci.size() == MOCK_CORE_COUNT - 2 - LCMER_L + 1);
+//         CHECK(dbgi.lci.size() == MOCK_CORE_COUNT - 2 - runtime_lcmer_l + 1);
 //     }
 
 //     tests_mock_fill_seq(dbgi);
 //     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.core_count *= 10;
+//         n.second.counts.core_count *= 10;
 //     }
 //     dbgi.count_forward_edges();
 
@@ -1406,9 +1418,9 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1423,7 +1435,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     l = LCmer(mock_cores.begin());
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1435,7 +1447,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 
 //     dbgi.count_forward_edges();
 //     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.core_count *= 10;
+//         n.second.counts.core_count *= 10;
 //     }
 //     tests_mock_fill_seq(dbgi);
 //     print_dbg_dot(dbgi, 0);
@@ -1465,9 +1477,9 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     u64 idx = 0;
 
 //     gtl::vector<u64> ll(1, 0);
-//     ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+//     ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1477,14 +1489,14 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //         assembler::insert_lcmer_helper(ll, i, dbgi);
 //     }
 //     for (auto &n : dbgi.dbg) {  // Main Path has 10X depth
-//         n.second.core_count *= 10;
+//         n.second.counts.core_count *= 10;
 //     }
 //     ll.clear();
 //     mock_cores[12] = 123123123;
 //     l = LCmer(mock_cores.begin());
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1525,9 +1537,9 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 
 //         ll.push_back(0);
 
-//         ll.reserve(MOCK_CORE_COUNT - LCMER_L + 3);
+//         ll.reserve(MOCK_CORE_COUNT - runtime_lcmer_l + 3);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//         for (int i = LCMER_L; i < MOCK_CORE_COUNT - 1; ++i) {
+//         for (int i = runtime_lcmer_l; i < MOCK_CORE_COUNT - 1; ++i) {
 //             uint32_t in_core = mock_cores[i];
 //             l.update_lcmer(in_core);
 //             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
@@ -1544,7 +1556,7 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
 //     l = LCmer(mock_cores.begin() + 7);
 
 //     ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));
-//     for (int i = LCMER_L + 7; i < MOCK_CORE_COUNT - 1; ++i) {
+//     for (int i = runtime_lcmer_l + 7; i < MOCK_CORE_COUNT - 1; ++i) {
 //         uint32_t in_core = mock_cores[i];
 //         l.update_lcmer(in_core);
 //         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, 0));

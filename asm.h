@@ -89,6 +89,8 @@ struct asm_config {
     std::string input;
     std::string output;
     int lcp_level = 3;
+    int dbg_lcmer_l = 8;
+    int olc_lcmer_l = 8;
     struct {
         int io = 4;
         int work = 8;
@@ -104,7 +106,7 @@ struct asm_config {
     } bloom;
     struct {
         int iterations = 2;
-        int max_tip_length = LCMER_L * 2;
+        int max_tip_length = 8 * 2;
         int min_bubble_length_difference = 2;
         double min_bubble_depth_difference_percentage = 2;
         bool enable_loop_opening = false;
@@ -114,6 +116,8 @@ struct asm_config {
         fprintf(f, "Input: %s\n", input.c_str());
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);
+        fprintf(f, "DBG LCMER Length: %d\n", dbg_lcmer_l);
+        fprintf(f, "OLC LCMER Length: %d\n", olc_lcmer_l);
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %zu\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");

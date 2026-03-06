@@ -111,7 +111,6 @@ target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurre
 # target_link_libraries(light_dbg_build PRIVATE gtl CLI11::CLI11)
 # target_compile_definitions(light_dbg_build PRIVATE
 #     SYNCMER_RULE=DensitySyncmerRule
-#     LCMER_L=8
 # )
 
 # Tests and custom targets
@@ -130,7 +129,6 @@ add_custom_target(debug
 # Compile definitions
 target_compile_definitions(${PROJECT_NAME} PUBLIC
     SYNCMER_RULE=DensitySyncmerRule
-    LCMER_L=8
 )
 
 

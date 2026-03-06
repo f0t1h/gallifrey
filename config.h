@@ -1,10 +1,6 @@
 #ifndef _LASM_CONFIG_H_
 #define _LASM_CONFIG_H_
 
-#ifndef LCMER_L
-#define LCMER_L 8
-#endif
-
 #ifndef BAMREAD_CHUNK_SIZE
 #define BAMREAD_CHUNK_SIZE 256ULL
 #endif

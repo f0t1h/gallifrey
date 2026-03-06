@@ -105,7 +105,9 @@ inline void unroll_cycles(layout_small_graph &lsg) {
                 seq_copy.emplace_back(s.len, s.skip_first_n, buf,
                                       s.origin_node);
             }
-            dups.push_back({id, dup_id, orig.core_count, std::move(seq_copy)});
+            dups.push_back(
+                {id, dup_id, static_cast<unsigned>(orig.counts.core_count),
+                 std::move(seq_copy)});
         }
         // Second pass: insert duplicates into the map.
         for (auto &d : dups) {
@@ -1261,7 +1263,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     node_to_super.reserve(dbg.active_set.size() + 8);
     nodes_in_layouts.reserve(dbg.active_set.size() + 8);
 
-    const int hash_combine_len = LCMER_L;
+    const int hash_combine_len = as.olc_lcmer_l;
     gtl::vector<ultra_layout_job> layout_jobs;
     layout_jobs.reserve(layouts.size());
 
@@ -1289,7 +1291,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                   });
 
         const int span = std::max(1, max_end - min_start);
-        const int fuzzy = std::max<int>(LCMER_L * 2, span / 20);
+        const int fuzzy = std::max<int>(as.olc_lcmer_l * 2, span / 20);
         for (const auto &n : lnodes) {
             uint8_t mask = 0;
             if (n.from <= min_start + fuzzy) mask |= SIDE_START;
@@ -1310,7 +1312,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         ++layout_idx;
     }
 
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Job preparation (%zu jobs)", layout_jobs.size());
+
     auto layout_seqs =
         build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences (parallel)");
@@ -2080,7 +2082,7 @@ namespace layout_graph_lago{
     struct lago{
         gtl::vector<u64> forward_lane;
         gtl::vector<u64> reverse_lane;
-        
+
 
     };
 }
