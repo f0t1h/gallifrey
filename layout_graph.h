@@ -599,24 +599,38 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
                   return a.id < b.id;
               });
 
-    // ── Fast path: single contig → return its raw seqs directly ──
-    if (sorted_idx.size() == 1) {
-        size_t ci = sorted_idx[0];
-        if (!nodes[ci].is_forward_lane) {
-            const auto &raw = *nodes[ci].raw_seqs;
-            gtl::vector<SequenceContainerType> rev;
-            rev.reserve(raw.size());
-            for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
-                rev.emplace_back(rit->reverse_complement());
-            return rev;
+    // ── Fast path: single contig or 1fw+1rv → return the larger ──
+    {
+        size_t n_fw = 0, n_rv = 0, fi = SIZE_MAX, ri = SIZE_MAX;
+        for (size_t i = 0; i < nodes.size(); ++i) {
+            if (nodes[i].is_forward_lane) { ++n_fw; fi = i; }
+            else                          { ++n_rv; ri = i; }
         }
-        // Forward: need to construct from the iterator-pair ctor
-        // that concatenates fragments into one CrumbledSubSeq64
-        const auto &raw = *nodes[ci].raw_seqs;
-        gtl::vector<SequenceContainerType> result;
-        result.reserve(1);
-        result.emplace_back(raw.begin(), raw.end());
-        return result;
+        if (n_fw <= 1 && n_rv <= 1 && (n_fw + n_rv) <= 2) {
+            // Pick the contig with more bases
+            size_t fw_len = 0, rv_len = 0;
+            if (fi != SIZE_MAX)
+                for (const auto &s : *nodes[fi].raw_seqs) fw_len += s.len;
+            if (ri != SIZE_MAX)
+                for (const auto &s : *nodes[ri].raw_seqs) rv_len += s.len;
+
+            size_t pick = (fw_len >= rv_len && fi != SIZE_MAX) ? fi : ri;
+            if (pick == SIZE_MAX) return {};
+
+            if (!nodes[pick].is_forward_lane) {
+                const auto &raw = *nodes[pick].raw_seqs;
+                gtl::vector<SequenceContainerType> rev;
+                rev.reserve(raw.size());
+                for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
+                    rev.emplace_back(rit->reverse_complement());
+                return rev;
+            }
+            const auto &raw = *nodes[pick].raw_seqs;
+            gtl::vector<SequenceContainerType> result;
+            result.reserve(1);
+            result.emplace_back(raw.begin(), raw.end());
+            return result;
+        }
     }
 
     // ── Per-contig core sequences ─────────────────────────────────────
@@ -1203,7 +1217,9 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
 
 template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
+    INIT_TIMERS(LayoutEmit);
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
+    TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)", layouts.size());
 
     static constexpr uint8_t SIDE_START = 1;
     static constexpr uint8_t SIDE_END = 2;
@@ -1216,9 +1232,14 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 
     struct supernode_out {
         std::string name;
-        gtl::vector<SequenceContainerType> seqs;
+        gtl::vector<SequenceContainerType> owned_seqs;   // layout seqs (owned)
+        const gtl::vector<SequenceContainerType> *ref_seqs = nullptr; // unitig seqs (borrowed)
         bool is_layout;
         u64 aux_id;
+
+        const gtl::vector<SequenceContainerType> &seqs() const {
+            return ref_seqs ? *ref_seqs : owned_seqs;
+        }
     };
     struct edge_agg {
         u64 src_super = 0;
@@ -1289,14 +1310,16 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         ++layout_idx;
     }
 
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Job preparation (%zu jobs)", layout_jobs.size());
     auto layout_seqs =
         build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences (parallel)");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
         const u64 sid = supernodes.size();
         supernodes.push_back({"M" + std::to_string(job.layout_idx),
                               std::move(layout_seqs[i]),
-                              true, job.layout_idx});
+                              nullptr, true, job.layout_idx});
         for (const auto &n : job.lnodes) {
             node_to_super[n.id] = sid;
         }
@@ -1311,11 +1334,11 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         const u64 sid = supernodes.size();
         supernodes.push_back(
             {"C" + std::to_string(node_id),
-             std::move(it->second.seq),
-             false, node_id});
+             {}, &it->second.seq, false, node_id});
         node_to_super[node_id] = sid;
     }
 
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Supernode creation");
     using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
     std::map<edge_key, edge_agg> merged_edges;
     for (const auto &[to_id, to_node] : dbg.dbg) {
@@ -1371,6 +1394,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
     }
 
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation");
     // Print supernodes — convert CrumbledSubSeq64 to ASCII only now
     constexpr size_t N_GAP_LEN = 64;
     charsi chs;
@@ -1379,7 +1403,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         const char *id_tag = sn.is_layout ? "LY" : "UI";
         std::fprintf(out, "S\t%s\t", sn.name.c_str());
         bool any_printed = false;
-        for (const auto &s : sn.seqs) {
+        for (const auto &s : sn.seqs()) {
             if (s.len == 0) {
                 // N-gap sentinel
                 for (size_t i = 0; i < N_GAP_LEN; ++i)
@@ -1409,6 +1433,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
             (unsigned long long)edge.example_from,
             (unsigned long long)edge.example_to);
     }
+    TIME_CHECKPOINT(LayoutEmit, stderr, "GFA printing");
 }
 
 template <class AssemblerT>
