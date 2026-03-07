@@ -1439,7 +1439,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 }
 
 template <class AssemblerT>
-inline void emit_ultra_merged_graph_stdout(AssemblerT &as, dbg_index &dbg) {
+inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg) {
     emit_ultra_merged_graph(as, dbg, stdout);
 }
 

@@ -20,10 +20,10 @@
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
-
 #include <string>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 #include "asm.h"
 #include "bgzf.h"
@@ -79,7 +79,7 @@ struct assembler {
 
     using cqt = moodycamel::ConcurrentQueue<Chunk>;
     using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
-    string input;
+    gtl::vector<string> inputs;
     string output;
     decltype(asm_config::threads) threads;
     int lcp_level;
@@ -90,9 +90,10 @@ struct assembler {
     SyncmerType syncmer_functor;
     int dbg_lcmer_l;
     int olc_lcmer_l;
+    bool parallel_file_reading;
 
     assembler(const asm_config &cfg)
-        : input{cfg.input},
+        : inputs{},
           output{cfg.output},
           threads{cfg.threads},
           lcp_level{cfg.lcp_level},
@@ -101,7 +102,14 @@ struct assembler {
           syncmer_params{cfg.syncmer},
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
-          olc_lcmer_l{cfg.dbg_lcmer_l} {}
+          olc_lcmer_l{cfg.dbg_lcmer_l},
+          parallel_file_reading{cfg.parallel_file_reading} {
+        if (!cfg.inputs.empty()) {
+            inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
+        } else if (!cfg.input.empty()) {
+            inputs.push_back(cfg.input);
+        }
+    }
 
     template <class BFT>
     static inline auto insert_lcmer_helper(const gtl::vector<uint64_t> &ll,
@@ -160,8 +168,8 @@ struct assembler {
         ll.reserve(lr.cores.size() - lcmer_l + 3);
         dbg_index::lci_type lval = dbgi.get(l);
         ll.push_back(lval.id);
-        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
-             ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
             uint32_t in_core = lr.cores[i];
             l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
             lval = dbgi.get(l);
@@ -177,17 +185,16 @@ struct assembler {
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
-            return gtl::vector<
-                std::tuple<u64, u64, u64, LCmer, LCmer>>{};
+            return gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>>{};
         }
 
         LCmer l{lr.cores.begin() + skip_first, lcmer_l};  // Skip first core;
-        gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>>
-            llr;
+        gtl::vector<std::tuple<u64, u64, u64, LCmer, LCmer>> llr;
 
         dbg_index::lci_type lval = dbgi.get(l);
         llr.emplace_back(lval.id, skip_first, skip_first, l, l);
-        // Fix: ensure we don't go out of bounds when accessing i + runtime_lcmer_l
+        // Fix: ensure we don't go out of bounds when accessing i +
+        // runtime_lcmer_l
         for (long long i = skip_first + 1;
              i < ((long long)lr.cores.size() - lcmer_l - skip_last); ++i) {
             uint32_t in_core = lr.cores[i + lcmer_l - 1];
@@ -212,8 +219,8 @@ struct assembler {
         gtl::vector<uint64_t> ll(1, 0);
         ll.reserve(lr.cores.size() - lcmer_l + 3);
         ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
-        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
-             ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
             uint32_t in_core = lr.cores[i];
             l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
             ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
@@ -225,8 +232,8 @@ struct assembler {
                 // Lets try atomic
                 dbgi.dbg.modify_if(
                     ll[i],
-                    [&lr, i, lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type
-                                          &val) {
+                    [&lr, i,
+                     lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
                         val.second.seq.emplace_back(
                             lr.data, lr.pos[i + lcmer_l - 1].second,
                             lr.pos[i + lcmer_l].second, val.first);
@@ -248,8 +255,8 @@ struct assembler {
 
         uint64_t val = dbgi.get(l).id;
 
-        for (size_t i = static_cast<size_t>(lcmer_l + 1); i < lr.cores.size() - 1;
-             ++i) {
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
             uint64_t from = lr.pos[i - 1].second;
             uint64_t to = lr.pos[i].second;
 
@@ -287,11 +294,11 @@ struct assembler {
     //                                      int &all_reads) {
     //     uint64_t lcmer_index = 0;
     // }
-    static auto process_data(
-        int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
-        dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
-        int &all_reads, auto Process_Func, SyncmerType syncmer_functor,
-        int lcmer_l) {
+    static auto process_data(int thread_id, int lcp_level, dqt &data_queue,
+                             dqt &recycle_queue, dbg_index &dbgi,
+                             std::atomic<bool> &done, int &processed_read_count,
+                             int &all_reads, auto Process_Func,
+                             SyncmerType syncmer_functor, int lcmer_l) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
@@ -407,17 +414,41 @@ struct assembler {
         gtl::vector<int> all_read_counts(threads.work, 0);
 
         for (int tid = 1; tid <= threads.work; ++tid) {
-            workers.emplace_back(
-                [&, tid]() {
-                    process_data(
-                        tid, lcp_level, data_queue, recycle_queue, dbgi, done,
-                        valid_read_counts[tid - 1], all_read_counts[tid - 1],
-                        process_cores<DefaultBF>, syncmer_functor, dbg_lcmer_l);
-                });
+            workers.emplace_back([&, tid]() {
+                process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
+                             done, valid_read_counts[tid - 1],
+                             all_read_counts[tid - 1], process_cores<DefaultBF>,
+                             syncmer_functor, dbg_lcmer_l);
+            });
         }
 
-        if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                           threads.io)) {
+        std::atomic<bool> read_failed{false};
+        if (parallel_file_reading) {
+            gtl::vector<std::thread> readers;
+            readers.reserve(inputs.size());
+            for (const auto &input : inputs) {
+                readers.emplace_back([&, input]() {
+                    if (!generate_data(input, std::ref(data_queue),
+                                       std::ref(recycle_queue), threads.io)) {
+                        fprintf(stderr, "Failed to read from input %s\n", input.c_str());
+                        read_failed.store(true);
+                    }
+                });
+            }
+            for (auto &reader : readers) {
+                reader.join();
+            }
+        } else {
+            for (const auto &input : inputs) {
+                if (!generate_data(input, std::ref(data_queue),
+                                   std::ref(recycle_queue), threads.io)) {
+                    fprintf(stderr, "Failed to read from input %s\n", input.c_str());
+                    break;
+                }
+            }
+        }
+        if (read_failed.load()) {
+            fprintf(stderr, "Error in reading data for DBG construction. Terminating.\n");
             exit(-1);
         }
 
@@ -447,17 +478,38 @@ struct assembler {
         gtl::vector<int> all_read_counts(threads.work, 0);
 
         for (int tid = 1; tid <= threads.work; ++tid) {
-            workers.emplace_back(
-                [&, tid]() {
-                    process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
-                                 done, valid_read_counts[tid - 1],
-                                 all_read_counts[tid - 1],
-                                 process_cores_for_basespace, syncmer_functor,
-                                 dbg_lcmer_l);
-                });
+            workers.emplace_back([&, tid]() {
+                process_data(
+                    tid, lcp_level, data_queue, recycle_queue, dbgi, done,
+                    valid_read_counts[tid - 1], all_read_counts[tid - 1],
+                    process_cores_for_basespace, syncmer_functor, dbg_lcmer_l);
+            });
         }
-        if (!generate_data(input, std::ref(data_queue), std::ref(recycle_queue),
-                           threads.io)) {
+        std::atomic<bool> read_failed{false};
+        if (parallel_file_reading) {
+            gtl::vector<std::thread> readers;
+            readers.reserve(inputs.size());
+            for (const auto &input : inputs) {
+                readers.emplace_back([&, input]() {
+                    if (!generate_data(input, std::ref(data_queue),
+                                       std::ref(recycle_queue), threads.io)) {
+                        read_failed.store(true);
+                    }
+                });
+            }
+            for (auto &reader : readers) {
+                reader.join();
+            }
+        } else {
+            for (const auto &input : inputs) {
+                if (!generate_data(input, std::ref(data_queue),
+                                   std::ref(recycle_queue), threads.io)) {
+                    read_failed.store(true);
+                    break;
+                }
+            }
+        }
+        if (read_failed.load()) {
             fprintf(stderr, "Error in reading data for basespace conversion\n");
             exit(-1);
         }
@@ -664,8 +716,8 @@ struct assembler {
         for (size_t i = 1; i < ll.size() - 1; ++i) {
             if (insert_lcmer_helper(ll, i, dbgi)) {
                 dbgi.dbg.modify_if(
-                    ll[i],
-                    [&lr, i, &subseqs, this](dbg_index::dbg_map_t::value_type &val) {
+                    ll[i], [&lr, i, &subseqs,
+                            this](dbg_index::dbg_map_t::value_type &val) {
                         val.second.seq.emplace_back(
                             subseqs, lr.pos[i + olc_lcmer_l - 1].second,
                             lr.pos[i + olc_lcmer_l].second);
@@ -1082,15 +1134,16 @@ struct assembler {
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%llu\t%"
                         //     "llu\t%llu\t%llu\t%llu\t%d\n",
                         //     k, match.size + runtime_lcmer_l, match.from,
-                        //     match.to + runtime_lcmer_l, match.node, ff->size +
-                        //     runtime_lcmer_l, ff->from, ff->to + runtime_lcmer_l, ff->to -
-                        //     ff->from, ff->to - ff->from, 250);
+                        //     match.to + runtime_lcmer_l, match.node, ff->size
+                        //     + runtime_lcmer_l, ff->from, ff->to +
+                        //     runtime_lcmer_l, ff->to - ff->from, ff->to -
+                        //     ff->from, 250);
                     } else {  // Handle after reciprocals are good
                         // printf(
                         //     "C%llu\t%llu\t%llu\t%llu\t+\tC%llu\t%d\t%d\t%d\t%"
                         //     "d\t%d\t%d\n",
-                        //     k, match.size + runtime_lcmer_l, match.from, match.to,
-                        //     match.node, -1, -1, -1, -1, -1, 250);
+                        //     k, match.size + runtime_lcmer_l, match.from,
+                        //     match.to, match.node, -1, -1, -1, -1, -1, 250);
                     }
                     // }
                 }
@@ -1100,9 +1153,10 @@ struct assembler {
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
-        // auto layouts = layout_graph_algo::connected_comp_plus_layout(reciprocal);
-        auto layouts = layout_graph_algo::connected_comp_plus_layout_lstsq(
-            reciprocal);
+        // auto layouts =
+        // layout_graph_algo::connected_comp_plus_layout(reciprocal);
+        auto layouts =
+            layout_graph_algo::connected_comp_plus_layout_lstsq(reciprocal);
 #if 0
         int cc = 0;
         for (auto &l : layouts) {
@@ -1125,8 +1179,6 @@ struct assembler {
 #endif
         return std::make_pair(reciprocal, layouts);
     }
-
-
 };
 
 // TODO do not use extensions to identify input type.
@@ -1190,14 +1242,12 @@ int run_assembly(const asm_config &cfg) {
     // Later stages commented out for profiling graph building
     {
         FILE *out = fopen(cfg.output.c_str(), "w");
-        print_dbg_seqs(out, dbg);
+        // print_dbg_seqs(out, dbg);
+        layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
         fclose(out);
     }
 
-    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph printing");
-
-    layout_graph_emit::emit_ultra_merged_graph_stdout(as, dbg);
-    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged");
+    IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged/Printed");
 
 #if 0
     // ultra

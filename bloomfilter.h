@@ -153,7 +153,7 @@ struct BlockedLockedBloomFilter {
     static constexpr int block_bits = block_bytes * 8;
     static_assert(LOCKS_PER_2PN_BLOCKS < 32);
     static constexpr int locks_per_n_blocks = 1 << LOCKS_PER_2PN_BLOCKS;
-    using block_type = unsigned __int128;
+    using block_type = unsigned long long;
     BlockedLockedBloomFilter(int n, float eps)
         : n(n),
           epsilon(eps),
@@ -162,10 +162,13 @@ struct BlockedLockedBloomFilter {
           num_blocks{(m + block_bits - 1) / block_bits},
           num_locks{1 + num_blocks / locks_per_n_blocks},
           bv(num_blocks * block_bytes / sizeof(block_type)),
-          locks(new mutex_type[num_locks]) {}
+          locks(new mutex_type[num_locks]) {
+              fprintf(stderr, "BloomFilter: n=%d, eps=%.2e, m=%lu, k=%d, num_blocks=%lu, num_locks=%lu\n",
+                      n, epsilon, m, k, num_blocks, num_locks);
+          }
 
-    int ComputeNumBits() {
-        return static_cast<int>(-1.44 * n * std::log2(epsilon) + 0.5);
+    uint64_t ComputeNumBits() {
+        return static_cast<uint64_t>(-1.44 * n * std::log2(epsilon) + 0.5);
     }
 
     int ComputeNumHashFns() {
@@ -212,10 +215,10 @@ struct BlockedLockedBloomFilter {
     int n;
     float epsilon;
 
-    int m;
+    uint64_t m;
     int k;
-    int num_blocks;
-    int num_locks;
+    uint64_t num_blocks;
+    uint64_t num_locks;
     std::vector<block_type> bv;
     std::unique_ptr<mutex_type[]> locks;
 };

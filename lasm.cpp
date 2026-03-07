@@ -1,5 +1,6 @@
 #include <CLI/CLI.hpp>
 #include <string>
+#include <vector>
 
 #include "CLI/CLI.hpp"
 
@@ -24,8 +25,10 @@ int asm_program(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("hifi", "run hifi assembly");
     auto &app = *app_;
     asm_config *p = new asm_config;
-    app.add_option("input", p->input, "Input bam file")->required();
-    app.add_option("output", p->output, "Output gfa file")->required();
+    auto *inputs = new std::vector<std::string>;
+    auto *file_reading_mode = new std::string{"sequential"};
+    app.add_option("input", *inputs, "Input bam files")->required();
+    app.add_option("-o,--output", p->output, "Output gfa file")->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
     app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
@@ -36,6 +39,10 @@ int asm_program(CLI::App &parent) {
                    "Number of IO threads (Used by htslib for decompressing)")
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
+        ->capture_default_str();
+    app.add_option("--file-reading-mode", *file_reading_mode,
+                   "Input reader mode: parallel or sequential")
+        ->check(CLI::IsMember({"parallel", "sequential"}))
         ->capture_default_str();
 
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
@@ -94,7 +101,18 @@ int asm_program(CLI::App &parent) {
            "cause misassembly if loop copy counts are mispredicted.")
         ->capture_default_str();
     app.callback([=]() {
+        if (inputs->empty()) {
+            delete file_reading_mode;
+            delete inputs;
+            delete p;
+            return -1;
+        }
+        p->parallel_file_reading = (*file_reading_mode == "parallel");
+        p->inputs = *inputs;
+        p->input = inputs->front();
         int ret = run_assembly(*p);
+        delete file_reading_mode;
+        delete inputs;
         delete p;
         return ret;
     });
@@ -104,8 +122,12 @@ int map_prog(CLI::App &parent) {
     auto *app_ = parent.add_subcommand("map", "run hifi assembly");
     auto &app = *app_;
     asm_config *p = new asm_config;
-    app.add_option("input", p->input, "Input bam file")->required();
-    app.add_option("reference", p->output, "Input bam file")->required();
+    auto *inputs = new std::vector<std::string>;
+    auto *file_reading_mode = new std::string{"sequential"};
+    app.add_option("input", *inputs, "Input bam files")->required();
+    app.add_option("-o,--output", p->output,
+                   "Second input file (query; kept for current run_mapping semantics)")
+        ->required();
     app.add_option("-l,--level", p->lcp_level, "LCP level to compute")
         ->required();
     app.add_option("--dbg-lcmer-l", p->dbg_lcmer_l, "DBG LCMER window length")
@@ -115,6 +137,10 @@ int map_prog(CLI::App &parent) {
     app.add_option("-@,--io-threads", p->threads.io, "Number of IO threads")
         ->capture_default_str();
     app.add_option("--random-seed", p->seed, "Random seed")
+        ->capture_default_str();
+    app.add_option("--file-reading-mode", *file_reading_mode,
+                   "Input reader mode: parallel or sequential")
+        ->check(CLI::IsMember({"parallel", "sequential"}))
         ->capture_default_str();
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
@@ -136,7 +162,18 @@ int map_prog(CLI::App &parent) {
         ->excludes("--density")
         ->needs("--submer-s");
     app.callback([=]() {
+        if (inputs->empty()) {
+            delete file_reading_mode;
+            delete inputs;
+            delete p;
+            return -1;
+        }
+        p->parallel_file_reading = (*file_reading_mode == "parallel");
+        p->inputs = *inputs;
+        p->input = inputs->front();
         int ret = run_mapping(*p);
+        delete file_reading_mode;
+        delete inputs;
         delete p;
         return ret;
     });

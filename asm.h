@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include <string>
+#include <vector>
 struct syncmer_params {
     static constexpr unsigned long invalid_param_value = 127127127;
     enum class typeenum { Density, MinCodeOpen, MinCodeClosed, Invalid };
@@ -86,6 +87,7 @@ struct syncmer_params {
     }
 };
 struct asm_config {
+    std::vector<std::string> inputs;
     std::string input;
     std::string output;
     int lcp_level = 3;
@@ -97,6 +99,7 @@ struct asm_config {
     } threads;
     size_t seed = 1453;
     bool rle = true;
+    bool parallel_file_reading = false;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
     bool silent = false;
@@ -113,7 +116,14 @@ struct asm_config {
     } graph_cleaning;
 
     void print_cfg(FILE *f) const {
-        fprintf(f, "Input: %s\n", input.c_str());
+        if (!inputs.empty()) {
+            fprintf(f, "Inputs (%zu):\n", inputs.size());
+            for (const auto &in : inputs) {
+                fprintf(f, "\t%s\n", in.c_str());
+            }
+        } else {
+            fprintf(f, "Input: %s\n", input.c_str());
+        }
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);
         fprintf(f, "DBG LCMER Length: %d\n", dbg_lcmer_l);
@@ -121,6 +131,8 @@ struct asm_config {
         fprintf(f, "Threads:\n\tIO: %d\n\tWork: %d\n", threads.io, threads.work);
         fprintf(f, "Seed: %zu\n", seed);
         fprintf(f, "RLE: %s\n", rle ? "true" : "false");
+        fprintf(f, "File Reading Mode: %s\n",
+                parallel_file_reading ? "parallel" : "sequential");
         syncmer.print_cfg(f);
         fprintf(f,
                 "Bloom Filter Parameters:\n\tProjected Count: %" PRIu64
