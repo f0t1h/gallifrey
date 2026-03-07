@@ -2,6 +2,7 @@
 #define BLOOMFILTER_H
 #define KOMIHASH_NS_CUSTOM komihash
 
+#include <inttypes.h>
 #include <vector>
 
 #include "ext/komihash.h"
@@ -163,7 +164,10 @@ struct BlockedLockedBloomFilter {
           num_locks{1 + num_blocks / locks_per_n_blocks},
           bv(num_blocks * block_bytes / sizeof(block_type)),
           locks(new mutex_type[num_locks]) {
-              fprintf(stderr, "BloomFilter: n=%d, eps=%.2e, m=%lu, k=%d, num_blocks=%lu, num_locks=%lu\n",
+              fprintf(stderr,
+                      "BloomFilter: n=%d, eps=%.2e, m=%" PRIu64
+                      ", k=%d, num_blocks=%" PRIu64 ", num_locks=%" PRIu64
+                      "\n",
                       n, epsilon, m, k, num_blocks, num_locks);
           }
 

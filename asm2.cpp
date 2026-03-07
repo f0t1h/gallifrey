@@ -459,8 +459,8 @@ struct assembler {
             valid_sum += valid_read_counts[i];
             all_sum += all_read_counts[i];
         }
-        fprintf(stderr, "%llu processed\n%llu total reads\n", valid_sum,
-                all_sum);
+        fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
+                valid_sum, all_sum);
         return dbg_pt;
     }
 
@@ -1162,13 +1162,13 @@ struct assembler {
                 if (it != dbgi.dbg.end()) {
                     auto [start_core, end_core, orient] = v;
                     (void)end_core;
-                    fprintf(stdout, "C%llu\t%d\t%d\t%c\n", k, start_core,
+                    fprintf(stdout, "C%" PRIu64 "\t%d\t%d\t%c\n", k, start_core,
                             start_core + end_core, (orient ? '+' : '-'));
                 } else {
                     auto [start_core, end_core, orient] = v;
                     (void)end_core;
                     (void)orient;
-                    fprintf(stdout, "C%llu\t%d\t(not found)\n", k, start_core);
+                    fprintf(stdout, "C%" PRIu64 "\t%d\t(not found)\n", k, start_core);
                 }
             }
         }
@@ -1235,6 +1235,7 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
+
     // Later stages commented out for profiling graph building
     {
         FILE *out = fopen(cfg.output.c_str(), "w");
@@ -1258,7 +1259,7 @@ int run_assembly(const asm_config &cfg) {
             auto [from, to, ori] = layout;
             auto nodeit = dbg.dbg.find(ctg_id);
             if (nodeit == dbg.dbg.end()) {
-                fprintf(stderr, "Error: Node %llu not found in graph\n",
+                fprintf(stderr, "Error: Node %" PRIu64 " not found in graph\n",
                         ctg_id);
                 exit(EXIT_FAILURE);
             }
@@ -1335,12 +1336,12 @@ int run_assembly(const asm_config &cfg) {
             }
         }
         charsi chs;
-        printf("S\t%llu\t",layout_idx);
+        printf("S\t%" PRIu64 "\t", layout_idx);
         std::set<u64> ids_seen;
         for (const auto &[id,s] : longest_path(small_bg) ){
             auto it = ids_seen.find(id);
             if(it != ids_seen.end()){
-                fprintf(stderr, "Duplicate ID: %llu\n", id);
+                fprintf(stderr, "Duplicate ID: %" PRIu64 "\n", id);
                 __builtin_trap();
             }
             else{

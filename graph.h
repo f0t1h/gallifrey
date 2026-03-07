@@ -1466,8 +1466,9 @@ struct GraphCleaning {
                             const double other_in_cn = other_depth / baseline;
                             fprintf(
                                 stderr,
-                                "[open_simple_loopsv2] cur=%llu loop=%llu "
-                                "other_in=%llu curr_d=%.3f loop_d=%.3f "
+                                "[open_simple_loopsv2] cur=%" PRIu64
+                                " loop=%" PRIu64 " "
+                                "other_in=%" PRIu64 " curr_d=%.3f loop_d=%.3f "
                                 "other_in_d=%.3f "
                                 "baseline=%.3f curr_cn=%.3f loop_cn=%.3f "
                                 "other_in_cn=%.3f "
@@ -1477,9 +1478,9 @@ struct GraphCleaning {
                                 "force_t1=%d "
                                 "base_cn(real/round)=%.3f/%d "
                                 "loop_turns=%d extra_turns=%d score=%.3f\n",
-                                (unsigned long long)node,
-                                (unsigned long long)pnode,
-                                (unsigned long long)other_prev, curr_depth,
+                                static_cast<uint64_t>(node),
+                                static_cast<uint64_t>(pnode),
+                                static_cast<uint64_t>(other_prev), curr_depth,
                                 pr_depth, other_depth, baseline, curr_cn,
                                 loop_cn, other_in_cn, copy_est.global_ref_depth,
                                 copy_est.raw_loop_cn, copy_est.raw_curr_cn,

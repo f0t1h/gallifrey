@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <inttypes.h>
 #include <sys/stat.h>
 #include <functional>
 #include <gtl/phmap_fwd_decl.hpp>
@@ -686,8 +687,9 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
 
     if (contig_order.empty()) {
         std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED: no contigs with cores\n",
-                     (unsigned long long)layout_idx);
+                     "[layout-dag] layout=%" PRIu64
+                     " SKIPPED: no contigs with cores\n",
+                     static_cast<uint64_t>(layout_idx));
         return {};
     }
 
@@ -880,8 +882,9 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
 
     if (poa.empty()) {
         std::fprintf(stderr,
-                     "[layout-dag] layout=%llu SKIPPED: POA graph empty\n",
-                     (unsigned long long)layout_idx);
+                     "[layout-dag] layout=%" PRIu64
+                     " SKIPPED: POA graph empty\n",
+                     static_cast<uint64_t>(layout_idx));
         return {};
     }
 
@@ -908,9 +911,9 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         // If some nodes weren't reached (residual cycles), append them
         if (topo_order.size() < n) {
             std::fprintf(stderr,
-                         "[layout-dag] layout=%llu WARNING: %zu/%zu nodes "
+                         "[layout-dag] layout=%" PRIu64 " WARNING: %zu/%zu nodes "
                          "stuck in cycles, appending in index order\n",
-                         (unsigned long long)layout_idx,
+                         static_cast<uint64_t>(layout_idx),
                          n - topo_order.size(), n);
             gtl::flat_hash_set<uint32_t> visited(
                 topo_order.begin(), topo_order.end());
@@ -1419,8 +1422,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
             any_printed = true;
         }
         if (!any_printed) std::fputc('*', out);
-        std::fprintf(out, "\tTP:Z:%s\t%s:i:%llu\n",
-                     tp, id_tag, (unsigned long long)sn.aux_id);
+        std::fprintf(out, "\tTP:Z:%s\t%s:i:%" PRIu64 "\n",
+                     tp, id_tag, static_cast<uint64_t>(sn.aux_id));
     }
     for (const auto &[_, edge] : merged_edges) {
         const auto &src_name = supernodes[edge.src_super].name;
@@ -1428,12 +1431,12 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         std::fprintf(
             out,
             "L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
-            "EC:i:%zu\tFN:i:%llu\tTN:i:%llu\n",
+            "EC:i:%zu\tFN:i:%" PRIu64 "\tTN:i:%" PRIu64 "\n",
             src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
             edge.src_ori, edge.dst_ori, side_label(edge.src_side),
             side_label(edge.dst_side), edge.count,
-            (unsigned long long)edge.example_from,
-            (unsigned long long)edge.example_to);
+            static_cast<uint64_t>(edge.example_from),
+            static_cast<uint64_t>(edge.example_to));
     }
     TIME_CHECKPOINT(LayoutEmit, stderr, "GFA printing");
 }
@@ -1513,7 +1516,7 @@ inline void print_merged_layouts(
         }
         if (non_contained.empty()) continue;
 
-        std::fprintf(out, "S\tM%llu\t", (unsigned long long)contig_id);
+        std::fprintf(out, "S\tM%" PRIu64 "\t", static_cast<uint64_t>(contig_id));
         size_t total_len = 0;
         int current_end = non_contained[0].start;
         gtl::vector<u64> prev_edges = non_contained[0].dbg_it->second.prev;
@@ -1567,9 +1570,9 @@ inline void print_merged_layouts(
         std::fprintf(out, "\tLN:i:%zu\n", total_len);
         for (u64 prev_id : prev_edges) {
             if (dbg.contains(prev_id)) {
-                std::fprintf(out, "L\tC%llu\t+\tM%llu\t+\t0M\n",
-                             (unsigned long long)prev_id,
-                             (unsigned long long)contig_id);
+                std::fprintf(out, "L\tC%" PRIu64 "\t+\tM%" PRIu64 "\t+\t0M\n",
+                             static_cast<uint64_t>(prev_id),
+                             static_cast<uint64_t>(contig_id));
             }
         }
         contig_id++;
@@ -1825,7 +1828,7 @@ inline void merge_layouts_ultra(
     charsi chs;
     auto single_node_print = [&out, &layout_no, &dbg,
                               &chs](const auto &layout) {
-        std::fprintf(out, ">M%llu %zu\n", (unsigned long long)layout_no,
+        std::fprintf(out, ">M%" PRIu64 " %zu\n", static_cast<uint64_t>(layout_no),
                      layout.size());
         u64 utig = layout.begin()->first;
         auto it = dbg.find(utig);
@@ -1872,9 +1875,9 @@ inline void merge_layouts_ultra(
                 as, base, left_dbg_it->second.seq, right_dbg_it->second.seq,
                 prev_anchor, oriori);
             oriori = !oriori;
-            std::fprintf(stderr, "Extending: %llu with %llu\n",
-                         (unsigned long long)layout_no,
-                         (unsigned long long)path[i]);
+            std::fprintf(stderr, "Extending: %" PRIu64 " with %" PRIu64 "\n",
+                         static_cast<uint64_t>(layout_no),
+                         static_cast<uint64_t>(path[i]));
         }
 
         auto last_it = dbg.find(path.back());
@@ -1884,7 +1887,7 @@ inline void merge_layouts_ultra(
                 (path.size() - 1) % 2 == 0);
         }
 
-        std::fprintf(out, ">L%llu\n", (unsigned long long)layout_no);
+        std::fprintf(out, ">L%" PRIu64 "\n", static_cast<uint64_t>(layout_no));
         for (const SequenceContainerType &s : base.seqs) {
             chs.require(s.len);
             s.convert_to_ascii((char *)chs.data);
@@ -1895,8 +1898,9 @@ inline void merge_layouts_ultra(
         for (u64 node : path) {
             auto it = dbg.find(node);
             if (it == dbg.end()) continue;
-            std::fprintf(out, ">Z%llu L%llu\n", (unsigned long long)node,
-                         (unsigned long long)layout_no);
+            std::fprintf(out, ">Z%" PRIu64 " L%" PRIu64 "\n",
+                         static_cast<uint64_t>(node),
+                         static_cast<uint64_t>(layout_no));
             for (const SequenceContainerType &s : it->second.seq) {
                 chs.require(s.len);
                 s.convert_to_ascii((char *)chs.data);
@@ -1997,8 +2001,8 @@ inline void merge_layouts_ldbg(
             source = path[i];
             auto source_node = dbg.find(source);
             if (source_node == dbg.end()) {
-                std::fprintf(stderr, "Source node %llu not found in dbg\n",
-                             (unsigned long long)source);
+                std::fprintf(stderr, "Source node %" PRIu64 " not found in dbg\n",
+                             static_cast<uint64_t>(source));
                 continue;
             }
 
@@ -2052,7 +2056,8 @@ inline void merge_layouts_ldbg(
 
         auto sp = smal_dbgi.shortest_path_bfs(tgt_lcm, src_lcm);
         if (!sp.empty()) {
-            std::fprintf(out, ">M%llu %zu\n", (unsigned long long)layout_no,
+            std::fprintf(out, ">M%" PRIu64 " %zu\n",
+                         static_cast<uint64_t>(layout_no),
                          layout.size());
             for (auto it = sp.rbegin(); it != sp.rend(); ++it) {
                 u64 n = *it;
@@ -2063,7 +2068,8 @@ inline void merge_layouts_ldbg(
             }
             std::fprintf(out, "\n");
         } else {
-            std::fprintf(out, ">M%llu %zu NP\n", (unsigned long long)layout_no,
+            std::fprintf(out, ">M%" PRIu64 " %zu NP\n",
+                         static_cast<uint64_t>(layout_no),
                          layout.size());
             auto first_it = dbgi.dbg.find(path[0]);
             if (first_it != dbgi.dbg.end()) {
