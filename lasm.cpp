@@ -109,7 +109,6 @@ int asm_program(CLI::App &parent) {
         }
         p->parallel_file_reading = (*file_reading_mode == "parallel");
         p->inputs = *inputs;
-        p->input = inputs->front();
         int ret = run_assembly(*p);
         delete file_reading_mode;
         delete inputs;
@@ -170,7 +169,6 @@ int map_prog(CLI::App &parent) {
         }
         p->parallel_file_reading = (*file_reading_mode == "parallel");
         p->inputs = *inputs;
-        p->input = inputs->front();
         int ret = run_mapping(*p);
         delete file_reading_mode;
         delete inputs;

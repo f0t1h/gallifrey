@@ -88,7 +88,6 @@ struct syncmer_params {
 };
 struct asm_config {
     std::vector<std::string> inputs;
-    std::string input;
     std::string output;
     int lcp_level = 3;
     int dbg_lcmer_l = 8;
@@ -122,7 +121,7 @@ struct asm_config {
                 fprintf(f, "\t%s\n", in.c_str());
             }
         } else {
-            fprintf(f, "Input: %s\n", input.c_str());
+            fprintf(f, "Inputs (0):\n");
         }
         fprintf(f, "Output: %s\n", output.c_str());
         fprintf(f, "LCP Level: %d\n", lcp_level);

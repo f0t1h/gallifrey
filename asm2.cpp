@@ -104,11 +104,7 @@ struct assembler {
           dbg_lcmer_l{cfg.dbg_lcmer_l},
           olc_lcmer_l{cfg.dbg_lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading} {
-        if (!cfg.inputs.empty()) {
-            inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
-        } else if (!cfg.input.empty()) {
-            inputs.push_back(cfg.input);
-        }
+        inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
     }
 
     template <class BFT>
@@ -1211,10 +1207,10 @@ int run_assembly(const asm_config &cfg) {
 
     INIT_TIMERS(HIFI_ASSEMBLY);
 
-    // auto inty = identify_input(cfg.input);
+    // auto inty = identify_input(cfg.inputs.front());
 
     // if (inty == input_type::UNKNOWN) {
-    //     fprintf(stderr, "Unknown input type %s\n", cfg.input.c_str());
+    //     fprintf(stderr, "Unknown input type %s\n", cfg.inputs.front().c_str());
     //     return -1;
     // }
 
