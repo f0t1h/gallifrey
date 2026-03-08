@@ -667,7 +667,7 @@ struct assembler {
         gtl::vector<u64> ll = {0};
         LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        for (size_t i = 2; i < lr.cores.size() - olc_lcmer_l - 1; ++i) {
+        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
             uint32_t in_core = lr.cores[i + olc_lcmer_l];
             l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
@@ -689,8 +689,7 @@ struct assembler {
 
     static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
                                const SyncmerType &syncmer_functor,
-                               int lcp_level) -> lcp_read {
-        lps str = {0, 0, 0, 0};
+                               int lcp_level, lps &str) -> lcp_read {
         lcp_read lr;
         lr.clear();
 
@@ -701,19 +700,13 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        // if (lr.cores.size() < runtime_lcmer_l + 2) {
-        //     // free_lps(&str);
-        //     return {};
-        // }
-        // free_lps(&str);
         return lr;
     }
 
     static auto build_lr_cores_with_seqs(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level)
+        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
-        lps str = {0, 0, 0, 0};
         lcp_read lr;
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
@@ -799,8 +792,8 @@ struct assembler {
 
     static auto build_rev_lr_cores(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level) -> lcp_read {
-        lps str = {0, 0, 0, 0};
+        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+        -> lcp_read {
         lcp_read lr;
         lr.clear();
 
@@ -815,19 +808,13 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
-        // if (lr.cores.size() < runtime_lcmer_l + 2) {
-        //     // free_lps(&str);
-        //     return {};
-        // }
-        // free_lps(&str);
         return lr;
     }
 
     static auto build_rev_lr_cores_with_seqs(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level)
+        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
-        lps str = {0, 0, 0, 0};
         lcp_read lr;
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
@@ -944,9 +931,9 @@ struct assembler {
 
         u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
         ll.emplace_back(lval);
-        for (size_t i = 2; i < lr.cores.size() - olc_lcmer_l - 1; ++i) {
+        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
             uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i - olc_lcmer_l], olc_lcmer_l);
+            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
             lval = dbgi.emplace_nobloomfilter(l, idx, tid);
             ll.emplace_back(lval);
         }
@@ -1032,12 +1019,28 @@ struct assembler {
                                 ? static_cast<u64>(lr.cores.size() - 1)
                                 : 0;
 
-                        matched[node.first].emplace_back(
-                            id,
-                            rev_match::ival{static_cast<u64>(from_core),
+                        matched.lazy_emplace_l(
+                            node.first,
+                            [&](auto &val) {
+                                val.second.emplace_back(
+                                    id,
+                                    rev_match::ival{static_cast<u64>(from_core),
+                                                    static_cast<u64>(to_core),
+                                                    core_len_steps},
+                                    rev_match::ival{0, 0, 0}, from_lcmer,
+                                    to_lcmer, LCmer{}, LCmer{});
+                            },
+                            [&](const auto &ctr) {
+                                ctr(node.first,
+                                    gtl::vector<rev_match>{rev_match{
+                                        id,
+                                        rev_match::ival{
+                                            static_cast<u64>(from_core),
                                             static_cast<u64>(to_core),
                                             core_len_steps},
-                            rev_match::ival{0, 0, 0}, from_lcmer, to_lcmer);
+                                        rev_match::ival{0, 0, 0}, from_lcmer,
+                                        to_lcmer, LCmer{}, LCmer{}}});
+                            });
                     }
                 }
                 free_lps(&str);
@@ -1634,10 +1637,12 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
         std::string(seq1) + std::string(seq2) + std::string(seq3);
 
     SUBCASE("build_lr_cores_with_seqs") {
+        lps lps_buf = {0, 0, 0, 0};
         auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level);
+            seqs, syncmer_functor, lcp_level, lps_buf);
         auto lr_original =
-            assembler::build_lr_cores(seqs, syncmer_functor, lcp_level);
+            assembler::build_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
+        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1675,10 +1680,12 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     }
 
     SUBCASE("build_rev_lr_cores_with_seqs") {
+        lps lps_buf = {0, 0, 0, 0};
         auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level);
+            seqs, syncmer_functor, lcp_level, lps_buf);
         auto lr_original =
-            assembler::build_rev_lr_cores(seqs, syncmer_functor, lcp_level);
+            assembler::build_rev_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
+        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1729,8 +1736,10 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
     SUBCASE("core sequences span fragment boundaries correctly") {
         // Build cores from vector of 3 sequences
+        lps lps_buf = {0, 0, 0, 0};
         auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level);
+            seqs, syncmer_functor, lcp_level, lps_buf);
+        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1778,8 +1787,10 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
     SUBCASE("rev: core sequences span fragment boundaries correctly") {
         // Build cores from vector of 3 sequences (reverse complemented)
+        lps lps_buf = {0, 0, 0, 0};
         auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
-            seqs, syncmer_functor, lcp_level);
+            seqs, syncmer_functor, lcp_level, lps_buf);
+        free_lps(&lps_buf);
 
         // Build reverse-complemented concatenated reference
         gtl::vector<SequenceContainerType> rev_seqs;

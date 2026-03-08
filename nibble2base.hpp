@@ -348,6 +348,12 @@ inline void onehotto2bitDNA_vector(const uint8_t *__restrict data, size_t len,
                                    uint8_t *__restrict high) {
 #if (defined(__ARM_NEON) || defined(__ARM_NEON__))
     return onehotto2bitDNA_neon(data, len, low, high);
+#else
+    for (size_t i = 0; i < len; ++i) {
+        uint8_t b = data[i];
+        low[i] = decode4_tbl[b & 0x0F];
+        high[i] = decode4_tbl[b >> 4];
+    }
 #endif
 }
 // Uses naive conversions for now can be optimized later if necessary
@@ -818,7 +824,7 @@ struct CrumbledSubSeq64 {
         }
         if ((len + skip_first_n) % 32 != 0)
             rc.data[0] = reverse_complement_kmer(data[num_blocks - 1],
-                                                 (len + skip_first_n - 1) % 32);
+                                                 (len + skip_first_n) % 32);
         rc.skip_first_n = (num_blocks * 32 - len) - skip_first_n;
         return rc;
     }

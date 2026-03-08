@@ -825,8 +825,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
     // Scalar tail: remaining input bytes
     for (; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - __builtin_clz(data[byte_idx]);
-        uint8_t lo_base = __builtin_ctz(data[byte_idx]);
+        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
         int64_t hi_pos = byte_idx * 2;
         int64_t lo_pos = byte_idx * 2 + 1;
         if (hi_pos > 0) {
@@ -845,7 +845,7 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         }
     }
     if (len % 2 == 1) {
-        uint8_t last_base = 27 - __builtin_clz(data[len / 2]);
+        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
         if (last_base != rle_data[out - 1]) {
             rle_data[out] = last_base;
             rle_pos[out] = static_cast<uint32_t>(len - 1);
@@ -855,8 +855,8 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 #else
     // Scalar fallback
     for (int64_t byte_idx = 0; byte_idx < len / 2; ++byte_idx) {
-        uint8_t hi_base = 27 - __builtin_clz(data[byte_idx]);
-        uint8_t lo_base = __builtin_ctz(data[byte_idx]);
+        uint8_t hi_base = 27 - std::countl_zero(static_cast<unsigned>(data[byte_idx]));
+        uint8_t lo_base = std::countr_zero(static_cast<unsigned>(data[byte_idx]));
         int64_t hi_pos = byte_idx * 2;
         int64_t lo_pos = byte_idx * 2 + 1;
         if (hi_pos > 0 || byte_idx > 0) {  // skip base 0 (already emitted)
@@ -875,7 +875,7 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
         }
     }
     if (len % 2 == 1) {
-        uint8_t last_base = 27 - __builtin_clz(data[len / 2]);
+        uint8_t last_base = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
         if (last_base != rle_data[out - 1]) {
             rle_data[out] = last_base;
             rle_pos[out] = static_cast<uint32_t>(len - 1);

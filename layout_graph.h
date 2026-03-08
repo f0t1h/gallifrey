@@ -312,7 +312,7 @@ inline layout_boundary find_layout_boundary(
 
 namespace layout_graph_algo {
 using layout_result_t =
-    gtl::vector<gtl::flat_hash_map<u64, std::tuple<int, int, bool>>>;
+    gtl::vector<gtl::flat_hash_map<u64, std::tuple<i64, i64, bool>>>;
 
 template <class RecigMapT>
 inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
@@ -320,27 +320,27 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     std::queue<std::pair<u64, typename RecigMapT::mapped_type>> q;
     gtl::flat_hash_set<u64> visited;
 
-    auto infer_len_for_node = [&](u64 id) -> int {
+    auto infer_len_for_node = [&](u64 id) -> i64 {
         auto out_range = recig.equal_range(id);
         if (out_range.first != out_range.second) {
             const auto &rm = out_range.first->second;
-            if (rm.qry.size > 0) return static_cast<int>(rm.qry.size);
+            if (rm.qry.size > 0) return static_cast<i64>(rm.qry.size);
         }
         for (const auto &kv : recig) {
             if (kv.second.node != id) continue;
             const auto &rm = kv.second;
-            if (rm.tgt.size > 0) return static_cast<int>(rm.tgt.size);
+            if (rm.tgt.size > 0) return static_cast<i64>(rm.tgt.size);
         }
         return 0;
     };
 
-    auto to_end_inclusive = [&](int start, int len) -> int {
+    auto to_end_inclusive = [&](i64 start, i64 len) -> i64 {
         if (len <= 0) return start;
-        if (start > std::numeric_limits<int>::max() - (len - 1)) {
-            return std::numeric_limits<int>::max();
+        if (start > std::numeric_limits<i64>::max() - (len - 1)) {
+            return std::numeric_limits<i64>::max();
         }
-        if (start < std::numeric_limits<int>::min() + (len - 1)) {
-            return std::numeric_limits<int>::min();
+        if (start < std::numeric_limits<i64>::min() + (len - 1)) {
+            return std::numeric_limits<i64>::min();
         }
         return start + (len - 1);
     };
@@ -348,9 +348,9 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     for (const auto &nit : recig) {
         if (visited.contains(nit.first)) continue;
         layouts.emplace_back();
-        const int root_start = 0;
-        const int root_len = infer_len_for_node(nit.first);
-        const int root_end = to_end_inclusive(root_start, root_len);
+        const i64 root_start = 0;
+        const i64 root_len = infer_len_for_node(nit.first);
+        const i64 root_end = to_end_inclusive(root_start, root_len);
         layouts.back().emplace(nit.first,
                                std::make_tuple(root_start, root_end, true));
         visited.emplace(nit.first);
@@ -379,10 +379,10 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
                 target_orient ? (node.second.tgt.size - node.second.tgt.to)
                               : node.second.tgt.from;
 
-            int delta = static_cast<int>(qs - ts);
-            int target_start = spos + delta;
-            const int target_len = infer_len_for_node(tgt);
-            const int target_end = to_end_inclusive(target_start, target_len);
+            i64 delta = static_cast<i64>(qs - ts);
+            i64 target_start = spos + delta;
+            const i64 target_len = infer_len_for_node(tgt);
+            const i64 target_end = to_end_inclusive(target_start, target_len);
 
             layouts.back().emplace(
                 tgt, std::make_tuple(target_start, target_end, target_orient));
@@ -402,27 +402,27 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
     layout_result_t layouts;
     gtl::flat_hash_set<u64> visited;
 
-    auto infer_len_for_node = [&](u64 id) -> int {
+    auto infer_len_for_node = [&](u64 id) -> i64 {
         auto out_range = recig.equal_range(id);
         if (out_range.first != out_range.second) {
             const auto &rm = out_range.first->second;
-            if (rm.qry.size > 0) return static_cast<int>(rm.qry.size);
+            if (rm.qry.size > 0) return static_cast<i64>(rm.qry.size);
         }
         for (const auto &kv : recig) {
             if (kv.second.node != id) continue;
             const auto &rm = kv.second;
-            if (rm.tgt.size > 0) return static_cast<int>(rm.tgt.size);
+            if (rm.tgt.size > 0) return static_cast<i64>(rm.tgt.size);
         }
         return 0;
     };
 
-    auto to_end_inclusive = [&](int start, int len) -> int {
+    auto to_end_inclusive = [&](i64 start, i64 len) -> i64 {
         if (len <= 0) return start;
-        if (start > std::numeric_limits<int>::max() - (len - 1)) {
-            return std::numeric_limits<int>::max();
+        if (start > std::numeric_limits<i64>::max() - (len - 1)) {
+            return std::numeric_limits<i64>::max();
         }
-        if (start < std::numeric_limits<int>::min() + (len - 1)) {
-            return std::numeric_limits<int>::min();
+        if (start < std::numeric_limits<i64>::min() + (len - 1)) {
+            return std::numeric_limits<i64>::min();
         }
         return start + (len - 1);
     };
@@ -459,7 +459,7 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
         struct edge_info {
             u64 src;
             u64 tgt;
-            int delta;
+            i64 delta;
         };
         gtl::vector<edge_info> edges;
 
@@ -493,7 +493,7 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
                 long long ts =
                     tgt_orient ? (it->second.tgt.size - it->second.tgt.to)
                                : it->second.tgt.from;
-                edges.push_back({src, tgt, static_cast<int>(qs - ts)});
+                edges.push_back({src, tgt, static_cast<i64>(qs - ts)});
             }
         }
 
@@ -525,9 +525,9 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
         const double min_pos = x_positions[component[0]];
         for (u64 node_id : component) {
             const double pos = x_positions[node_id] - min_pos;
-            const int start = static_cast<int>(std::round(pos));
-            const int len = infer_len_for_node(node_id);
-            const int end = to_end_inclusive(start, len);
+            const i64 start = static_cast<i64>(std::round(pos));
+            const i64 len = infer_len_for_node(node_id);
+            const i64 end = to_end_inclusive(start, len);
             const bool orient =
                 orientations.contains(node_id) ? orientations[node_id] : true;
             layouts.back().emplace(node_id, std::make_tuple(start, end, orient));
@@ -540,8 +540,8 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
 namespace layout_graph_emit {
 struct ultra_layout_node_info {
     u64 id;
-    int from;
-    int to;
+    i64 from;
+    i64 to;
     bool ori;
 };
 
@@ -561,8 +561,8 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     // ── Local structs ──────────────────────────────────────────────────
     struct lane_node {
         u64 id = 0;
-        int from = 0;
-        int to = 0;
+        i64 from = 0;
+        i64 to = 0;
         bool is_forward_lane = true;
         const gtl::vector<SequenceContainerType> *raw_seqs = nullptr;
     };
@@ -643,6 +643,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     // Build cores for all contigs in layout order, RC only if reverse
     gtl::vector<size_t> contig_order;
     contig_order.reserve(sorted_idx.size());
+    lps lps_buf = {0, 0, 0, 0};
 
     for (size_t ci : sorted_idx) {
         const auto &raw = *nodes[ci].raw_seqs;
@@ -658,7 +659,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         }
 
         auto [lr, cseqs] = AssemblerT::build_lr_cores_with_seqs(
-            *seqs_ptr, as.syncmer_functor, as.lcp_level);
+            *seqs_ptr, as.syncmer_functor, as.lcp_level, lps_buf);
 
         if (lr.cores.empty()) {
             // Synthetic single-core fallback — concatenate fragments
@@ -690,6 +691,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
                      "[layout-dag] layout=%" PRIu64
                      " SKIPPED: no contigs with cores\n",
                      static_cast<uint64_t>(layout_idx));
+        free_lps(&lps_buf);
         return {};
     }
 
@@ -781,7 +783,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             for (auto &[r, _] : comp_srcs) roots.push_back(r);
             std::sort(roots.begin(), roots.end(),
                       [&](uint32_t a, uint32_t b) {
-                          int ma = INT_MAX, mb = INT_MAX;
+                          i64 ma = INT64_MAX, mb = INT64_MAX;
                           for (uint32_t s : comp_srcs[a])
                               ma = std::min(ma,
                                    nodes[poa[s].contig_idx].from);
@@ -885,6 +887,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
                      "[layout-dag] layout=%" PRIu64
                      " SKIPPED: POA graph empty\n",
                      static_cast<uint64_t>(layout_idx));
+        free_lps(&lps_buf);
         return {};
     }
 
@@ -965,8 +968,8 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
 
     // For each component: find heaviest path, determine layout position
     struct comp_path {
-        int layout_from;
-        int layout_to;
+        i64 layout_from;
+        i64 layout_to;
         int64_t total_weight;
         gtl::vector<uint32_t> path;
     };
@@ -1005,22 +1008,22 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         // sinks/sources in this component that cover more layout span.
         {
             gtl::flat_hash_set<uint32_t> on_path(path.begin(), path.end());
-            int path_max_to = INT_MIN;
+            i64 path_max_to = INT64_MIN;
             for (uint32_t nid : path)
                 path_max_to = std::max(path_max_to,
                                        nodes[poa[nid].contig_idx].to);
-            int path_min_from = INT_MAX;
+            i64 path_min_from = INT64_MAX;
             for (uint32_t nid : path)
                 path_min_from = std::min(path_min_from,
                                          nodes[poa[nid].contig_idx].from);
 
             // Forward extension: find sink with layout_to > path_max_to
             int32_t ext_sink = -1;
-            int ext_to = path_max_to;
+            i64 ext_to = path_max_to;
             for (size_t i = 0; i < n; ++i) {
                 if (comp_id[i] != c) continue;
                 if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                int to = nodes[poa[i].contig_idx].to;
+                i64 to = nodes[poa[i].contig_idx].to;
                 if (to > ext_to && poa_fwd[i].empty()) {
                     ext_to = to;
                     ext_sink = static_cast<int32_t>(i);
@@ -1034,20 +1037,31 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
                 std::reverse(ext_path.begin(), ext_path.end());
                 // Find last node in ext_path that's on the main path
                 size_t branch_pos = 0;
-                for (size_t i = 0; i < ext_path.size(); ++i)
-                    if (on_path.contains(ext_path[i])) branch_pos = i;
-                // Append the diverging suffix
-                for (size_t i = branch_pos + 1; i < ext_path.size(); ++i)
-                    path.push_back(ext_path[i]);
+                bool found_overlap = false;
+                for (size_t i = 0; i < ext_path.size(); ++i) {
+                    if (on_path.contains(ext_path[i])) {
+                        branch_pos = i;
+                        found_overlap = true;
+                    }
+                }
+                if (!found_overlap) [[unlikely]] {
+                    std::fprintf(stderr,
+                        "[layout-dag] WARNING: forward extension has no "
+                        "overlap with main path (%s:%d)\n", __FILE__, __LINE__);
+                } else {
+                    // Append the diverging suffix
+                    for (size_t i = branch_pos + 1; i < ext_path.size(); ++i)
+                        path.push_back(ext_path[i]);
+                }
             }
 
             // Backward extension: find source with layout_from < path_min_from
             int32_t ext_source = -1;
-            int ext_from = path_min_from;
+            i64 ext_from = path_min_from;
             for (size_t i = 0; i < n; ++i) {
                 if (comp_id[i] != c) continue;
                 if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                int from = nodes[poa[i].contig_idx].from;
+                i64 from = nodes[poa[i].contig_idx].from;
                 if (from < ext_from && poa_rev[i].empty()) {
                     ext_from = from;
                     ext_source = static_cast<int32_t>(i);
@@ -1079,7 +1093,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         }
 
         // Layout position range from all nodes' contigs in this component
-        int min_pos = INT_MAX, max_pos = INT_MIN;
+        i64 min_pos = INT64_MAX, max_pos = INT64_MIN;
         for (size_t i = 0; i < n; ++i) {
             if (comp_id[i] != c) continue;
             min_pos = std::min(min_pos, nodes[poa[i].contig_idx].from);
@@ -1165,6 +1179,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         }
     }
 
+    free_lps(&lps_buf);
     return merged_seqs;
 }
 
@@ -1274,8 +1289,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     for (const auto &current_layout : layouts) {
         gtl::vector<ultra_layout_node_info> lnodes;
         lnodes.reserve(current_layout.size());
-        int min_start = INT_MAX;
-        int max_end = INT_MIN;
+        i64 min_start = INT64_MAX;
+        i64 max_end = INT64_MIN;
         for (const auto &[ctg_id, layout] : current_layout) {
             auto [from, to, ori] = layout;
             lnodes.push_back({ctg_id, from, to, ori});
@@ -1293,21 +1308,28 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                       return a.id < b.id;
                   });
 
-        const int span = std::max(1, max_end - min_start);
-        const int fuzzy = std::max<int>(as.olc_lcmer_l * 2, span / 20);
+        const i64 span = std::max<i64>(1, max_end - min_start);
+        const i64 fuzzy = std::max<i64>(as.olc_lcmer_l * 2, span / 20);
         for (const auto &n : lnodes) {
             uint8_t mask = 0;
             if (n.from <= min_start + fuzzy) mask |= SIDE_START;
             if (n.to >= max_end - fuzzy) mask |= SIDE_END;
             if (mask == 0) {
-                int d_start = n.from - min_start;
+                i64 d_start = n.from - min_start;
                 if (d_start < 0) d_start = -d_start;
-                int d_end = max_end - n.to;
+                i64 d_end = max_end - n.to;
                 if (d_end < 0) d_end = -d_end;
                 mask = (d_start <= d_end) ? SIDE_START : SIDE_END;
             }
             node_boundary_mask[n.id] |= mask;
-            node_layout_ori[n.id] = n.ori;
+            auto [ori_it, inserted] = node_layout_ori.try_emplace(n.id, n.ori);
+            if (!inserted && ori_it->second != n.ori) [[unlikely]] {
+                std::fprintf(stderr,
+                    "[layout-emit] WARNING: node %" PRIu64
+                    " orientation conflict: was %c, now %c (overwriting)\n",
+                    n.id, ori_it->second ? '+' : '-', n.ori ? '+' : '-');
+                ori_it->second = n.ori;
+            }
             nodes_in_layouts.insert(n.id);
         }
 
@@ -1369,17 +1391,17 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                     char src_ori = '+', dst_ori = '+';
 
                     if (nodes_in_layouts.contains(from_id)) {
-                        bool ori = node_layout_ori[from_id]; // TODO FIND
+                        bool ori = node_layout_ori.at(from_id);
                         src_ori = ori_char(ori);
                         src_side = ori ? SIDE_END : SIDE_START;
-                        if ((node_boundary_mask[from_id] & src_side) == 0)
+                        if ((node_boundary_mask.at(from_id) & src_side) == 0)
                             accept = false;
                     }
                     if (nodes_in_layouts.contains(to_id)) {
-                        bool ori = node_layout_ori[to_id];
+                        bool ori = node_layout_ori.at(to_id);
                         dst_ori = ori_char(ori);
                         dst_side = ori ? SIDE_START : SIDE_END;
-                        if ((node_boundary_mask[to_id] & dst_side) == 0)
+                        if ((node_boundary_mask.at(to_id) & dst_side) == 0)
                             accept = false;
                     }
                     if (!accept) continue;
@@ -1505,8 +1527,8 @@ inline void print_merged_layouts(
         if (layout.empty()) continue;
 
         struct LayoutEntry {
-            int start;
-            int end;
+            i64 start;
+            i64 end;
             u64 node_id;
             bool orient;
             dbg_index::dbg_map_t::iterator dbg_it;
@@ -1529,8 +1551,8 @@ inline void print_merged_layouts(
 
         double core_to_base_scale = 0.0;
         {
-            int min_start = INT_MAX;
-            int max_start = INT_MIN;
+            i64 min_start = INT64_MAX;
+            i64 max_start = INT64_MIN;
             size_t total_bases = 0;
             for (const auto &e : entries) {
                 min_start = std::min(min_start, e.start);
@@ -1549,7 +1571,7 @@ inline void print_merged_layouts(
 
         gtl::vector<LayoutEntry> non_contained;
         non_contained.reserve(entries.size());
-        int max_end = INT_MIN;
+        i64 max_end = INT64_MIN;
         for (auto &entry : entries) {
             if (entry.end <= max_end) {
                 entry.dbg_it->second.seq.clear();
@@ -1563,12 +1585,12 @@ inline void print_merged_layouts(
 
         std::fprintf(out, "S\tM%" PRIu64 "\t", static_cast<uint64_t>(contig_id));
         size_t total_len = 0;
-        int current_end = non_contained[0].start;
+        i64 current_end = non_contained[0].start;
         gtl::vector<u64> prev_edges = non_contained[0].dbg_it->second.prev;
 
         for (size_t i = 0; i < non_contained.size(); ++i) {
             auto &curr = non_contained[i];
-            int overlap_cores = current_end - curr.start;
+            i64 overlap_cores = current_end - curr.start;
             if (overlap_cores < 0) overlap_cores = 0;
 
             size_t bases_to_skip = 0;
@@ -1744,15 +1766,16 @@ inline auto find_anchors_and_extend_the_ctg_builder(
     const gtl::vector<SequenceContainerType> &next,
     const std::optional<half_lcmer> &prev_anchor, bool forward)
     -> half_lcmer {
+    lps lps_buf = {0, 0, 0, 0};
     auto [extension_cores, reextension] = [&]() {
         if (forward) {
             return AssemblerT::build_lr_cores_with_seqs(extension,
                                                         as.syncmer_functor,
-                                                        as.lcp_level);
+                                                        as.lcp_level, lps_buf);
         }
         return AssemblerT::build_rev_lr_cores_with_seqs(extension,
                                                         as.syncmer_functor,
-                                                        as.lcp_level);
+                                                        as.lcp_level, lps_buf);
     }();
 
     auto mini_extension_index = [&]() {
@@ -1780,10 +1803,10 @@ inline auto find_anchors_and_extend_the_ctg_builder(
         if (next.empty()) return lcp_read{};
         if (!forward) {
             return AssemblerT::build_lr_cores(next, as.syncmer_functor,
-                                              as.lcp_level);
+                                              as.lcp_level, lps_buf);
         }
         return AssemblerT::build_rev_lr_cores(next, as.syncmer_functor,
-                                              as.lcp_level);
+                                              as.lcp_level, lps_buf);
     }();
 
     auto right_anchor = [&]() -> std::optional<half_lcmer> {
@@ -1800,7 +1823,10 @@ inline auto find_anchors_and_extend_the_ctg_builder(
         return {};
     }();
 
-    if (left_anchor == right_anchor) return right_anchor.value();
+    if (left_anchor == right_anchor) {
+        free_lps(&lps_buf);
+        return right_anchor.value();
+    }
 
     auto left_extension_pos = [&]() {
         auto &cores = extension_cores.cores;
@@ -1829,6 +1855,7 @@ inline auto find_anchors_and_extend_the_ctg_builder(
         if (right_anchor.has_value() && l == right_anchor.value()) break;
     }
 
+    free_lps(&lps_buf);
     return right_anchor.has_value() ? right_anchor.value() : half_lcmer{};
 }
 
@@ -1839,16 +1866,16 @@ inline void merge_layouts_ultra(
     auto identify_component_endpoints = [](const auto &layout) {
         u64 leftmost = 0;
         u64 rightmost = 0;
-        int min_start = INT_MAX;
-        int max_start = INT_MIN;
-        int leftmost_span = INT_MIN;
-        int rightmost_span = INT_MIN;
+        i64 min_start = INT64_MAX;
+        i64 max_start = INT64_MIN;
+        i64 leftmost_span = INT64_MIN;
+        i64 rightmost_span = INT64_MIN;
         bool start_orient_forward = true;
 
         for (const auto &[node_id, start_end_orient] : layout) {
             auto [start_core, end_core, orient] = start_end_orient;
             (void)orient;
-            const int s = end_core - start_core;
+            const i64 s = end_core - start_core;
 
             if (start_core < min_start ||
                 (start_core == min_start && s > leftmost_span)) {
@@ -1965,15 +1992,15 @@ inline void merge_layouts_ldbg(
     auto identify_component_endpoints = [](const auto &layout) {
         u64 leftmost = 0;
         u64 rightmost = 0;
-        int min_start = INT_MAX;
-        int max_start = INT_MIN;
-        int leftmost_span = INT_MIN;
-        int rightmost_span = INT_MIN;
+        i64 min_start = INT64_MAX;
+        i64 max_start = INT64_MIN;
+        i64 leftmost_span = INT64_MIN;
+        i64 rightmost_span = INT64_MIN;
 
         for (const auto &[node_id, start_end_orient] : layout) {
             auto [start_core, end_core, orient] = start_end_orient;
             (void)orient;
-            const int s = end_core - start_core;
+            const i64 s = end_core - start_core;
 
             if (start_core < min_start ||
                 (start_core == min_start && s > leftmost_span)) {
@@ -2042,6 +2069,7 @@ inline void merge_layouts_ldbg(
         }
 
         bool plus = true;
+        lps lps_buf = {0, 0, 0, 0};
         for (size_t i = 0; i < path.size(); ++i) {
             source = path[i];
             auto source_node = dbg.find(source);
@@ -2054,7 +2082,7 @@ inline void merge_layouts_ldbg(
             if (plus) {
                 auto lrs = AssemblerT::build_lr_cores(source_node->second.seq,
                                                       as.syncmer_functor,
-                                                      as.lcp_level);
+                                                      as.lcp_level, lps_buf);
                 auto ll = process_substr_cores(lrs, new_index, tid, smal_dbgi,
                                                source_node->second.seq);
                 if (i == 0) {
@@ -2083,7 +2111,7 @@ inline void merge_layouts_ldbg(
 
                 auto lrs = AssemblerT::build_lr_cores(rev_seqs,
                                                       as.syncmer_functor,
-                                                      as.lcp_level);
+                                                      as.lcp_level, lps_buf);
                 auto ll = process_substr_cores(lrs, new_index, tid, smal_dbgi,
                                                rev_seqs);
                 if (i == path.size() - 1) {
@@ -2098,6 +2126,7 @@ inline void merge_layouts_ldbg(
             }
             plus = !plus;
         }
+        free_lps(&lps_buf);
 
         auto sp = smal_dbgi.shortest_path_bfs(tgt_lcm, src_lcm);
         if (!sp.empty()) {

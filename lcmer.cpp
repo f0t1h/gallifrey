@@ -1,5 +1,6 @@
 #include "lcmer.h"
 
+#include <bit>
 #include <cstdint>
 
 #include "asm.h"
@@ -129,8 +130,8 @@ uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
 int onehotto2bitDNA2(const uint8_t *data, char *ret) {
     static char table[] = {'A', 'C', 'G', 'T'};
     for (size_t i = 0;; ++i) {
-        int clz = __builtin_clz(data[i]);
-        int ctz = __builtin_ctz(data[i]);
+        int clz = std::countl_zero(static_cast<unsigned>(data[i]));
+        int ctz = std::countr_zero(static_cast<unsigned>(data[i]));
 
         if (clz < 0 || ctz > 3) {
             ret[i] = 0;
@@ -144,8 +145,8 @@ int onehotto2bitDNA2(const uint8_t *data, char *ret) {
 uint8_t *onehotto2bitDNA(uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
     for (size_t i = 0; i < len / 2; ++i) {
-        ret[2 * i] = 27 - __builtin_clz(data[i]);
-        ret[2 * i + 1] = __builtin_ctz(data[i]);
+        ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
     }
     return ret;
 }
@@ -166,17 +167,17 @@ void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &chs) {
         vst1q_u8(chs.data + 2 * i + 16, interleaved.val[1]);
     }
     for (; i < len / 2; ++i) {
-        chs.data[2 * i]     = 27 - __builtin_clz(data[i]);
-        chs.data[2 * i + 1] = __builtin_ctz(data[i]);
+        chs.data[2 * i]     = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        chs.data[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
     }
 #else
     for (size_t i = 0; i < len / 2; ++i) {
-        chs.data[2 * i]     = 27 - __builtin_clz(data[i]);
-        chs.data[2 * i + 1] = __builtin_ctz(data[i]);
+        chs.data[2 * i]     = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        chs.data[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
     }
 #endif
     if (len % 2 == 1) {
-        chs.data[len - 1] = 27 - __builtin_clz(data[len / 2]);
+        chs.data[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
     }
 }
 void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
@@ -204,29 +205,29 @@ void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
     }
     size_t mid = half - 1;
     for (; i < half; ++i) {
-        chs.data[2 * (mid - i)]     = __builtin_clz(data[i]) - 24;
-        chs.data[2 * (mid - i) + 1] = 3 - __builtin_ctz(data[i]);
+        chs.data[2 * (mid - i)]     = std::countl_zero(static_cast<unsigned>(data[i])) - 24;
+        chs.data[2 * (mid - i) + 1] = 3 - std::countr_zero(static_cast<unsigned>(data[i]));
     }
 #else
     size_t mid = len / 2 - 1;
     for (size_t i = 0; i < len / 2; ++i) {
-        chs.data[2 * (mid - i)]     = __builtin_clz(data[i]) - 24;
-        chs.data[2 * (mid - i) + 1] = 3 - __builtin_ctz(data[i]);
+        chs.data[2 * (mid - i)]     = std::countl_zero(static_cast<unsigned>(data[i])) - 24;
+        chs.data[2 * (mid - i) + 1] = 3 - std::countr_zero(static_cast<unsigned>(data[i]));
     }
 #endif
     if (len % 2 == 1) {
-        chs.data[0] = __builtin_clz(data[len / 2]) - 24;
+        chs.data[0] = std::countl_zero(static_cast<unsigned>(data[len / 2])) - 24;
     }
 }
 uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
     uint8_t *ret = (uint8_t *)malloc(len);
 #pragma clang loop vectorize(enable) interleave(enable)
     for (size_t i = 0; i < len / 2; ++i) {
-        ret[2 * i] = 27 - __builtin_clz(data[i]);
-        ret[2 * i + 1] = __builtin_ctz(data[i]);
+        ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+        ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
     }
     if (len % 2 == 1) {
-        ret[len - 1] = 27 - __builtin_clz(data[len / 2]);
+        ret[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
     }
     return ret;
 }
