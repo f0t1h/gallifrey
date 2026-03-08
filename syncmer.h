@@ -61,10 +61,10 @@ struct MurMur {
         switch (len & 3) {
             case 3:
                 k1 ^= tail[2] << 16;
-                break;
+
             case 2:
                 k1 ^= tail[1] << 8;
-                break;
+
             case 1:
                 k1 ^= tail[0];
                 k1 *= c1;
@@ -154,8 +154,7 @@ struct GenericSyncmerRule {
           table(table_size, 0) {
         if (s() != cfg.invalid_param_value) {
             s_mask = (1U << s()) - 1U;
-        }
-        else{
+        } else {
             s_mask = -1;
         }
         size_t tc = 0;
@@ -164,8 +163,9 @@ struct GenericSyncmerRule {
             tc += table[i];
         }
         fprintf(stderr, "Real K-mer density: %lf\n", (double)tc / table_size);
-        if((double)tc / table_size > pure_lcp_density_threshold) {
-            fprintf(stderr, "Density of %lf > %lf, switching to pure LCP!\n", (double)tc / table_size, pure_lcp_density_threshold);
+        if ((double)tc / table_size > pure_lcp_density_threshold) {
+            fprintf(stderr, "Density of %lf > %lf, switching to pure LCP!\n",
+                    (double)tc / table_size, pure_lcp_density_threshold);
             pure_lcp = true;
         }
     }

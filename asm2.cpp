@@ -38,41 +38,6 @@
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
-template <class T>
-struct mptr {
-    static constexpr size_t vmask = 3;
-    static constexpr size_t pmask = ~vmask;
-    T *ptr;
-    ~mptr() {
-        delete unwrap();
-        ptr = 0;
-    }
-    mptr(T val) : ptr{new T{val}} {}
-    mptr(T val, int message) : ptr{new T{val}} { write_message(message); }
-    mptr(T *ptr) : ptr{ptr} {}
-    mptr(T *ptr, int message) : ptr{ptr} { write_message(message); }
-    mptr(mptr &&other) {
-        ptr = other.ptr;
-        other.ptr = 0;
-    }
-    mptr(const mptr &other) = delete;
-    mptr &operator=(const mptr &other) = delete;
-    mptr &&operator=(mptr &&other) {
-        this->ptr = other.ptr;
-        other.ptr = 0;
-    }
-    constexpr const T *unwrap() const { return (T *)((size_t)(ptr)&pmask); }
-    constexpr T *unwrap() { return (T *)((size_t)(ptr)&pmask); }
-    constexpr T operator*() const {
-        if (ptr) return *unwrap();
-        throw 42;
-    }
-    constexpr int get_message() const { return (size_t)(ptr)&vmask; }
-    void write_message(int message) {
-        ptr = (T *)((size_t)(ptr) | (message & vmask));
-    }
-};
-
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -323,7 +288,7 @@ struct assembler {
             ++processed_read_count;
             Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
         pd_cleanup:
-            if (!recycle_queue.try_dequeue(data_p)) {
+            if (!recycle_queue.try_enqueue(data_p)) {
                 bam_destroy1(data_p);
                 data_p = NULL;
             }
@@ -637,41 +602,41 @@ struct assembler {
         return components;
     }
 
-    std::tuple<int, int> get_start_positions(
-        u64 current, u64 neighbor, gtl::btree_multimap<u64, rev_match> rmatch,
-        int cgroup) {
-        int qs = -9999, ts = -9999;
-        int qe = -9999, te = -9999;
-        int ql = -9999, tl = -9999;
+    // std::tuple<int, int> get_start_positions(
+    //     u64 current, u64 neighbor, gtl::btree_multimap<u64, rev_match> rmatch,
+    //     int cgroup) {
+    //     int qs = -9999, ts = -9999;
+    //     int qe = -9999, te = -9999;
+    //     int ql = -9999, tl = -9999;
 
-        auto range_c = rmatch.equal_range(current);
-        for (auto it = range_c.first; it != range_c.second; ++it) {
-            if (it->second.node == neighbor) {
-                qe = it->second.tgt.to;
-                qs = it->second.tgt.from;
-                ql = it->second.tgt.size;
-                break;
-            }
-        }
-        // Find the specific reciprocal entry for (neighbor -> current)
-        auto range_t = rmatch.equal_range(neighbor);
-        for (auto it = range_t.first; it != range_t.second; ++it) {
-            if (it->second.node == current) {
-                ts = it->second.tgt.from;
-                te = it->second.tgt.to;
-                tl = it->second.tgt.size;
-                break;
-            }
-        }
-        int ngroup = 1 - cgroup;
-        if (cgroup == 1) {
-            qs = ql - qe;
-        }
-        if (ngroup == 1) {
-            ts = tl - te;
-        }
-        return std::make_tuple(qs, ts);
-    }
+    //     auto range_c = rmatch.equal_range(current);
+    //     for (auto it = range_c.first; it != range_c.second; ++it) {
+    //         if (it->second.node == neighbor) {
+    //             qe = it->second.tgt.to;
+    //             qs = it->second.tgt.from;
+    //             ql = it->second.tgt.size;
+    //             break;
+    //         }
+    //     }
+    //     // Find the specific reciprocal entry for (neighbor -> current)
+    //     auto range_t = rmatch.equal_range(neighbor);
+    //     for (auto it = range_t.first; it != range_t.second; ++it) {
+    //         if (it->second.node == current) {
+    //             ts = it->second.tgt.from;
+    //             te = it->second.tgt.to;
+    //             tl = it->second.tgt.size;
+    //             break;
+    //         }
+    //     }
+    //     int ngroup = 1 - cgroup;
+    //     if (cgroup == 1) {
+    //         qs = ql - qe;
+    //     }
+    //     if (ngroup == 1) {
+    //         ts = tl - te;
+    //     }
+    //     return std::make_tuple(qs, ts);
+    // }
 
     auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
                     auto &node, dbg_index &dbgi, u64 &idx, int tid) {
@@ -704,7 +669,7 @@ struct assembler {
         ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
         for (size_t i = 2; i < lr.cores.size() - olc_lcmer_l - 1; ++i) {
             uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i - olc_lcmer_l], olc_lcmer_l);
+            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
             ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
         }
         ll.push_back(0);

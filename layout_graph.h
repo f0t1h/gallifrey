@@ -1346,83 +1346,128 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     TIME_CHECKPOINT(LayoutEmit, stderr, "Supernode creation");
     using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
     std::map<edge_key, edge_agg> merged_edges;
-    for (const auto &[to_id, to_node] : dbg.dbg) {
-        if (to_node.redirected()) continue;
-        auto to_super_it = node_to_super.find(to_id);
-        if (to_super_it == node_to_super.end()) continue;
+    {
+        int nthreads_edge = as.threads.work;
+        if (nthreads_edge < 1) nthreads_edge = 1;
+        gtl::vector<std::map<edge_key, edge_agg>> per_thread(nthreads_edge);
 
-        for (u64 from_id : to_node.prev) {
-            auto from_super_it = node_to_super.find(from_id);
-            if (from_super_it == node_to_super.end()) continue;
-            if (from_super_it->second == to_super_it->second) continue;
+        for_each_map(
+            dbg.dbg,
+            [&](int tid, const auto &entry) {
+                const auto &[to_id, to_node] = entry;
+                if (to_node.redirected()) return;
+                auto to_super_it = node_to_super.find(to_id);
+                if (to_super_it == node_to_super.end()) return;
 
-            bool accept = true;
-            uint8_t src_side = 0, dst_side = 0;
-            char src_ori = '+', dst_ori = '+';
+                for (u64 from_id : to_node.prev) {
+                    auto from_super_it = node_to_super.find(from_id);
+                    if (from_super_it == node_to_super.end()) continue;
+                    if (from_super_it->second == to_super_it->second) continue;
 
-            if (nodes_in_layouts.contains(from_id)) {
-                bool ori = node_layout_ori[from_id];
-                src_ori = ori_char(ori);
-                src_side = ori ? SIDE_END : SIDE_START;
-                if ((node_boundary_mask[from_id] & src_side) == 0) {
-                    accept = false;
+                    bool accept = true;
+                    uint8_t src_side = 0, dst_side = 0;
+                    char src_ori = '+', dst_ori = '+';
+
+                    if (nodes_in_layouts.contains(from_id)) {
+                        bool ori = node_layout_ori[from_id]; // TODO FIND
+                        src_ori = ori_char(ori);
+                        src_side = ori ? SIDE_END : SIDE_START;
+                        if ((node_boundary_mask[from_id] & src_side) == 0)
+                            accept = false;
+                    }
+                    if (nodes_in_layouts.contains(to_id)) {
+                        bool ori = node_layout_ori[to_id];
+                        dst_ori = ori_char(ori);
+                        dst_side = ori ? SIDE_START : SIDE_END;
+                        if ((node_boundary_mask[to_id] & dst_side) == 0)
+                            accept = false;
+                    }
+                    if (!accept) continue;
+
+                    edge_key k{from_super_it->second,
+                               to_super_it->second,
+                               src_ori, dst_ori,
+                               src_side, dst_side};
+                    auto &agg = per_thread[tid][k];
+                    if (agg.count == 0) {
+                        agg.src_super = from_super_it->second;
+                        agg.dst_super = to_super_it->second;
+                        agg.src_ori = src_ori;
+                        agg.dst_ori = dst_ori;
+                        agg.src_side = src_side;
+                        agg.dst_side = dst_side;
+                        agg.example_from = from_id;
+                        agg.example_to = to_id;
+                    }
+                    agg.count++;
+                }
+            },
+            nthreads_edge);
+
+        // Merge per-thread maps
+        for (auto &local : per_thread) {
+            for (auto &[k, agg] : local) {
+                auto &dst = merged_edges[k];
+                if (dst.count == 0) {
+                    dst = agg;
+                } else {
+                    dst.count += agg.count;
                 }
             }
-            if (nodes_in_layouts.contains(to_id)) {
-                bool ori = node_layout_ori[to_id];
-                dst_ori = ori_char(ori);
-                dst_side = ori ? SIDE_START : SIDE_END;
-                if ((node_boundary_mask[to_id] & dst_side) == 0) {
-                    accept = false;
-                }
-            }
-            if (!accept) continue;
-
-            edge_key k{from_super_it->second,
-                       to_super_it->second,
-                       src_ori,
-                       dst_ori,
-                       src_side,
-                       dst_side};
-            auto &agg = merged_edges[k];
-            if (agg.count == 0) {
-                agg.src_super = from_super_it->second;
-                agg.dst_super = to_super_it->second;
-                agg.src_ori = src_ori;
-                agg.dst_ori = dst_ori;
-                agg.src_side = src_side;
-                agg.dst_side = dst_side;
-                agg.example_from = from_id;
-                agg.example_to = to_id;
-            }
-            agg.count++;
         }
     }
 
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation");
-    // Print supernodes — convert CrumbledSubSeq64 to ASCII only now
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation (parallel)");
+
+    // ── Parallel ASCII conversion of supernode sequences ─────────────
     constexpr size_t N_GAP_LEN = 64;
-    charsi chs;
-    for (const auto &sn : supernodes) {
+    const size_t n_super = supernodes.size();
+    gtl::vector<std::string> super_seq_strs(n_super);
+    {
+        int nthreads_print = as.threads.work;
+        if (nthreads_print < 1) nthreads_print = 1;
+        nthreads_print = std::min<int>(nthreads_print, n_super);
+
+        std::atomic<size_t> next_idx{0};
+        gtl::vector<std::thread> workers;
+        workers.reserve(nthreads_print);
+        for (int t = 0; t < nthreads_print; ++t) {
+            workers.emplace_back([&]() {
+                charsi local_chs;
+                while (true) {
+                    size_t i = next_idx.fetch_add(1);
+                    if (i >= n_super) break;
+                    const auto &sn_seqs = supernodes[i].seqs();
+                    std::string &dst = super_seq_strs[i];
+                    size_t total_len = 0;
+                    for (const auto &s : sn_seqs) {
+                        total_len += (s.len == 0) ? N_GAP_LEN : s.len;
+                    }
+                    dst.reserve(total_len);
+                    for (const auto &s : sn_seqs) {
+                        if (s.len == 0) {
+                            dst.append(N_GAP_LEN, 'N');
+                            continue;
+                        }
+                        local_chs.require(s.len + 32);
+                        s.convert_to_ascii((char *)local_chs.data);
+                        dst.append((const char *)local_chs.data, s.len);
+                    }
+                    if (dst.empty()) dst = "*";
+                }
+            });
+        }
+        for (auto &w : workers) w.join();
+    }
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Parallel ASCII conversion");
+
+    // ── Sequential write ─────────────────────────────────────────────
+    for (size_t i = 0; i < n_super; ++i) {
+        const auto &sn = supernodes[i];
         const char *tp = sn.is_layout ? "layout" : "unitig";
         const char *id_tag = sn.is_layout ? "LY" : "UI";
-        std::fprintf(out, "S\t%s\t", sn.name.c_str());
-        bool any_printed = false;
-        for (const auto &s : sn.seqs()) {
-            if (s.len == 0) {
-                // N-gap sentinel
-                for (size_t i = 0; i < N_GAP_LEN; ++i)
-                    std::fputc('N', out);
-                any_printed = true;
-                continue;
-            }
-            chs.require(s.len + 32);
-            s.convert_to_ascii((char *)chs.data);
-            std::fwrite(chs.data, 1, s.len, out);
-            any_printed = true;
-        }
-        if (!any_printed) std::fputc('*', out);
-        std::fprintf(out, "\tTP:Z:%s\t%s:i:%" PRIu64 "\n",
+        std::fprintf(out, "S\t%s\t%s\tTP:Z:%s\t%s:i:%" PRIu64 "\n",
+                     sn.name.c_str(), super_seq_strs[i].c_str(),
                      tp, id_tag, static_cast<uint64_t>(sn.aux_id));
     }
     for (const auto &[_, edge] : merged_edges) {
@@ -1438,7 +1483,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
             static_cast<uint64_t>(edge.example_from),
             static_cast<uint64_t>(edge.example_to));
     }
-    TIME_CHECKPOINT(LayoutEmit, stderr, "GFA printing");
+    TIME_CHECKPOINT(LayoutEmit, stderr, "GFA writing");
 }
 
 template <class AssemblerT>
