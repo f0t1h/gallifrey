@@ -21,7 +21,7 @@ void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
     cr->label |= (bam_seqi(data, si) << 8);
     cr->label |= (bam_seqi(data, si + distance - 2) << 4);
     cr->label |= (bam_seqi(data, si + distance - 1));
-    cr->bit_rep = 0x8000000000000000 | cr->label;
+    cr->bit_rep = CL(uint128_t){0x8000000000000000, cr->label};
     cr->bit_size = 2 * distance;
 }
 

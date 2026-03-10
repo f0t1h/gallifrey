@@ -45,7 +45,7 @@ include_directories(${HTS_INCLUDE_DIRS})
 link_directories(${HTS_LIBRARY_DIRS})
 add_definitions(${HTS_CFLAGS_OTHER})
 
-set(SOURCE_FILES lasm.cpp asm2.cpp stats.cpp lcmer.cpp sthist.cpp map.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp map.cpp)
 include_directories(./ext)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
@@ -112,6 +112,12 @@ target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurre
 # target_compile_definitions(light_dbg_build PRIVATE
 #     SYNCMER_RULE=DensitySyncmerRule
 # )
+
+# Core dump tool
+add_executable(dump_cores dump_cores.cpp lcmer.cpp)
+target_include_directories(dump_cores PRIVATE . ./ext)
+target_link_libraries(dump_cores PRIVATE ${HTS_LIBRARIES} gtl CLI11::CLI11 pthread deflate z)
+target_compile_definitions(dump_cores PRIVATE SYNCMER_RULE=DensitySyncmerRule DOCTEST_CONFIG_DISABLE)
 
 # Tests and custom targets
 add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)

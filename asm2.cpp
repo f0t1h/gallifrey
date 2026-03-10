@@ -659,6 +659,8 @@ struct assembler {
             lr.cores.emplace_back(str.cores[i].label);
             lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
         }
+
+
         if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
             // good_n.fetch_sub(1);
             free_lps(&str);
@@ -1203,6 +1205,13 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
+
+    // Dump pre-layout unitig graph
+    {
+        FILE *pre = fopen((cfg.output + ".pre_layout").c_str(), "w");
+        print_dbg_seqs(pre, dbg);
+        fclose(pre);
+    }
 
     // Later stages commented out for profiling graph building
     {

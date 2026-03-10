@@ -582,8 +582,8 @@ void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
     cr->end = ei;
     cr->label = 0;
     cr->label |= Kval;
-    cr->bit_rep = 0x8000000000000000 | cr->label;
     cr->bit_size = WIDTH * k;
+    cr->bit_rep = CL(uint128_t){0x8000000000000000, cr->label};
 }
 
 template <typename _T>
@@ -593,7 +593,7 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei,
     cr->end = ei;
     cr->label = 0;
     cr->label |= (Kval ^ reverse_complement_kmer(Kval, k));
-    cr->bit_rep = 0x8000000000000000 | cr->label;
+    cr->bit_rep = CL(uint128_t){0x8000000000000000, cr->label};
     cr->bit_size = 2 * k;
 }
 

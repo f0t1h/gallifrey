@@ -1235,6 +1235,129 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
     return out_seqs;
 }
 
+// ── Post-layout graph types ─────────────────────────────────────────
+struct supernode_out {
+    std::string name;
+    gtl::vector<SequenceContainerType> owned_seqs;   // layout seqs (owned)
+    const gtl::vector<SequenceContainerType> *ref_seqs = nullptr; // unitig seqs (borrowed)
+    bool is_layout;
+    u64 aux_id;
+
+    const gtl::vector<SequenceContainerType> &seqs() const {
+        return ref_seqs ? *ref_seqs : owned_seqs;
+    }
+};
+
+struct edge_agg {
+    u64 src_super = 0;
+    u64 dst_super = 0;
+    char src_ori = '+';
+    char dst_ori = '+';
+    uint8_t src_side = 0;
+    uint8_t dst_side = 0;
+    u64 example_from = 0;
+    u64 example_to = 0;
+    size_t count = 0;
+};
+
+using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
+using supernode_vec = gtl::vector<supernode_out>;
+using edge_map = std::map<edge_key, edge_agg>;
+
+// ── Post-layout graph cleaning ──────────────────────────────────────
+// Mirrors GraphCleaning in graph.h: separate struct with individual
+// cleaning functions operating on the supernode/superedge graph.
+struct PostLayoutCleaning {
+    struct adj_entry {
+        u64 neighbor;       // supernode id
+        edge_key key;       // key into merged_edges
+    };
+
+    // Per-supernode adjacency (directed: fwd = outgoing, rev = incoming)
+    struct adj_info {
+        gtl::vector<adj_entry> fwd;  // outgoing edges
+        gtl::vector<adj_entry> rev;  // incoming edges
+    };
+
+    using adj_map = gtl::flat_hash_map<u64, adj_info>;
+
+    static void build_adjacency(const edge_map &merged_edges, adj_map &adj) {
+        adj.clear();
+        for (const auto &[k, e] : merged_edges) {
+            adj[e.src_super].fwd.push_back({e.dst_super, k});
+            adj[e.dst_super].rev.push_back({e.src_super, k});
+        }
+    }
+
+    // Remove short C-node tips: C-nodes with no successors (or no predecessors)
+    // and sequence length below max_tip_len.
+    static size_t cut_tips(supernode_vec &supernodes, edge_map &merged_edges,
+                           adj_map &adj, size_t max_tip_len) {
+        size_t removed = 0;
+        bool changed = true;
+        while (changed) {
+            changed = false;
+            for (size_t i = 0; i < supernodes.size(); ++i) {
+                auto &sn = supernodes[i];
+                if (sn.name.empty()) continue;        // already removed
+                if (sn.is_layout) continue;            // never remove M-nodes
+
+                auto adj_it = adj.find(i);
+                size_t in_deg = (adj_it != adj.end()) ? adj_it->second.rev.size() : 0;
+                size_t out_deg = (adj_it != adj.end()) ? adj_it->second.fwd.size() : 0;
+
+                // Tip: dead-end on at least one side
+                if (in_deg != 0 && out_deg != 0) continue;
+                if (in_deg == 0 && out_deg == 0) continue;  // isolated — keep
+
+                // Check sequence length
+                size_t seq_len = 0;
+                for (const auto &s : sn.seqs()) seq_len += s.len;
+                if (seq_len >= max_tip_len) continue;
+
+                // Remove this tip: erase its edges and mark node removed
+                if (adj_it != adj.end()) {
+                    for (const auto &e : adj_it->second.fwd)
+                        merged_edges.erase(e.key);
+                    for (const auto &e : adj_it->second.rev)
+                        merged_edges.erase(e.key);
+                }
+                sn.name.clear();
+                adj.erase(i);
+                changed = true;
+                ++removed;
+            }
+            if (changed) {
+                build_adjacency(merged_edges, adj);
+            }
+        }
+        return removed;
+    }
+
+    // Remove edges pointing to/from removed supernodes.
+    static void fix_edges(const supernode_vec &supernodes, edge_map &merged_edges) {
+        std::erase_if(merged_edges, [&](const auto &kv) {
+            const auto &e = kv.second;
+            return e.src_super >= supernodes.size() ||
+                   e.dst_super >= supernodes.size() ||
+                   supernodes[e.src_super].name.empty() ||
+                   supernodes[e.dst_super].name.empty();
+        });
+    }
+
+    static void run(supernode_vec &supernodes, edge_map &merged_edges,
+                    size_t max_tip_len = 50000) {
+        adj_map adj;
+        build_adjacency(merged_edges, adj);
+
+        size_t tips = cut_tips(supernodes, merged_edges, adj, max_tip_len);
+        fix_edges(supernodes, merged_edges);
+
+        if (tips > 0)
+            std::fprintf(stderr, "[post-layout-clean] Removed %zu tips\n", tips);
+    }
+};
+
 template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     INIT_TIMERS(LayoutEmit);
@@ -1249,29 +1372,6 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         return "na";
     };
     auto ori_char = [](bool ori) -> char { return ori ? '+' : '-'; };
-
-    struct supernode_out {
-        std::string name;
-        gtl::vector<SequenceContainerType> owned_seqs;   // layout seqs (owned)
-        const gtl::vector<SequenceContainerType> *ref_seqs = nullptr; // unitig seqs (borrowed)
-        bool is_layout;
-        u64 aux_id;
-
-        const gtl::vector<SequenceContainerType> &seqs() const {
-            return ref_seqs ? *ref_seqs : owned_seqs;
-        }
-    };
-    struct edge_agg {
-        u64 src_super = 0;
-        u64 dst_super = 0;
-        char src_ori = '+';
-        char dst_ori = '+';
-        uint8_t src_side = 0;
-        uint8_t dst_side = 0;
-        u64 example_from = 0;
-        u64 example_to = 0;
-        size_t count = 0;
-    };
 
     gtl::vector<supernode_out> supernodes;
     gtl::flat_hash_map<u64, u64> node_to_super;
@@ -1352,11 +1452,113 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
     }
 
+    // ── Skip C-nodes whose DBG neighbors are all inside layouts ────────
+    // Build successor map from prev edges
+    gtl::flat_hash_map<u64, gtl::vector<u64>> successors;
+    for (const auto &[to_id, to_node] : dbg.dbg) {
+        if (to_node.redirected()) continue;
+        for (u64 from_id : to_node.prev) {
+            successors[from_id].push_back(to_id);
+        }
+    }
+
+    // Remove C-node connected components whose external edges all go to
+    // layout-interior nodes. Such components are tips/paths hanging off
+    // interior layout unitigs — their sequence is already in the layout.
+    gtl::flat_hash_set<u64> candidate_set;
     for (u64 node_id : dbg.active_set) {
         if (nodes_in_layouts.contains(node_id)) continue;
         auto it = dbg.dbg.find(node_id);
         if (it == dbg.dbg.end()) continue;
         if (it->second.redirected() || it->second.seq.empty()) continue;
+        candidate_set.insert(node_id);
+    }
+
+    // Find connected components among C-nodes
+    gtl::flat_hash_set<u64> cc_visited;
+    gtl::flat_hash_set<u64> contained_nodes;
+
+    for (u64 seed : candidate_set) {
+        if (cc_visited.contains(seed)) continue;
+
+        // BFS within C-nodes
+        gtl::vector<u64> component;
+        std::queue<u64> bfs;
+        bfs.push(seed);
+        cc_visited.insert(seed);
+
+        bool has_boundary_neighbor = false;
+
+        while (!bfs.empty()) {
+            u64 cur = bfs.front(); bfs.pop();
+            component.push_back(cur);
+            auto db_it = dbg.dbg.find(cur);
+
+            // Check all neighbors
+            for (u64 pred_id : db_it->second.prev) {
+                if (candidate_set.contains(pred_id)) {
+                    if (!cc_visited.contains(pred_id)) {
+                        cc_visited.insert(pred_id);
+                        bfs.push(pred_id);
+                    }
+                } else if (!nodes_in_layouts.contains(pred_id)) {
+                    // Neighbor is outside layouts and not a C-node candidate
+                    has_boundary_neighbor = true;
+                }
+                // If in layout: check if it's at a layout boundary
+                if (nodes_in_layouts.contains(pred_id)) {
+                    auto bm_it = node_boundary_mask.find(pred_id);
+                    if (bm_it != node_boundary_mask.end()) {
+                        bool ori = node_layout_ori.at(pred_id);
+                        uint8_t needed = ori ? SIDE_END : SIDE_START;
+                        if (bm_it->second & needed)
+                            has_boundary_neighbor = true;
+                    }
+                }
+            }
+            for (u64 succ_id : successors[cur]) {
+                if (candidate_set.contains(succ_id)) {
+                    if (!cc_visited.contains(succ_id)) {
+                        cc_visited.insert(succ_id);
+                        bfs.push(succ_id);
+                    }
+                } else if (!nodes_in_layouts.contains(succ_id)) {
+                    has_boundary_neighbor = true;
+                }
+                if (nodes_in_layouts.contains(succ_id)) {
+                    auto bm_it = node_boundary_mask.find(succ_id);
+                    if (bm_it != node_boundary_mask.end()) {
+                        bool ori = node_layout_ori.at(succ_id);
+                        uint8_t needed = ori ? SIDE_START : SIDE_END;
+                        if (bm_it->second & needed)
+                            has_boundary_neighbor = true;
+                    }
+                }
+            }
+        }
+
+        if (!has_boundary_neighbor && !component.empty()) {
+            for (u64 nid : component)
+                contained_nodes.insert(nid);
+        }
+    }
+
+    size_t contained_bp = 0;
+    for (u64 node_id : contained_nodes) {
+        auto it = dbg.dbg.find(node_id);
+        for (const auto &s : it->second.seq) contained_bp += s.len;
+    }
+    if (!contained_nodes.empty()) {
+        std::fprintf(stderr,
+            "[layout-emit] Skipped %zu contained C-nodes (%zu bp)\n",
+            contained_nodes.size(), contained_bp);
+    }
+
+    // Create supernodes for remaining C-nodes
+    for (u64 node_id : candidate_set) {
+        if (contained_nodes.contains(node_id)) continue;
+        auto it = dbg.dbg.find(node_id);
+        if (it == dbg.dbg.end()) continue;
 
         const u64 sid = supernodes.size();
         supernodes.push_back(
@@ -1366,8 +1568,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     }
 
     TIME_CHECKPOINT(LayoutEmit, stderr, "Supernode creation");
-    using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
-    std::map<edge_key, edge_agg> merged_edges;
+    edge_map merged_edges;
     {
         int nthreads_edge = as.threads.work;
         if (nthreads_edge < 1) nthreads_edge = 1;
@@ -1384,7 +1585,9 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                 for (u64 from_id : to_node.prev) {
                     auto from_super_it = node_to_super.find(from_id);
                     if (from_super_it == node_to_super.end()) continue;
-                    if (from_super_it->second == to_super_it->second) continue;
+                    // Skip intra-supernode edges, but keep self-loops
+                    if (from_super_it->second == to_super_it->second
+                        && from_id != to_id) continue;
 
                     bool accept = true;
                     uint8_t src_side = 0, dst_side = 0;
@@ -1441,6 +1644,10 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 
     TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation (parallel)");
 
+    // ── Post-layout graph cleaning ──────────────────────────────────
+    PostLayoutCleaning::run(supernodes, merged_edges);
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Post-layout cleaning");
+
     // ── Parallel ASCII conversion of supernode sequences ─────────────
     constexpr size_t N_GAP_LEN = 64;
     const size_t n_super = supernodes.size();
@@ -1459,6 +1666,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                 while (true) {
                     size_t i = next_idx.fetch_add(1);
                     if (i >= n_super) break;
+                    if (supernodes[i].name.empty()) continue;  // removed
                     const auto &sn_seqs = supernodes[i].seqs();
                     std::string &dst = super_seq_strs[i];
                     size_t total_len = 0;
@@ -1486,6 +1694,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     // ── Sequential write ─────────────────────────────────────────────
     for (size_t i = 0; i < n_super; ++i) {
         const auto &sn = supernodes[i];
+        if (sn.name.empty()) continue;  // removed by post-layout cleaning
         const char *tp = sn.is_layout ? "layout" : "unitig";
         const char *id_tag = sn.is_layout ? "LY" : "UI";
         std::fprintf(out, "S\t%s\t%s\tTP:Z:%s\t%s:i:%" PRIu64 "\n",

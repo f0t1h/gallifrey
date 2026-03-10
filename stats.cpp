@@ -3,6 +3,7 @@
 #include "gtl/phmap.hpp"
 #include "histogram.h"
 #include "lcmer.h"
+#include "ext/lcptools/lcptools_ho.h"
 #include "syncmer.h"
 template <class T>
 struct stat_accu {
@@ -53,7 +54,7 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level, d
         "{:.2f}");
 
     struct tb_event ev;
-    lps str = {0, 0, 0, 0};
+    lps lcstr = {0, 0, 0, 0};
     syncmer::DensitySyncmerRule<uint32_t, syncmer::MurMur> syncmer_functor{
         8,
         density, 423U, static_cast<unsigned int>(-1)};
@@ -63,7 +64,7 @@ int run_stats(const std::string &input, int update_frequency, int lcmer_level, d
     while (reader.read(bamdata)) {
         lcps.clear();
          parse_cores_from_bam_record(
-            bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &str,
+            bam_get_seq(bamdata), bamdata->core.l_qseq, lcmer_level, &lcstr,
             syncmer_functor, chs, lcps, pos_buf);
         stats["length"].update(bamdata->core.l_qseq);
         stats["core-count"].update(lcps.cores.size());
@@ -96,6 +97,6 @@ enough:
     while (tb_peek_event(&ev, 100) == TB_ERR_NO_EVENT) {
         if (ev.type == TB_EVENT_KEY) goto enough;
     }
-    lps_clear(&str);
+    lps_clear(&lcstr);
     return 0;
 }
