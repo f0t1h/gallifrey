@@ -116,8 +116,8 @@ target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11
 
 # Tests and custom targets
 add_test(NAME test COMMAND lasm hifi ../tests/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8 --density 0.05)
-add_custom_target(rt COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
-add_dependencies(rt ${PROJECT_NAME})
+add_custom_target(rtest COMMAND lasm hifi test/human2.mapped.sorted_small_set.bam test.gfa -l3 -t8)
+add_dependencies(rtest ${PROJECT_NAME})
 
 # Debug targets
 add_custom_target(debug
