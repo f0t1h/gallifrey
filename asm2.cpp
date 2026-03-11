@@ -26,7 +26,6 @@
 #include <vector>
 
 #include "asm.h"
-#include "bgzf.h"
 #include "config.h"
 #include "ext/doctest.h"
 #include "graph.h"
@@ -42,7 +41,6 @@ struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
 
-    using cqt = moodycamel::ConcurrentQueue<Chunk>;
     using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
     gtl::vector<string> inputs;
     string output;
@@ -294,24 +292,6 @@ struct assembler {
             }
         }
         free_lps(&str);
-    }
-
-    auto generate_chunks(std::string input, cqt &chunk_queue) {
-        BlockIterator iter(input);
-        Block blk;
-        // fetch chunks until no more blocks
-        while (iter.next(blk)) {
-            // first block in chunk
-            int64_t first_vstart = blk.vstart();
-            int64_t last_vend = blk.vend();
-
-            size_t count = 1;
-            while (count < BAMREAD_CHUNK_SIZE && iter.next(blk)) {
-                last_vend = blk.vend();
-                ++count;
-            }
-            while (!chunk_queue.try_enqueue({first_vstart, last_vend}));
-        }
     }
 
     [[nodiscard]] auto generate_data(const std::string &input, dqt &data_queue,

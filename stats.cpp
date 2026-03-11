@@ -1,10 +1,44 @@
-#include "bgzf.h"
+#include <htslib/sam.h>
+
+#include <string>
+
 #include "ext/termbox2.h"
 #include "gtl/phmap.hpp"
 #include "histogram.h"
 #include "lcmer.h"
 #include "ext/lcptools/lcptools_ho.h"
 #include "syncmer.h"
+
+struct BAMReader {
+    std::string filename;
+    samFile *fp;
+    sam_hdr_t *hdr;
+
+    BAMReader(const std::string &filename, int threads [[maybe_unused]] = 2)
+        : fp{sam_open(filename.c_str(), "rb")} {
+        this->filename = filename;
+        if (!(hdr = sam_hdr_read(fp))) {
+            throw "Cannot read header from file!";
+        }
+    }
+    ~BAMReader() {
+        if (hdr) {
+            sam_hdr_destroy(hdr);
+        }
+        if (fp) {
+            sam_close(fp);
+        }
+    }
+
+    bool read(bam1_t *bamdata) { return sam_read1(fp, hdr, bamdata) >= 0; }
+    bam1_t *init_data() {
+        bam1_t *data = bam_init1();
+        if (data == NULL) {
+            throw "Not enough memory";
+        }
+        return data;
+    }
+};
 template <class T>
 struct stat_accu {
     T count;
