@@ -7,12 +7,12 @@
 #define LCPTOOLS_IMPL
 #include "asm.h"
 #include "bamdoctor.h"
+#include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
 #ifdef BUILD_HISTOGRAM_UTILS
 #include "stats.h"
 #include "sthist.h"
 #endif
-
 using std::string;
 
 // auto lam = []() -> int {
@@ -308,6 +308,7 @@ int main(int argc, char **argv) {
     stdin_hist_prog(app);
 #endif
     sam_read_testing(app);
+    dump_cores_program(app);
     CLI11_PARSE(app, argc, argv);
     return 0;
 }
