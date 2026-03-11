@@ -14,10 +14,10 @@
 #include <Eigen/Dense>
 #include <cmath>
 #include <map>
-#include <optional>
+
 #include <queue>
 #include <stack>
-#include <stdexcept>
+#include <cinttypes>
 #include <string>
 #include <thread>
 #include <tuple>
