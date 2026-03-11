@@ -20,6 +20,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cinttypes>
 
 #include "asm.h"
 #include "bloomfilter.h"
