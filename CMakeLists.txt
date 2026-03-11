@@ -93,7 +93,8 @@ FetchContent_MakeAvailable(eigen)
 
 
 # Link libraries
-target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11 concurrentqueue pthread deflate z Eigen3::Eigen)
+target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11
+                      concurrentqueue pthread deflate z Eigen3::Eigen rt)
 
 # Unit tests (doctest)
 # Lightweight DBG builder test tool (single-thread, no bloom/locks).
