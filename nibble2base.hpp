@@ -12,12 +12,8 @@
 #include "htslib/hts.h"
 
 #include <htslib/sam.h>
-#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
 
 
-#include <arm_neon.h>
-#include <stddef.h>
-#include <stdint.h>
 
 static const uint8_t decode4_tbl[16] = {
     /* 0 */ 0,
@@ -36,6 +32,13 @@ static const uint8_t decode4_tbl[16] = {
     /* D */ 0,
     /* E */ 0,
     /* F */ 0};
+
+#if (defined(__ARM_NEON) || defined(__ARM_NEON__))
+
+
+#include <arm_neon.h>
+#include <stddef.h>
+#include <stdint.h>
 
 
 inline void onehotto2bitDNA_neon(  // TODO VERIFY TEST THIS
