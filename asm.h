@@ -2,9 +2,10 @@
 
 #ifndef _ASM_H_
 #define _ASM_H_
+
 #include <inttypes.h>
 #include <stdint.h>
-#include <inttypes.h>
+
 #include <string>
 #include <vector>
 struct syncmer_params {

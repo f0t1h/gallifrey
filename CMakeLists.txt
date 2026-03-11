@@ -134,7 +134,12 @@ add_custom_target(debug
 
 # Compile definitions
 target_compile_definitions(${PROJECT_NAME} PUBLIC
+    __STDC_FORMAT_MACROS=1
     SYNCMER_RULE=DensitySyncmerRule
+)
+
+target_compile_definitions(dump_cores PRIVATE
+    __STDC_FORMAT_MACROS=1
 )
 
 
