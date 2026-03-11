@@ -219,18 +219,18 @@ void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
         chs.data[0] = std::countl_zero(static_cast<unsigned>(data[len / 2])) - 24;
     }
 }
-uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
-    uint8_t *ret = (uint8_t *)malloc(len);
-#pragma clang loop vectorize(enable) interleave(enable)
-    for (size_t i = 0; i < len / 2; ++i) {
-        ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
-        ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
-    }
-    if (len % 2 == 1) {
-        ret[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
-    }
-    return ret;
-}
+// // uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len) {
+// //     uint8_t *ret = (uint8_t *)malloc(len);
+// // #pragma clang loop vectorize(enable) interleave(enable)
+// //     for (size_t i = 0; i < len / 2; ++i) {
+// //         ret[2 * i] = 27 - std::countl_zero(static_cast<unsigned>(data[i]));
+// //         ret[2 * i + 1] = std::countr_zero(static_cast<unsigned>(data[i]));
+// //     }
+// //     if (len % 2 == 1) {
+// //         ret[len - 1] = 27 - std::countl_zero(static_cast<unsigned>(data[len / 2]));
+// //     }
+// //     return ret;
+// }
 
 // lcp_read parse_cores_from_kseq(const char *s, size_t len, int lcp_level) {
 //     // uint64_t estimated_core_size = (int)(len / std::pow(1.5, lcp_level));
@@ -263,15 +263,15 @@ TEST_CASE("Nibbles to Crumbs") {
             expected[byte] = {tab[high], tab[low]};
         }
     }
-    SUBCASE("Even") {
-        uint8_t *conversion =
-            onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size());
-        for (unsigned i = 0; i < bytes.size(); ++i) {
-            CHECK(expected[bytes[i]].first == conversion[2 * i]);
-            CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
-        }
-        free(conversion);
-    }
+    // SUBCASE("Even") {
+    //     uint8_t *conversion =
+    //         onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size());
+    //     for (unsigned i = 0; i < bytes.size(); ++i) {
+    //         CHECK(expected[bytes[i]].first == conversion[2 * i]);
+    //         CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
+    //     }
+    //     free(conversion);
+    // }
     SUBCASE("Even reverse") {
         charsi c;
         c.require(2 * bytes.size());
@@ -284,15 +284,15 @@ TEST_CASE("Nibbles to Crumbs") {
     }
     bytes.push_back((1 << 4));
     expected[bytes.back()] = {tab[1], 0};
-    SUBCASE("Odd") {
-        uint8_t *conversion =
-            onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size() - 1);
-        for (unsigned i = 0; i < bytes.size(); ++i) {
-            CHECK(expected[bytes[i]].first == conversion[2 * i]);
-            CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
-        }
-        free(conversion);
-    }
+    // SUBCASE("Odd") {
+    //     uint8_t *conversion =
+    //         onehotto2bitDNA_bivec(bytes.data(), 2 * bytes.size() - 1);
+    //     for (unsigned i = 0; i < bytes.size(); ++i) {
+    //         CHECK(expected[bytes[i]].first == conversion[2 * i]);
+    //         CHECK(expected[bytes[i]].second == conversion[2 * i + 1]);
+    //     }
+    //     free(conversion);
+    // }
 }
 
 // TEST_CASE("CrumbledSubSeq reverse complement") {

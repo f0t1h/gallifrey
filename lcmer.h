@@ -598,7 +598,7 @@ void init_core_kmer_xor(struct core *cr, _T Kval, uint64_t si, uint64_t ei,
 }
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
-uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
+// uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
 
 void onehotto2bitDNA_bivec_chs(const uint8_t *data, size_t len, charsi &c);
 void onehotto2bitDNA_bivec_chs_reverse(const uint8_t *data, size_t len,
