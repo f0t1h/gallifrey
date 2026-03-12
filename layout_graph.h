@@ -3,12 +3,10 @@
 
 #include <sys/stat.h>
 
-#include <Eigen/Dense>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cinttypes>
-#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <functional>
@@ -300,139 +298,6 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     return layouts;
 }
 
-template <class RecigMapT>
-inline layout_result_t connected_comp_plus_layout_lstsq(
-    const RecigMapT &recig) {
-    layout_result_t layouts;
-    gtl::flat_hash_set<u64> visited;
-
-    auto infer_len_for_node = [&](u64 id) -> i64 {
-        auto out_range = recig.equal_range(id);
-        if (out_range.first != out_range.second) {
-            const auto &rm = out_range.first->second;
-            if (rm.qry.size > 0) return static_cast<i64>(rm.qry.size);
-        }
-        for (const auto &kv : recig) {
-            if (kv.second.node != id) continue;
-            const auto &rm = kv.second;
-            if (rm.tgt.size > 0) return static_cast<i64>(rm.tgt.size);
-        }
-        return 0;
-    };
-
-    auto to_end_inclusive = [](i64 start, i64 len) -> i64 {
-        return (len <= 0) ? start : start + len - 1;
-    };
-
-    for (const auto &nit : recig) {
-        if (visited.contains(nit.first)) continue;
-
-        gtl::vector<u64> component;
-        gtl::flat_hash_set<u64> comp_visited;
-        std::stack<u64> stack;
-        stack.push(nit.first);
-
-        while (!stack.empty()) {
-            u64 node = stack.top();
-            stack.pop();
-            if (comp_visited.contains(node)) continue;
-            comp_visited.emplace(node);
-            visited.emplace(node);
-            component.push_back(node);
-
-            auto range = recig.equal_range(node);
-            for (auto it = range.first; it != range.second; ++it) {
-                if (!comp_visited.contains(it->second.node)) {
-                    stack.push(it->second.node);
-                }
-            }
-        }
-        if (component.empty()) continue;
-
-        gtl::flat_hash_map<u64, size_t> idx;
-        for (size_t i = 0; i < component.size(); ++i) idx[component[i]] = i;
-        const size_t n = component.size();
-
-        struct edge_info {
-            u64 src;
-            u64 tgt;
-            i64 delta;
-        };
-        gtl::vector<edge_info> edges;
-
-        gtl::flat_hash_map<u64, bool> orientations;
-        std::queue<u64> orient_queue;
-        orient_queue.push(component[0]);
-        orientations[component[0]] = true;
-
-        while (!orient_queue.empty()) {
-            u64 src = orient_queue.front();
-            orient_queue.pop();
-            bool s_orient = orientations[src];
-
-            auto range = recig.equal_range(src);
-            for (auto it = range.first; it != range.second; ++it) {
-                u64 tgt = it->second.node;
-                if (!idx.contains(tgt)) continue;
-
-                bool tgt_orient;
-                if (orientations.contains(tgt)) {
-                    tgt_orient = orientations[tgt];
-                } else {
-                    tgt_orient = !s_orient;
-                    orientations[tgt] = tgt_orient;
-                    orient_queue.push(tgt);
-                }
-
-                long long qs = s_orient
-                                   ? (it->second.qry.size - it->second.qry.to)
-                                   : it->second.qry.from;
-                long long ts = tgt_orient
-                                   ? (it->second.tgt.size - it->second.tgt.to)
-                                   : it->second.tgt.from;
-                edges.push_back({src, tgt, static_cast<i64>(qs - ts)});
-            }
-        }
-
-        Eigen::MatrixXd L = Eigen::MatrixXd::Zero(n, n);
-        Eigen::VectorXd b = Eigen::VectorXd::Zero(n);
-        for (const auto &e : edges) {
-            const size_t i = idx[e.src];
-            const size_t j = idx[e.tgt];
-            L(i, i) += 1.0;
-            L(j, j) += 1.0;
-            L(i, j) -= 1.0;
-            L(j, i) -= 1.0;
-            b(j) += e.delta;
-            b(i) -= e.delta;
-        }
-        L.row(0).setZero();
-        L(0, 0) = 1.0;
-        b(0) = 0.0;
-
-        const Eigen::VectorXd x_vec = L.colPivHouseholderQr().solve(b);
-        gtl::flat_hash_map<u64, double> x_positions;
-        for (size_t i = 0; i < n; ++i) x_positions[component[i]] = x_vec(i);
-
-        std::sort(component.begin(), component.end(), [&](u64 a, u64 bnode) {
-            return x_positions[a] < x_positions[bnode];
-        });
-
-        layouts.emplace_back();
-        const double min_pos = x_positions[component[0]];
-        for (u64 node_id : component) {
-            const double pos = x_positions[node_id] - min_pos;
-            const i64 start = static_cast<i64>(std::round(pos));
-            const i64 len = infer_len_for_node(node_id);
-            const i64 end = to_end_inclusive(start, len);
-            const bool orient =
-                orientations.contains(node_id) ? orientations[node_id] : true;
-            layouts.back().emplace(node_id,
-                                   std::make_tuple(start, end, orient));
-        }
-    }
-    return layouts;
-}
 }  // namespace layout_graph_algo
 
 namespace layout_graph_emit {

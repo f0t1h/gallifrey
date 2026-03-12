@@ -83,18 +83,9 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(libbloom)
 
-FetchContent_Declare(
-    eigen
-    GIT_REPOSITORY https://gitlab.com/libeigen/eigen.git
-    GIT_TAG 3.4.0
-    GIT_SHALLOW TRUE
-)
-FetchContent_MakeAvailable(eigen)
-
-
 # Link libraries
 target_link_libraries(${PROJECT_NAME} ${HTS_LIBRARIES} gtl CLI11::CLI11
-                      concurrentqueue pthread deflate z Eigen3::Eigen
+                      concurrentqueue pthread deflate z
                       $<$<PLATFORM_ID:Linux>:rt>)
 
 # Unit tests (doctest)

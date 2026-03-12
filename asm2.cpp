@@ -7,7 +7,6 @@
 #include <htslib/thread_pool.h>
 #include <stdio.h>
 
-#include <Eigen/Dense>
 #include <algorithm>
 #include <chrono>
 #include <cstdarg>
@@ -1099,30 +1098,9 @@ struct assembler {
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
-        // auto layouts =
-        // layout_graph_algo::connected_comp_plus_layout(reciprocal);
         auto layouts =
-            layout_graph_algo::connected_comp_plus_layout_lstsq(reciprocal);
-#if 0
-        int cc = 0;
-        for (auto &l : layouts) {
-            fprintf(stdout, "# Layout %d:\n", cc++);
-            for (auto &[k, v] : l) {
-                auto it = dbgi.dbg.find(k);
-                if (it != dbgi.dbg.end()) {
-                    auto [start_core, end_core, orient] = v;
-                    (void)end_core;
-                    fprintf(stdout, "C%" PRIu64 "\t%d\t%d\t%c\n", k, start_core,
-                            start_core + end_core, (orient ? '+' : '-'));
-                } else {
-                    auto [start_core, end_core, orient] = v;
-                    (void)end_core;
-                    (void)orient;
-                    fprintf(stdout, "C%" PRIu64 "\t%d\t(not found)\n", k, start_core);
-                }
-            }
-        }
-#endif
+            layout_graph_algo::connected_comp_plus_layout(reciprocal);
+
         return std::make_pair(reciprocal, layouts);
     }
 };
@@ -1150,7 +1128,22 @@ input_type identify_input(const std::string &input) {
     return input_type::UNKNOWN;
 }
 
+static bool validate_path(const std::string &path) {
+    auto slash = path.rfind('/');
+    if (slash == std::string::npos) return true;
+    std::string dir = path.substr(0, slash);
+    struct stat st;
+    if (stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "error: output directory does not exist: %s\n",
+                dir.c_str());
+        return false;
+    }
+    return true;
+}
+
 int run_assembly(const asm_config &cfg) {
+    if (!validate_path(cfg.output)) return 1;
+
     if (!cfg.silent) cfg.print_cfg(stderr);
     // free(malloc(1024ULL * 1024 * 1024 * 20)); INTIMIDATE the OS for the
     // ram
