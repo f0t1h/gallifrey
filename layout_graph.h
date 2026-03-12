@@ -1,23 +1,22 @@
 #ifndef _LAYOUT_GRAPH_H
 #define _LAYOUT_GRAPH_H
 
+#include <sys/stat.h>
+
+#include <Eigen/Dense>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <inttypes.h>
-#include <sys/stat.h>
 #include <functional>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
-#include <Eigen/Dense>
-#include <cmath>
 #include <map>
-
 #include <queue>
 #include <stack>
-#include <cinttypes>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -25,6 +24,8 @@
 #include "graph.h"
 
 using layout_small_graph = gtl::flat_hash_map<uint64_t, dbg_index::bidbg_val>;
+
+namespace layout_graph_algo {
 
 // Break cycles by duplicating the cycling sub-path.
 // Each cycle found via DFS is unrolled once: nodes are copied with fresh IDs
@@ -106,9 +107,9 @@ inline void unroll_cycles(layout_small_graph &lsg) {
                 seq_copy.emplace_back(s.len, s.skip_first_n, buf,
                                       s.origin_node);
             }
-            dups.push_back(
-                {id, dup_id, static_cast<unsigned>(orig.counts.core_count),
-                 std::move(seq_copy)});
+            dups.push_back({id, dup_id,
+                            static_cast<unsigned>(orig.counts.core_count),
+                            std::move(seq_copy)});
         }
         // Second pass: insert duplicates into the map.
         for (auto &d : dups) {
@@ -220,97 +221,6 @@ longest_path(layout_small_graph &lsg) {
     return result;
 }
 
-struct layout_boundary {
-    gtl::flat_hash_set<u64>
-        incoming_fwd;  // predecessors of forward-oriented layout contigs
-    gtl::flat_hash_set<u64>
-        incoming_rev;  // predecessors of reverse-oriented layout contigs
-    gtl::flat_hash_set<u64>
-        outgoing_fwd;  // successors of forward-oriented layout contigs
-    gtl::flat_hash_set<u64>
-        outgoing_rev;  // successors of reverse-oriented layout contigs
-    gtl::vector<u64> contained;  // non-layout nodes fully between layout nodes
-
-    // Convenience: all incoming / all outgoing regardless of orientation.
-    gtl::flat_hash_set<u64> all_incoming() const {
-        gtl::flat_hash_set<u64> s(incoming_fwd);
-        s.insert(incoming_rev.begin(), incoming_rev.end());
-        return s;
-    }
-    gtl::flat_hash_set<u64> all_outgoing() const {
-        gtl::flat_hash_set<u64> s(outgoing_fwd);
-        s.insert(outgoing_rev.begin(), outgoing_rev.end());
-        return s;
-    }
-};
-
-// Given the original graph, active node set, and a map of layout node IDs to
-// their orientation (true = forward, false = reverse), find non-layout nodes
-// that border or are contained within the layout.
-// Incoming = non-layout nodes in a layout node's prev list (topological
-// predecessors). Outgoing = non-layout nodes whose prev list contains a layout
-// node (topological successors). Each set is split by the orientation of the
-// connected layout contig.
-inline layout_boundary find_layout_boundary(
-    const dbg_index::dbg_map_t &dbg, const auto &active_nodes,
-    const gtl::flat_hash_map<u64, bool> &layout_ori) {
-    layout_boundary result;
-
-    // Build a flat set for quick membership checks.
-    gtl::flat_hash_set<u64> layout_set;
-    layout_set.reserve(layout_ori.size());
-    for (const auto &[id, _] : layout_ori) {
-        layout_set.insert(id);
-    }
-
-    // 1. Incoming: scan layout nodes' prev — active predecessors not in layout.
-    //    Split by the orientation of the layout contig they connect to.
-    for (const auto &[lid, ori] : layout_ori) {
-        auto it = dbg.find(lid);
-        if (it == dbg.end()) continue;
-        for (u64 p : it->second.prev) {
-            if (!layout_set.contains(p) && active_nodes.contains(p)) {
-                if (ori) {
-                    result.incoming_fwd.insert(p);
-                } else {
-                    result.incoming_rev.insert(p);
-                }
-            }
-        }
-    }
-
-    // 2. Outgoing: active non-layout nodes whose prev contains a layout node.
-    //    Split by the orientation of the layout contig they point back to.
-    for (u64 id : active_nodes) {
-        if (layout_set.contains(id)) continue;
-        auto it = dbg.find(id);
-        if (it == dbg.end()) continue;
-        for (u64 p : it->second.prev) {
-            auto oit = layout_ori.find(p);
-            if (oit != layout_ori.end()) {
-                if (oit->second) {
-                    result.outgoing_fwd.insert(id);
-                } else {
-                    result.outgoing_rev.insert(id);
-                }
-            }
-        }
-    }
-
-    // 3. Contained: nodes that appear in both incoming and outgoing (any
-    // orientation).
-    auto all_in = result.all_incoming();
-    auto all_out = result.all_outgoing();
-    for (u64 id : all_in) {
-        if (all_out.contains(id)) {
-            result.contained.push_back(id);
-        }
-    }
-
-    return result;
-}
-
-namespace layout_graph_algo {
 using layout_result_t =
     gtl::vector<gtl::flat_hash_map<u64, std::tuple<i64, i64, bool>>>;
 
@@ -334,15 +244,8 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
         return 0;
     };
 
-    auto to_end_inclusive = [&](i64 start, i64 len) -> i64 {
-        if (len <= 0) return start;
-        if (start > std::numeric_limits<i64>::max() - (len - 1)) {
-            return std::numeric_limits<i64>::max();
-        }
-        if (start < std::numeric_limits<i64>::min() + (len - 1)) {
-            return std::numeric_limits<i64>::min();
-        }
-        return start + (len - 1);
+    auto to_end_inclusive = [](i64 start, i64 len) -> i64 {
+        return (len <= 0) ? start : start + len - 1;
     };
 
     for (const auto &nit : recig) {
@@ -373,11 +276,12 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
             (void)epos;
             bool target_orient = !s_orient;
 
-            long long qs = s_orient ? (node.second.qry.size - node.second.qry.to)
-                                    : node.second.qry.from;
-            long long ts =
-                target_orient ? (node.second.tgt.size - node.second.tgt.to)
-                              : node.second.tgt.from;
+            long long qs = s_orient
+                               ? (node.second.qry.size - node.second.qry.to)
+                               : node.second.qry.from;
+            long long ts = target_orient
+                               ? (node.second.tgt.size - node.second.tgt.to)
+                               : node.second.tgt.from;
 
             i64 delta = static_cast<i64>(qs - ts);
             i64 target_start = spos + delta;
@@ -416,15 +320,8 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
         return 0;
     };
 
-    auto to_end_inclusive = [&](i64 start, i64 len) -> i64 {
-        if (len <= 0) return start;
-        if (start > std::numeric_limits<i64>::max() - (len - 1)) {
-            return std::numeric_limits<i64>::max();
-        }
-        if (start < std::numeric_limits<i64>::min() + (len - 1)) {
-            return std::numeric_limits<i64>::min();
-        }
-        return start + (len - 1);
+    auto to_end_inclusive = [](i64 start, i64 len) -> i64 {
+        return (len <= 0) ? start : start + len - 1;
     };
 
     for (const auto &nit : recig) {
@@ -487,12 +384,12 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
                     orient_queue.push(tgt);
                 }
 
-                long long qs =
-                    s_orient ? (it->second.qry.size - it->second.qry.to)
-                             : it->second.qry.from;
-                long long ts =
-                    tgt_orient ? (it->second.tgt.size - it->second.tgt.to)
-                               : it->second.tgt.from;
+                long long qs = s_orient
+                                   ? (it->second.qry.size - it->second.qry.to)
+                                   : it->second.qry.from;
+                long long ts = tgt_orient
+                                   ? (it->second.tgt.size - it->second.tgt.to)
+                                   : it->second.tgt.from;
                 edges.push_back({src, tgt, static_cast<i64>(qs - ts)});
             }
         }
@@ -530,7 +427,8 @@ inline layout_result_t connected_comp_plus_layout_lstsq(
             const i64 end = to_end_inclusive(start, len);
             const bool orient =
                 orientations.contains(node_id) ? orientations[node_id] : true;
-            layouts.back().emplace(node_id, std::make_tuple(start, end, orient));
+            layouts.back().emplace(node_id,
+                                   std::make_tuple(start, end, orient));
         }
     }
     return layouts;
@@ -550,57 +448,484 @@ struct ultra_layout_job {
     gtl::vector<ultra_layout_node_info> lnodes;
 };
 
-// append_seqvec_ascii removed — ASCII conversion deferred to print time
+struct lane_node {
+    u64 id = 0;
+    i64 from = 0;
+    i64 to = 0;
+    bool is_forward_lane = true;
+    const gtl::vector<SequenceContainerType> *raw_seqs = nullptr;
+};
 
+struct scd_node {
+    uint32_t core_label;
+    size_t contig_idx;
+    size_t core_idx;
+    uint16_t weight;
+};
+
+struct comp_path {
+    i64 layout_from;
+    i64 layout_to;
+    int64_t total_weight;
+    gtl::vector<uint32_t> path;
+};
+
+using scd_adj_t = gtl::vector<std::pair<uint32_t, uint16_t>>;
+
+// ── Phase 1: Build seed-chain DAG from contig cores ─────────────────
+inline void build_scd_graph(
+    const gtl::vector<size_t> &contig_order,
+    const gtl::flat_hash_map<size_t, lcp_read> &contig_lr,
+    const gtl::vector<lane_node> &nodes,
+    gtl::vector<scd_node> &scd,
+    gtl::vector<scd_adj_t> &scd_fwd,
+    gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> &label_nodes,
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs)
+{
+    scd.reserve(contig_order.size() * 64);
+    scd_fwd.reserve(contig_order.size() * 64);
+    node_contigs.reserve(contig_order.size() * 64);
+
+    auto add_edge = [&](int32_t from, uint32_t to) {
+        if (from < 0) return;
+        for (auto &[t, ew] : scd_fwd[static_cast<size_t>(from)]) {
+            if (t == to) { ++ew; return; }
+        }
+        scd_fwd[static_cast<size_t>(from)].push_back({to, 1});
+    };
+
+    for (size_t ci : contig_order) {
+        const auto &lr = contig_lr.find(ci)->second;
+        const size_t M = lr.cores.size();
+        if (M == 0) continue;
+        const size_t gn = scd.size();
+
+        if (gn == 0) {
+            int32_t last_node = -1;
+            for (size_t k = 0; k < M; ++k) {
+                uint32_t cur = static_cast<uint32_t>(scd.size());
+                scd.push_back({lr.cores[k], ci, k, 1});
+                scd_fwd.emplace_back();
+                node_contigs.push_back({{ci, k}});
+                label_nodes[lr.cores[k]].push_back(cur);
+                add_edge(last_node, cur);
+                last_node = static_cast<int32_t>(cur);
+            }
+            continue;
+        }
+
+        // Compute topological ranks (component-ordered)
+        gtl::vector<uint32_t> topo_rank(gn, 0);
+        {
+            gtl::vector<uint32_t> in_deg(gn, 0);
+            for (size_t u = 0; u < gn; ++u)
+                for (auto &[v, w] : scd_fwd[u])
+                    if (v < gn) ++in_deg[v];
+
+            gtl::vector<uint32_t> uf(gn);
+            for (uint32_t i = 0; i < gn; ++i) uf[i] = i;
+            auto uf_find = [&](uint32_t x) -> uint32_t {
+                while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
+                return x;
+            };
+            for (size_t u = 0; u < gn; ++u)
+                for (auto &[v, w] : scd_fwd[u])
+                    if (v < gn) uf[uf_find(u)] = uf_find(v);
+
+            gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> comp_srcs;
+            for (uint32_t i = 0; i < gn; ++i)
+                if (in_deg[i] == 0) comp_srcs[uf_find(i)].push_back(i);
+
+            gtl::vector<uint32_t> roots;
+            roots.reserve(comp_srcs.size());
+            for (auto &[r, _] : comp_srcs) roots.push_back(r);
+            std::sort(roots.begin(), roots.end(), [&](uint32_t a, uint32_t b) {
+                i64 ma = INT64_MAX, mb = INT64_MAX;
+                for (uint32_t s : comp_srcs[a])
+                    ma = std::min(ma, nodes[scd[s].contig_idx].from);
+                for (uint32_t s : comp_srcs[b])
+                    mb = std::min(mb, nodes[scd[s].contig_idx].from);
+                return ma < mb;
+            });
+
+            uint32_t rank = 0;
+            for (uint32_t root : roots) {
+                std::queue<uint32_t> q;
+                for (uint32_t s : comp_srcs[root]) q.push(s);
+                while (!q.empty()) {
+                    uint32_t u = q.front(); q.pop();
+                    topo_rank[u] = rank++;
+                    for (auto &[v, w] : scd_fwd[u])
+                        if (v < gn && --in_deg[v] == 0) q.push(v);
+                }
+            }
+        }
+
+        // Collect seeds
+        struct scd_seed { uint32_t rank; size_t k; uint32_t v; };
+        gtl::vector<scd_seed> seeds;
+        for (size_t k = 0; k < M; ++k) {
+            auto it = label_nodes.find(lr.cores[k]);
+            if (it == label_nodes.end()) continue;
+            for (uint32_t v : it->second) {
+                if (v >= gn) continue;
+                seeds.push_back({topo_rank[v], k, v});
+            }
+        }
+
+        // Sort by rank asc, k desc for LIS
+        std::sort(seeds.begin(), seeds.end(),
+                  [](const scd_seed &a, const scd_seed &b) {
+                      if (a.rank != b.rank) return a.rank < b.rank;
+                      return a.k > b.k;
+                  });
+
+        // LIS on k with traceback
+        const size_t S = seeds.size();
+        gtl::vector<size_t> tails;
+        gtl::vector<size_t> tail_idx;
+        gtl::vector<int32_t> lis_prev(S, -1);
+        for (size_t i = 0; i < S; ++i) {
+            size_t k = seeds[i].k;
+            auto pos = std::lower_bound(tails.begin(), tails.end(), k);
+            size_t lp = static_cast<size_t>(pos - tails.begin());
+            lis_prev[i] =
+                (lp > 0) ? static_cast<int32_t>(tail_idx[lp - 1]) : -1;
+            if (pos == tails.end()) {
+                tails.push_back(k);
+                tail_idx.push_back(i);
+            } else {
+                *pos = k;
+                tail_idx[lp] = i;
+            }
+        }
+
+        // Traceback
+        gtl::vector<int32_t> query_to_node(M, -1);
+        if (!tails.empty()) {
+            for (int32_t idx = static_cast<int32_t>(tail_idx.back());
+                 idx >= 0; idx = lis_prev[idx])
+                query_to_node[seeds[idx].k] =
+                    static_cast<int32_t>(seeds[idx].v);
+        }
+
+        // Merge matched, create new for unmatched
+        int32_t last_node = -1;
+        for (size_t k = 0; k < M; ++k) {
+            uint32_t cur_node;
+            if (query_to_node[k] >= 0) {
+                cur_node = static_cast<uint32_t>(query_to_node[k]);
+                scd[cur_node].weight++;
+                node_contigs[cur_node].push_back({ci, k});
+            } else {
+                cur_node = static_cast<uint32_t>(scd.size());
+                scd.push_back({lr.cores[k], ci, k, 1});
+                scd_fwd.emplace_back();
+                node_contigs.push_back({{ci, k}});
+                label_nodes[lr.cores[k]].push_back(cur_node);
+            }
+            add_edge(last_node, cur_node);
+            last_node = static_cast<int32_t>(cur_node);
+        }
+    }
+}
+
+// ── Phase 2: Find heaviest path per connected component ─────────────
+inline gtl::vector<comp_path> find_heaviest_paths(
+    const gtl::vector<scd_node> &scd,
+    const gtl::vector<scd_adj_t> &scd_fwd,
+    const gtl::vector<lane_node> &nodes,
+    u64 layout_idx)
+{
+    const size_t n = scd.size();
+
+    gtl::vector<uint32_t> topo_order;
+    topo_order.reserve(n);
+    {
+        gtl::vector<uint32_t> in_deg(n, 0);
+        for (size_t u = 0; u < n; ++u)
+            for (auto &[v, w] : scd_fwd[u]) ++in_deg[v];
+        std::queue<uint32_t> q;
+        for (uint32_t i = 0; i < n; ++i)
+            if (in_deg[i] == 0) q.push(i);
+        while (!q.empty()) {
+            uint32_t u = q.front(); q.pop();
+            topo_order.push_back(u);
+            for (auto &[v, w] : scd_fwd[u])
+                if (--in_deg[v] == 0) q.push(v);
+        }
+        if (topo_order.size() < n) {
+            std::fprintf(stderr,
+                         "[layout-dag] layout=%" PRIu64
+                         " WARNING: %zu/%zu nodes stuck in cycles\n",
+                         static_cast<uint64_t>(layout_idx),
+                         n - topo_order.size(), n);
+            gtl::flat_hash_set<uint32_t> visited(topo_order.begin(),
+                                                 topo_order.end());
+            for (uint32_t i = 0; i < n; ++i)
+                if (!visited.contains(i)) topo_order.push_back(i);
+        }
+    }
+
+    gtl::vector<scd_adj_t> scd_rev(n);
+    for (size_t u = 0; u < n; ++u)
+        for (auto &[v, w] : scd_fwd[u])
+            scd_rev[v].push_back({static_cast<uint32_t>(u), w});
+
+    gtl::vector<int64_t> dp(n, 0);
+    gtl::vector<int32_t> parent(n, -1);
+    for (uint32_t v : topo_order) {
+        dp[v] = scd[v].weight;
+        parent[v] = -1;
+        for (auto &[u, w] : scd_rev[v]) {
+            int64_t cand = dp[u] + scd[v].weight;
+            if (cand > dp[v]) {
+                dp[v] = cand;
+                parent[v] = static_cast<int32_t>(u);
+            }
+        }
+    }
+
+    gtl::vector<int32_t> comp_id(n, -1);
+    int32_t num_comps = 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (comp_id[i] >= 0) continue;
+        std::queue<uint32_t> bfs;
+        bfs.push(static_cast<uint32_t>(i));
+        comp_id[i] = num_comps;
+        while (!bfs.empty()) {
+            uint32_t u = bfs.front(); bfs.pop();
+            for (auto &[v, w] : scd_fwd[u])
+                if (comp_id[v] < 0) { comp_id[v] = num_comps; bfs.push(v); }
+            for (auto &[u2, w] : scd_rev[u])
+                if (comp_id[u2] < 0) { comp_id[u2] = num_comps; bfs.push(u2); }
+        }
+        ++num_comps;
+    }
+
+    gtl::vector<comp_path> comp_paths;
+    for (int32_t c = 0; c < num_comps; ++c) {
+        int32_t best_end = -1;
+        int64_t best_dp = -1;
+        for (size_t i = 0; i < n; ++i) {
+            if (comp_id[i] != c) continue;
+            if (scd_fwd[i].empty() && dp[i] > best_dp) {
+                best_dp = dp[i];
+                best_end = static_cast<int32_t>(i);
+            }
+        }
+        if (best_end < 0) {
+            for (size_t i = 0; i < n; ++i) {
+                if (comp_id[i] != c) continue;
+                if (dp[i] > best_dp) {
+                    best_dp = dp[i];
+                    best_end = static_cast<int32_t>(i);
+                }
+            }
+        }
+        if (best_end < 0) continue;
+
+        gtl::vector<uint32_t> path;
+        for (int32_t cur = best_end; cur >= 0; cur = parent[cur])
+            path.push_back(static_cast<uint32_t>(cur));
+        std::reverse(path.begin(), path.end());
+
+        // Extend at both ends
+        {
+            gtl::flat_hash_set<uint32_t> on_path(path.begin(), path.end());
+            i64 path_max_to = INT64_MIN;
+            for (uint32_t nid : path)
+                path_max_to = std::max(path_max_to,
+                                       nodes[scd[nid].contig_idx].to);
+            i64 path_min_from = INT64_MAX;
+            for (uint32_t nid : path)
+                path_min_from = std::min(path_min_from,
+                                         nodes[scd[nid].contig_idx].from);
+
+            // Forward extension
+            int32_t ext_sink = -1;
+            i64 ext_to = path_max_to;
+            for (size_t i = 0; i < n; ++i) {
+                if (comp_id[i] != c) continue;
+                if (on_path.contains(static_cast<uint32_t>(i))) continue;
+                i64 to = nodes[scd[i].contig_idx].to;
+                if (to > ext_to && scd_fwd[i].empty()) {
+                    ext_to = to;
+                    ext_sink = static_cast<int32_t>(i);
+                }
+            }
+            if (ext_sink >= 0) {
+                gtl::vector<uint32_t> ext_path;
+                for (int32_t cur = ext_sink; cur >= 0; cur = parent[cur])
+                    ext_path.push_back(static_cast<uint32_t>(cur));
+                std::reverse(ext_path.begin(), ext_path.end());
+                size_t branch_pos = 0;
+                bool found_overlap = false;
+                for (size_t i = 0; i < ext_path.size(); ++i) {
+                    if (on_path.contains(ext_path[i])) {
+                        branch_pos = i;
+                        found_overlap = true;
+                    }
+                }
+                if (!found_overlap) [[unlikely]] {
+                    std::fprintf(stderr,
+                        "[layout-dag] WARNING: forward extension has no "
+                        "overlap with main path (%s:%d)\n",
+                        __FILE__, __LINE__);
+                } else {
+                    for (size_t i = branch_pos + 1; i < ext_path.size(); ++i)
+                        path.push_back(ext_path[i]);
+                }
+            }
+
+            // Backward extension
+            int32_t ext_source = -1;
+            i64 ext_from = path_min_from;
+            for (size_t i = 0; i < n; ++i) {
+                if (comp_id[i] != c) continue;
+                if (on_path.contains(static_cast<uint32_t>(i))) continue;
+                i64 from = nodes[scd[i].contig_idx].from;
+                if (from < ext_from && scd_rev[i].empty()) {
+                    ext_from = from;
+                    ext_source = static_cast<int32_t>(i);
+                }
+            }
+            if (ext_source >= 0) {
+                gtl::vector<uint32_t> prefix;
+                uint32_t cur = static_cast<uint32_t>(ext_source);
+                while (!on_path.contains(cur)) {
+                    prefix.push_back(cur);
+                    uint32_t best_succ = UINT32_MAX;
+                    int64_t best_dp_val = -1;
+                    for (auto &[v, w] : scd_fwd[cur]) {
+                        if (dp[v] > best_dp_val) {
+                            best_dp_val = dp[v];
+                            best_succ = v;
+                        }
+                    }
+                    if (best_succ == UINT32_MAX) break;
+                    cur = best_succ;
+                }
+                if (!prefix.empty()) {
+                    prefix.insert(prefix.end(), path.begin(), path.end());
+                    path = std::move(prefix);
+                }
+            }
+        }
+
+        i64 min_pos = INT64_MAX, max_pos = INT64_MIN;
+        for (size_t i = 0; i < n; ++i) {
+            if (comp_id[i] != c) continue;
+            min_pos = std::min(min_pos, nodes[scd[i].contig_idx].from);
+            max_pos = std::max(max_pos, nodes[scd[i].contig_idx].to);
+        }
+        comp_paths.push_back({min_pos, max_pos, best_dp, std::move(path)});
+    }
+
+    std::sort(comp_paths.begin(), comp_paths.end(),
+              [](const auto &a, const auto &b) {
+                  return a.layout_from < b.layout_from;
+              });
+    return comp_paths;
+}
+
+// ── Phase 3: Collect output sequences from heaviest paths ───────────
+inline gtl::vector<SequenceContainerType> collect_path_sequences(
+    const gtl::vector<comp_path> &paths,
+    const gtl::vector<gtl::vector<std::pair<size_t, size_t>>> &node_contigs,
+    gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>> &contig_core_seqs,
+    size_t n_nodes)
+{
+    gtl::vector<SequenceContainerType> merged_seqs;
+    merged_seqs.reserve(n_nodes);
+
+    for (size_t ci = 0; ci < paths.size(); ++ci) {
+        if (ci > 0 && !merged_seqs.empty())
+            merged_seqs.emplace_back(0, 0);
+
+        const auto &path = paths[ci].path;
+        size_t emit_contig = SIZE_MAX;
+
+        for (size_t pi = 0; pi < path.size(); ++pi) {
+            uint32_t nid = path[pi];
+            const auto &nc = node_contigs[nid];
+
+            size_t use_contig = SIZE_MAX;
+            size_t use_core = SIZE_MAX;
+            if (emit_contig != SIZE_MAX) {
+                for (auto &[cid, kid] : nc) {
+                    if (cid == emit_contig) {
+                        use_contig = cid;
+                        use_core = kid;
+                        break;
+                    }
+                }
+            }
+
+            if (use_contig == SIZE_MAX) {
+                if (pi + 1 < path.size()) {
+                    const auto &nc_next = node_contigs[path[pi + 1]];
+                    for (auto &[cid, kid] : nc) {
+                        for (auto &[cid2, kid2] : nc_next) {
+                            if (cid == cid2) {
+                                use_contig = cid;
+                                use_core = kid;
+                                goto found_contig;
+                            }
+                        }
+                    }
+                }
+                if (!nc.empty()) {
+                    use_contig = nc[0].first;
+                    use_core = nc[0].second;
+                }
+            }
+        found_contig:
+
+            if (use_contig == SIZE_MAX) continue;
+            emit_contig = use_contig;
+
+            auto cs_it = contig_core_seqs.find(use_contig);
+            if (cs_it != contig_core_seqs.end() &&
+                use_core < cs_it->second.size()) {
+                auto &core_seq = cs_it->second[use_core];
+                if (core_seq.len > 0)
+                    merged_seqs.push_back(std::move(core_seq));
+            }
+        }
+    }
+    return merged_seqs;
+}
+
+// ── Main entry: build layout sequence from positioned nodes ─────────
 template <class AssemblerT>
 inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
     const gtl::vector<ultra_layout_node_info> &lnodes,
     [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
+    if (lnodes.empty()) return {};
 
-    // ── Local structs ──────────────────────────────────────────────────
-    struct lane_node {
-        u64 id = 0;
-        i64 from = 0;
-        i64 to = 0;
-        bool is_forward_lane = true;
-        const gtl::vector<SequenceContainerType> *raw_seqs = nullptr;
-    };
-
-    if (lnodes.empty()) {
-        return {};
-    }
-
-    // ── Phase 0: Build lane_nodes ──────────────────────────────────────
+    // ── Build lane_nodes ────────────────────────────────────────────
     gtl::vector<lane_node> nodes;
     nodes.reserve(lnodes.size());
-
     for (const auto &n : lnodes) {
         auto it = dbg.dbg.find(n.id);
         if (it == dbg.dbg.end()) continue;
         if (it->second.seq.empty()) continue;
-
-        lane_node ln;
-        ln.id = n.id;
-        ln.from = n.from;
-        ln.to = n.to;
-        ln.is_forward_lane = n.ori;
-        ln.raw_seqs = &it->second.seq;
-        nodes.push_back(std::move(ln));
+        nodes.push_back({n.id, n.from, n.to, n.ori, &it->second.seq});
     }
     if (nodes.empty()) return {};
 
-    // Sort all contigs by layout position
+    // Sort by layout position
     gtl::vector<size_t> sorted_idx(nodes.size());
     for (size_t i = 0; i < nodes.size(); ++i) sorted_idx[i] = i;
-    std::sort(sorted_idx.begin(), sorted_idx.end(),
-              [&](size_t ia, size_t ib) {
-                  const auto &a = nodes[ia];
-                  const auto &b = nodes[ib];
-                  if (a.from != b.from) return a.from < b.from;
-                  if (a.to != b.to) return a.to < b.to;
-                  return a.id < b.id;
-              });
+    std::sort(sorted_idx.begin(), sorted_idx.end(), [&](size_t ia, size_t ib) {
+        const auto &a = nodes[ia];
+        const auto &b = nodes[ib];
+        if (a.from != b.from) return a.from < b.from;
+        if (a.to != b.to) return a.to < b.to;
+        return a.id < b.id;
+    });
 
     // ── Fast path: single contig or 1fw+1rv → return the larger ──
     {
@@ -610,7 +935,6 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             else                          { ++n_rv; ri = i; }
         }
         if (n_fw <= 1 && n_rv <= 1 && (n_fw + n_rv) <= 2) {
-            // Pick the contig with more bases
             size_t fw_len = 0, rv_len = 0;
             if (fi != SIZE_MAX)
                 for (const auto &s : *nodes[fi].raw_seqs) fw_len += s.len;
@@ -636,19 +960,15 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         }
     }
 
-    // ── Per-contig core sequences ─────────────────────────────────────
+    // ── Build per-contig core sequences ─────────────────────────────
     gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>> contig_core_seqs;
     gtl::flat_hash_map<size_t, lcp_read> contig_lr;
-
-    // Build cores for all contigs in layout order, RC only if reverse
     gtl::vector<size_t> contig_order;
     contig_order.reserve(sorted_idx.size());
     lps lps_buf = {0, 0, 0, 0};
 
     for (size_t ci : sorted_idx) {
         const auto &raw = *nodes[ci].raw_seqs;
-
-        // RC fragments if reverse orientation
         gtl::vector<SequenceContainerType> rev_seqs;
         const gtl::vector<SequenceContainerType> *seqs_ptr = &raw;
         if (!nodes[ci].is_forward_lane) {
@@ -662,20 +982,16 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             *seqs_ptr, as.syncmer_functor, as.lcp_level, lps_buf);
 
         if (lr.cores.empty()) {
-            // Synthetic single-core fallback — concatenate fragments
-            // directly without ASCII round-trip
             const auto &frags = *seqs_ptr;
             size_t total_len = 0;
             for (const auto &f : frags) total_len += f.len;
             if (total_len == 0) continue;
-
             SequenceContainerType synth(frags.begin(), frags.end());
             gtl::vector<SequenceContainerType> synth_vec;
             synth_vec.push_back(std::move(synth));
             lcp_read synth_lr;
             synth_lr.cores.push_back(0);
-            synth_lr.pos.emplace_back(0u,
-                static_cast<uint32_t>(total_len));
+            synth_lr.pos.emplace_back(0u, static_cast<uint32_t>(total_len));
             contig_lr[ci] = std::move(synth_lr);
             contig_core_seqs[ci] = std::move(synth_vec);
             contig_order.push_back(ci);
@@ -687,500 +1003,38 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
     }
 
     if (contig_order.empty()) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%" PRIu64
+        std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
                      " SKIPPED: no contigs with cores\n",
                      static_cast<uint64_t>(layout_idx));
         free_lps(&lps_buf);
         return {};
     }
 
-    // ── POA graph ──────────────────────────────────────────────────────
-    struct poa_node {
-        uint32_t core_label;
-        size_t   contig_idx;  // which contig's core_seq to emit
-        size_t   core_idx;
-        uint16_t weight;      // how many contigs pass through
-    };
-
-    gtl::vector<poa_node> poa;
-    // Adjacency: node -> [(successor, edge_weight)]
-    gtl::vector<gtl::vector<std::pair<uint32_t, uint16_t>>> poa_fwd;
-    // Label index: core_label -> [node_ids]
+    // ── Phase 1: Build seed-chain DAG ───────────────────────────────
+    gtl::vector<scd_node> scd;
+    gtl::vector<scd_adj_t> scd_fwd;
     gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
-    // All (contig_idx, core_idx) that pass through each node
     gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+    build_scd_graph(contig_order, contig_lr, nodes,
+                    scd, scd_fwd, label_nodes, node_contigs);
 
-    poa.reserve(contig_order.size() * 64);
-    poa_fwd.reserve(contig_order.size() * 64);
-    node_contigs.reserve(contig_order.size() * 64);
-
-    // ── Phase 1: Add each contig to the POA graph via DP alignment ─────
-    // Standard POA: align each new contig's core-label sequence against
-    // the existing DAG using DP (LCS on DAG), then merge matched nodes
-    // and insert new nodes for unmatched query positions.
-    auto add_edge = [&](int32_t from, uint32_t to) {
-        if (from < 0) return;
-        for (auto &[t, ew] : poa_fwd[static_cast<size_t>(from)]) {
-            if (t == to) { ++ew; return; }
-        }
-        poa_fwd[static_cast<size_t>(from)].push_back({to, 1});
-    };
-
-    for (size_t ci : contig_order) {
-        const auto &lr = contig_lr[ci];
-        const size_t M = lr.cores.size();
-        if (M == 0) continue;
-
-        const size_t gn = poa.size();
-
-        // First contig or empty graph: just create nodes
-        if (gn == 0) {
-            int32_t last_node = -1;
-            for (size_t k = 0; k < M; ++k) {
-                uint32_t cur = static_cast<uint32_t>(poa.size());
-                poa.push_back({lr.cores[k], ci, k, 1});
-                poa_fwd.emplace_back();
-                node_contigs.push_back({{ci, k}});
-                label_nodes[lr.cores[k]].push_back(cur);
-                add_edge(last_node, cur);
-                last_node = static_cast<int32_t>(cur);
-            }
-            continue;
-        }
-
-        // ── Seed-chain alignment ────────────────────────────────────
-        // 1. Compute topological ranks — component by component so
-        //    disconnected components get non-interleaving rank ranges.
-        //    Components ordered by min layout_from so earlier-in-layout
-        //    components get lower ranks.
-        gtl::vector<uint32_t> topo_rank(gn, 0);
-        {
-            gtl::vector<uint32_t> in_deg(gn, 0);
-            for (size_t u = 0; u < gn; ++u)
-                for (auto &[v, w] : poa_fwd[u])
-                    if (v < gn) ++in_deg[v];
-
-            // Union-find for connected components
-            gtl::vector<uint32_t> uf(gn);
-            for (uint32_t i = 0; i < gn; ++i) uf[i] = i;
-            auto uf_find = [&](uint32_t x) -> uint32_t {
-                while (uf[x] != x) { uf[x] = uf[uf[x]]; x = uf[x]; }
-                return x;
-            };
-            for (size_t u = 0; u < gn; ++u)
-                for (auto &[v, w] : poa_fwd[u])
-                    if (v < gn) uf[uf_find(u)] = uf_find(v);
-
-            // Group sources by component root
-            gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> comp_srcs;
-            for (uint32_t i = 0; i < gn; ++i)
-                if (in_deg[i] == 0) comp_srcs[uf_find(i)].push_back(i);
-
-            // Sort component roots by min layout_from
-            gtl::vector<uint32_t> roots;
-            roots.reserve(comp_srcs.size());
-            for (auto &[r, _] : comp_srcs) roots.push_back(r);
-            std::sort(roots.begin(), roots.end(),
-                      [&](uint32_t a, uint32_t b) {
-                          i64 ma = INT64_MAX, mb = INT64_MAX;
-                          for (uint32_t s : comp_srcs[a])
-                              ma = std::min(ma,
-                                   nodes[poa[s].contig_idx].from);
-                          for (uint32_t s : comp_srcs[b])
-                              mb = std::min(mb,
-                                   nodes[poa[s].contig_idx].from);
-                          return ma < mb;
-                      });
-
-            // Topo sort each component sequentially
-            uint32_t rank = 0;
-            for (uint32_t root : roots) {
-                std::queue<uint32_t> q;
-                for (uint32_t s : comp_srcs[root]) q.push(s);
-                while (!q.empty()) {
-                    uint32_t u = q.front(); q.pop();
-                    topo_rank[u] = rank++;
-                    for (auto &[v, w] : poa_fwd[u])
-                        if (v < gn && --in_deg[v] == 0) q.push(v);
-                }
-            }
-        }
-
-        // 2. Collect seeds: (rank, query_pos, graph_node)
-        struct poa_seed {
-            uint32_t rank; size_t k; uint32_t v;
-        };
-        gtl::vector<poa_seed> seeds;
-        for (size_t k = 0; k < M; ++k) {
-            auto it = label_nodes.find(lr.cores[k]);
-            if (it == label_nodes.end()) continue;
-            for (uint32_t v : it->second) {
-                if (v >= gn) continue;
-                seeds.push_back({topo_rank[v], k, v});
-            }
-        }
-
-        // 3. Sort by rank asc, k desc (standard 2D strictly-increasing
-        //    LIS trick: ties in rank get k-descending so at most one
-        //    per rank survives in any chain).
-        std::sort(seeds.begin(), seeds.end(),
-                  [](const poa_seed &a, const poa_seed &b) {
-                      if (a.rank != b.rank) return a.rank < b.rank;
-                      return a.k > b.k;
-                  });
-
-        // 4. LIS on k (strictly increasing) with traceback
-        const size_t S = seeds.size();
-        gtl::vector<size_t> tails;       // tails[i] = k of best len-(i+1) chain
-        gtl::vector<size_t> tail_idx;    // seed index for that tail
-        gtl::vector<int32_t> lis_prev(S, -1);
-
-        for (size_t i = 0; i < S; ++i) {
-            size_t k = seeds[i].k;
-            auto pos = std::lower_bound(tails.begin(), tails.end(), k);
-            size_t lp = static_cast<size_t>(pos - tails.begin());
-
-            lis_prev[i] = (lp > 0)
-                ? static_cast<int32_t>(tail_idx[lp - 1]) : -1;
-
-            if (pos == tails.end()) {
-                tails.push_back(k);
-                tail_idx.push_back(i);
-            } else {
-                *pos = k;
-                tail_idx[lp] = i;
-            }
-        }
-
-        // 5. Traceback → query_to_node
-        gtl::vector<int32_t> query_to_node(M, -1);
-        if (!tails.empty()) {
-            for (int32_t idx = static_cast<int32_t>(tail_idx.back());
-                 idx >= 0; idx = lis_prev[idx])
-                query_to_node[seeds[idx].k] =
-                    static_cast<int32_t>(seeds[idx].v);
-        }
-
-        // 6. Apply: merge matched, create new for unmatched
-        int32_t last_node = -1;
-        for (size_t k = 0; k < M; ++k) {
-            uint32_t cur_node;
-            if (query_to_node[k] >= 0) {
-                cur_node = static_cast<uint32_t>(query_to_node[k]);
-                poa[cur_node].weight++;
-                node_contigs[cur_node].push_back({ci, k});
-            } else {
-                cur_node = static_cast<uint32_t>(poa.size());
-                poa.push_back({lr.cores[k], ci, k, 1});
-                poa_fwd.emplace_back();
-                node_contigs.push_back({{ci, k}});
-                label_nodes[lr.cores[k]].push_back(cur_node);
-            }
-            add_edge(last_node, cur_node);
-            last_node = static_cast<int32_t>(cur_node);
-        }
-    }
-
-    if (poa.empty()) {
-        std::fprintf(stderr,
-                     "[layout-dag] layout=%" PRIu64
-                     " SKIPPED: POA graph empty\n",
+    if (scd.empty()) {
+        std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
+                     " SKIPPED: SCD graph empty\n",
                      static_cast<uint64_t>(layout_idx));
         free_lps(&lps_buf);
         return {};
     }
 
-    // ── Phase 2: Find heaviest path per connected component ────────────
-    const size_t n = poa.size();
+    // ── Phase 2: Find heaviest paths ────────────────────────────────
+    auto comp_paths = find_heaviest_paths(scd, scd_fwd, nodes, layout_idx);
 
-    // Final topological sort
-    gtl::vector<uint32_t> topo_order;
-    topo_order.reserve(n);
-    {
-        gtl::vector<uint32_t> in_deg(n, 0);
-        for (size_t u = 0; u < n; ++u)
-            for (auto &[v, w] : poa_fwd[u])
-                ++in_deg[v];
-        std::queue<uint32_t> q;
-        for (uint32_t i = 0; i < n; ++i)
-            if (in_deg[i] == 0) q.push(i);
-        while (!q.empty()) {
-            uint32_t u = q.front(); q.pop();
-            topo_order.push_back(u);
-            for (auto &[v, w] : poa_fwd[u])
-                if (--in_deg[v] == 0) q.push(v);
-        }
-        // If some nodes weren't reached (residual cycles), append them
-        if (topo_order.size() < n) {
-            std::fprintf(stderr,
-                         "[layout-dag] layout=%" PRIu64 " WARNING: %zu/%zu nodes "
-                         "stuck in cycles, appending in index order\n",
-                         static_cast<uint64_t>(layout_idx),
-                         n - topo_order.size(), n);
-            gtl::flat_hash_set<uint32_t> visited(
-                topo_order.begin(), topo_order.end());
-            for (uint32_t i = 0; i < n; ++i)
-                if (!visited.contains(i)) topo_order.push_back(i);
-        }
-    }
-
-    // Build reverse adjacency
-    gtl::vector<gtl::vector<std::pair<uint32_t, uint16_t>>> poa_rev(n);
-    for (size_t u = 0; u < n; ++u)
-        for (auto &[v, w] : poa_fwd[u])
-            poa_rev[v].push_back({static_cast<uint32_t>(u), w});
-
-    // DP: heaviest path (maximize sum of node weights)
-    gtl::vector<int64_t> dp(n, 0);
-    gtl::vector<int32_t> parent(n, -1);
-    for (uint32_t v : topo_order) {
-        dp[v] = poa[v].weight;
-        parent[v] = -1;
-        for (auto &[u, w] : poa_rev[v]) {
-            int64_t cand = dp[u] + poa[v].weight;
-            if (cand > dp[v]) {
-                dp[v] = cand;
-                parent[v] = static_cast<int32_t>(u);
-            }
-        }
-    }
-
-    // Find connected components (undirected BFS)
-    gtl::vector<int32_t> comp_id(n, -1);
-    int32_t num_comps = 0;
-    for (size_t i = 0; i < n; ++i) {
-        if (comp_id[i] >= 0) continue;
-        std::queue<uint32_t> bfs;
-        bfs.push(static_cast<uint32_t>(i));
-        comp_id[i] = num_comps;
-        while (!bfs.empty()) {
-            uint32_t u = bfs.front(); bfs.pop();
-            for (auto &[v, w] : poa_fwd[u]) {
-                if (comp_id[v] < 0) { comp_id[v] = num_comps; bfs.push(v); }
-            }
-            for (auto &[u2, w] : poa_rev[u]) {
-                if (comp_id[u2] < 0) { comp_id[u2] = num_comps; bfs.push(u2); }
-            }
-        }
-        ++num_comps;
-    }
-
-    // For each component: find heaviest path, determine layout position
-    struct comp_path {
-        i64 layout_from;
-        i64 layout_to;
-        int64_t total_weight;
-        gtl::vector<uint32_t> path;
-    };
-    gtl::vector<comp_path> comp_paths;
-
-    for (int32_t c = 0; c < num_comps; ++c) {
-        // Find best sink (no outgoing edges) in this component
-        int32_t best_end = -1;
-        int64_t best_dp = -1;
-        for (size_t i = 0; i < n; ++i) {
-            if (comp_id[i] != c) continue;
-            if (poa_fwd[i].empty() && dp[i] > best_dp) {
-                best_dp = dp[i];
-                best_end = static_cast<int32_t>(i);
-            }
-        }
-        // Fallback: max dp in component if no sinks
-        if (best_end < 0) {
-            for (size_t i = 0; i < n; ++i) {
-                if (comp_id[i] != c) continue;
-                if (dp[i] > best_dp) {
-                    best_dp = dp[i];
-                    best_end = static_cast<int32_t>(i);
-                }
-            }
-        }
-        if (best_end < 0) continue;
-
-        // Trace back
-        gtl::vector<uint32_t> path;
-        for (int32_t cur = best_end; cur >= 0; cur = parent[cur])
-            path.push_back(static_cast<uint32_t>(cur));
-        std::reverse(path.begin(), path.end());
-
-        // Extend the heaviest path at both ends if there are
-        // sinks/sources in this component that cover more layout span.
-        {
-            gtl::flat_hash_set<uint32_t> on_path(path.begin(), path.end());
-            i64 path_max_to = INT64_MIN;
-            for (uint32_t nid : path)
-                path_max_to = std::max(path_max_to,
-                                       nodes[poa[nid].contig_idx].to);
-            i64 path_min_from = INT64_MAX;
-            for (uint32_t nid : path)
-                path_min_from = std::min(path_min_from,
-                                         nodes[poa[nid].contig_idx].from);
-
-            // Forward extension: find sink with layout_to > path_max_to
-            int32_t ext_sink = -1;
-            i64 ext_to = path_max_to;
-            for (size_t i = 0; i < n; ++i) {
-                if (comp_id[i] != c) continue;
-                if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                i64 to = nodes[poa[i].contig_idx].to;
-                if (to > ext_to && poa_fwd[i].empty()) {
-                    ext_to = to;
-                    ext_sink = static_cast<int32_t>(i);
-                }
-            }
-            if (ext_sink >= 0) {
-                // Traceback from ext_sink, find where it meets the main path
-                gtl::vector<uint32_t> ext_path;
-                for (int32_t cur = ext_sink; cur >= 0; cur = parent[cur])
-                    ext_path.push_back(static_cast<uint32_t>(cur));
-                std::reverse(ext_path.begin(), ext_path.end());
-                // Find last node in ext_path that's on the main path
-                size_t branch_pos = 0;
-                bool found_overlap = false;
-                for (size_t i = 0; i < ext_path.size(); ++i) {
-                    if (on_path.contains(ext_path[i])) {
-                        branch_pos = i;
-                        found_overlap = true;
-                    }
-                }
-                if (!found_overlap) [[unlikely]] {
-                    std::fprintf(stderr,
-                        "[layout-dag] WARNING: forward extension has no "
-                        "overlap with main path (%s:%d)\n", __FILE__, __LINE__);
-                } else {
-                    // Append the diverging suffix
-                    for (size_t i = branch_pos + 1; i < ext_path.size(); ++i)
-                        path.push_back(ext_path[i]);
-                }
-            }
-
-            // Backward extension: find source with layout_from < path_min_from
-            int32_t ext_source = -1;
-            i64 ext_from = path_min_from;
-            for (size_t i = 0; i < n; ++i) {
-                if (comp_id[i] != c) continue;
-                if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                i64 from = nodes[poa[i].contig_idx].from;
-                if (from < ext_from && poa_rev[i].empty()) {
-                    ext_from = from;
-                    ext_source = static_cast<int32_t>(i);
-                }
-            }
-            if (ext_source >= 0) {
-                // Follow successors greedily from ext_source toward the
-                // main path, guided by dp values.
-                gtl::vector<uint32_t> prefix;
-                uint32_t cur = static_cast<uint32_t>(ext_source);
-                while (!on_path.contains(cur)) {
-                    prefix.push_back(cur);
-                    uint32_t best_succ = UINT32_MAX;
-                    int64_t best_dp_val = -1;
-                    for (auto &[v, w] : poa_fwd[cur]) {
-                        if (dp[v] > best_dp_val) {
-                            best_dp_val = dp[v];
-                            best_succ = v;
-                        }
-                    }
-                    if (best_succ == UINT32_MAX) break;
-                    cur = best_succ;
-                }
-                if (!prefix.empty()) {
-                    prefix.insert(prefix.end(), path.begin(), path.end());
-                    path = std::move(prefix);
-                }
-            }
-        }
-
-        // Layout position range from all nodes' contigs in this component
-        i64 min_pos = INT64_MAX, max_pos = INT64_MIN;
-        for (size_t i = 0; i < n; ++i) {
-            if (comp_id[i] != c) continue;
-            min_pos = std::min(min_pos, nodes[poa[i].contig_idx].from);
-            max_pos = std::max(max_pos, nodes[poa[i].contig_idx].to);
-        }
-
-        comp_paths.push_back({min_pos, max_pos, best_dp, std::move(path)});
-    }
-
-    // Sort components by layout position
-    std::sort(comp_paths.begin(), comp_paths.end(),
-              [](const auto &a, const auto &b) {
-                  return a.layout_from < b.layout_from;
-              });
-
-
-    // ── Phase 3: Collect output sequences ──────────────────────────────
-    // For each node on the path, pick a consistent contig to avoid
-    // boundary mismatches at merged nodes. Collect CrumbledSubSeq64
-    // objects directly — defer ASCII conversion to print time.
-    gtl::vector<SequenceContainerType> merged_seqs;
-    merged_seqs.reserve(n);
-
-    for (size_t ci = 0; ci < comp_paths.size(); ++ci) {
-        if (ci > 0 && !merged_seqs.empty()) {
-            // Sentinel: zero-len entry signals N-gap between components
-            merged_seqs.emplace_back(0, 0);
-        }
-
-        const auto &path = comp_paths[ci].path;
-        size_t emit_contig = SIZE_MAX;
-
-        for (size_t pi = 0; pi < path.size(); ++pi) {
-            uint32_t nid = path[pi];
-            const auto &nc = node_contigs[nid];
-
-            // Try to stay on current contig
-            size_t use_contig = SIZE_MAX;
-            size_t use_core = SIZE_MAX;
-            if (emit_contig != SIZE_MAX) {
-                for (auto &[cid, kid] : nc) {
-                    if (cid == emit_contig) {
-                        use_contig = cid;
-                        use_core = kid;
-                        break;
-                    }
-                }
-            }
-
-            // If current contig doesn't pass through this node, switch.
-            // Prefer the contig that also appears in the NEXT node.
-            if (use_contig == SIZE_MAX) {
-                if (pi + 1 < path.size()) {
-                    const auto &nc_next = node_contigs[path[pi + 1]];
-                    for (auto &[cid, kid] : nc) {
-                        for (auto &[cid2, kid2] : nc_next) {
-                            if (cid == cid2) {
-                                use_contig = cid;
-                                use_core = kid;
-                                goto found_contig;
-                            }
-                        }
-                    }
-                }
-                if (!nc.empty()) {
-                    use_contig = nc[0].first;
-                    use_core = nc[0].second;
-                }
-            }
-            found_contig:
-
-            if (use_contig == SIZE_MAX) continue;
-            emit_contig = use_contig;
-
-            auto cs_it = contig_core_seqs.find(use_contig);
-            if (cs_it != contig_core_seqs.end() &&
-                use_core < cs_it->second.size()) {
-                auto &core_seq = cs_it->second[use_core];
-                if (core_seq.len > 0) {
-                    merged_seqs.push_back(std::move(core_seq));
-                }
-            }
-        }
-    }
+    // ── Phase 3: Collect output sequences ───────────────────────────
+    auto result = collect_path_sequences(
+        comp_paths, node_contigs, contig_core_seqs, scd.size());
 
     free_lps(&lps_buf);
-    return merged_seqs;
+    return result;
 }
 
 using layout_seq_t = gtl::vector<SequenceContainerType>;
@@ -1206,7 +1060,8 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
         workers.emplace_back([&]() {
             size_t job_idx = 0;
             while (true) {
-                if (!job_queue.wait_dequeue_timed(job_idx, WAIT_QUEUE_TIMEOUT)) {
+                if (!job_queue.wait_dequeue_timed(job_idx,
+                                                  WAIT_QUEUE_TIMEOUT)) {
                     if (done.load()) break;
                     continue;
                 }
@@ -1238,8 +1093,9 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
 // ── Post-layout graph types ─────────────────────────────────────────
 struct supernode_out {
     std::string name;
-    gtl::vector<SequenceContainerType> owned_seqs;   // layout seqs (owned)
-    const gtl::vector<SequenceContainerType> *ref_seqs = nullptr; // unitig seqs (borrowed)
+    gtl::vector<SequenceContainerType> owned_seqs;  // layout seqs (owned)
+    const gtl::vector<SequenceContainerType> *ref_seqs =
+        nullptr;  // unitig seqs (borrowed)
     bool is_layout;
     u64 aux_id;
 
@@ -1269,8 +1125,8 @@ using edge_map = std::map<edge_key, edge_agg>;
 // cleaning functions operating on the supernode/superedge graph.
 struct PostLayoutCleaning {
     struct adj_entry {
-        u64 neighbor;       // supernode id
-        edge_key key;       // key into merged_edges
+        u64 neighbor;  // supernode id
+        edge_key key;  // key into merged_edges
     };
 
     // Per-supernode adjacency (directed: fwd = outgoing, rev = incoming)
@@ -1299,12 +1155,14 @@ struct PostLayoutCleaning {
             changed = false;
             for (size_t i = 0; i < supernodes.size(); ++i) {
                 auto &sn = supernodes[i];
-                if (sn.name.empty()) continue;        // already removed
-                if (sn.is_layout) continue;            // never remove M-nodes
+                if (sn.name.empty()) continue;  // already removed
+                if (sn.is_layout) continue;     // never remove M-nodes
 
                 auto adj_it = adj.find(i);
-                size_t in_deg = (adj_it != adj.end()) ? adj_it->second.rev.size() : 0;
-                size_t out_deg = (adj_it != adj.end()) ? adj_it->second.fwd.size() : 0;
+                size_t in_deg =
+                    (adj_it != adj.end()) ? adj_it->second.rev.size() : 0;
+                size_t out_deg =
+                    (adj_it != adj.end()) ? adj_it->second.fwd.size() : 0;
 
                 // Tip: dead-end on at least one side
                 if (in_deg != 0 && out_deg != 0) continue;
@@ -1335,7 +1193,8 @@ struct PostLayoutCleaning {
     }
 
     // Remove edges pointing to/from removed supernodes.
-    static void fix_edges(const supernode_vec &supernodes, edge_map &merged_edges) {
+    static void fix_edges(const supernode_vec &supernodes,
+                          edge_map &merged_edges) {
         std::erase_if(merged_edges, [&](const auto &kv) {
             const auto &e = kv.second;
             return e.src_super >= supernodes.size() ||
@@ -1354,7 +1213,8 @@ struct PostLayoutCleaning {
         fix_edges(supernodes, merged_edges);
 
         if (tips > 0)
-            std::fprintf(stderr, "[post-layout-clean] Removed %zu tips\n", tips);
+            std::fprintf(stderr, "[post-layout-clean] Removed %zu tips\n",
+                         tips);
     }
 };
 
@@ -1362,7 +1222,8 @@ template <class AssemblerT>
 inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     INIT_TIMERS(LayoutEmit);
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
-    TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)", layouts.size());
+    TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
+                    layouts.size());
 
     static constexpr uint8_t SIDE_START = 1;
     static constexpr uint8_t SIDE_END = 2;
@@ -1424,7 +1285,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
             node_boundary_mask[n.id] |= mask;
             auto [ori_it, inserted] = node_layout_ori.try_emplace(n.id, n.ori);
             if (!inserted && ori_it->second != n.ori) [[unlikely]] {
-                std::fprintf(stderr,
+                std::fprintf(
+                    stderr,
                     "[layout-emit] WARNING: node %" PRIu64
                     " orientation conflict: was %c, now %c (overwriting)\n",
                     n.id, ori_it->second ? '+' : '-', n.ori ? '+' : '-');
@@ -1437,16 +1299,15 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         ++layout_idx;
     }
 
-
     auto layout_seqs =
         build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences (parallel)");
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
         const u64 sid = supernodes.size();
         supernodes.push_back({"M" + std::to_string(job.layout_idx),
-                              std::move(layout_seqs[i]),
-                              nullptr, true, job.layout_idx});
+                              std::move(layout_seqs[i]), nullptr, true,
+                              job.layout_idx});
         for (const auto &n : job.lnodes) {
             node_to_super[n.id] = sid;
         }
@@ -1490,7 +1351,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         bool has_boundary_neighbor = false;
 
         while (!bfs.empty()) {
-            u64 cur = bfs.front(); bfs.pop();
+            u64 cur = bfs.front();
+            bfs.pop();
             component.push_back(cur);
             auto db_it = dbg.dbg.find(cur);
 
@@ -1538,8 +1400,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
 
         if (!has_boundary_neighbor && !component.empty()) {
-            for (u64 nid : component)
-                contained_nodes.insert(nid);
+            for (u64 nid : component) contained_nodes.insert(nid);
         }
     }
 
@@ -1550,8 +1411,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     }
     if (!contained_nodes.empty()) {
         std::fprintf(stderr,
-            "[layout-emit] Skipped %zu contained C-nodes (%zu bp)\n",
-            contained_nodes.size(), contained_bp);
+                     "[layout-emit] Skipped %zu contained C-nodes (%zu bp)\n",
+                     contained_nodes.size(), contained_bp);
     }
 
     // Create supernodes for remaining C-nodes
@@ -1561,9 +1422,11 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         if (it == dbg.dbg.end()) continue;
 
         const u64 sid = supernodes.size();
-        supernodes.push_back(
-            {"C" + std::to_string(node_id),
-             {}, &it->second.seq, false, node_id});
+        supernodes.push_back({"C" + std::to_string(node_id),
+                              {},
+                              &it->second.seq,
+                              false,
+                              node_id});
         node_to_super[node_id] = sid;
     }
 
@@ -1586,8 +1449,9 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                     auto from_super_it = node_to_super.find(from_id);
                     if (from_super_it == node_to_super.end()) continue;
                     // Skip intra-supernode edges, but keep self-loops
-                    if (from_super_it->second == to_super_it->second
-                        && from_id != to_id) continue;
+                    if (from_super_it->second == to_super_it->second &&
+                        from_id != to_id)
+                        continue;
 
                     bool accept = true;
                     uint8_t src_side = 0, dst_side = 0;
@@ -1611,8 +1475,10 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 
                     edge_key k{from_super_it->second,
                                to_super_it->second,
-                               src_ori, dst_ori,
-                               src_side, dst_side};
+                               src_ori,
+                               dst_ori,
+                               src_side,
+                               dst_side};
                     auto &agg = per_thread[tid][k];
                     if (agg.count == 0) {
                         agg.src_super = from_super_it->second;
@@ -1642,7 +1508,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
     }
 
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation (parallel)");
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Edge aggregation");
 
     // ── Post-layout graph cleaning ──────────────────────────────────
     PostLayoutCleaning::run(supernodes, merged_edges);
@@ -1689,7 +1555,7 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         }
         for (auto &w : workers) w.join();
     }
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Parallel ASCII conversion");
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Convert to ASCII");
 
     // ── Sequential write ─────────────────────────────────────────────
     for (size_t i = 0; i < n_super; ++i) {
@@ -1698,8 +1564,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
         const char *tp = sn.is_layout ? "layout" : "unitig";
         const char *id_tag = sn.is_layout ? "LY" : "UI";
         std::fprintf(out, "S\t%s\t%s\tTP:Z:%s\t%s:i:%" PRIu64 "\n",
-                     sn.name.c_str(), super_seq_strs[i].c_str(),
-                     tp, id_tag, static_cast<uint64_t>(sn.aux_id));
+                     sn.name.c_str(), super_seq_strs[i].c_str(), tp, id_tag,
+                     static_cast<uint64_t>(sn.aux_id));
     }
     for (const auto &[_, edge] : merged_edges) {
         const auto &src_name = supernodes[edge.src_super].name;
@@ -2395,6 +2261,6 @@ struct lsg_cleaning {
         }
     }
 };
-#endif // #if 0
+#endif  // #if 0
 
-#endif // _LAYOUT_GRAPH_H
+#endif  // _LAYOUT_GRAPH_H

@@ -1295,7 +1295,7 @@ int run_assembly(const asm_config &cfg) {
         charsi chs;
         printf("S\t%" PRIu64 "\t", layout_idx);
         std::set<u64> ids_seen;
-        for (const auto &[id,s] : longest_path(small_bg) ){
+        for (const auto &[id,s] : layout_graph_algo::longest_path(small_bg) ){
             auto it = ids_seen.find(id);
             if(it != ids_seen.end()){
                 fprintf(stderr, "Duplicate ID: %" PRIu64 "\n", id);
