@@ -1463,38 +1463,38 @@ struct GraphCleaning {
                                 other_depth, pr_depth, curr_depth, depth_stats);
                             const int extra_turns =
                                 std::max(0, copy_est.loop_turns - 1);
-                            const double baseline = depth_stats.baseline;
-                            const double curr_cn = curr_depth / baseline;
-                            const double loop_cn = pr_depth / baseline;
-                            const double other_in_cn = other_depth / baseline;
-                            fprintf(
-                                stderr,
-                                "[open_simple_loopsv2] cur=%" PRIu64
-                                " loop=%" PRIu64 " "
-                                "other_in=%" PRIu64 " curr_d=%.3f loop_d=%.3f "
-                                "other_in_d=%.3f "
-                                "baseline=%.3f curr_cn=%.3f loop_cn=%.3f "
-                                "other_in_cn=%.3f "
-                                "global_ref_d=%.3f raw(loop/curr)=%.3f/%.3f "
-                                "rounded(loop/curr)=%d/%d "
-                                "other_cn_round=%d turn_gain/thr=%.3f/%.3f "
-                                "force_t1=%d "
-                                "base_cn(real/round)=%.3f/%d "
-                                "loop_turns=%d extra_turns=%d score=%.3f\n",
-                                static_cast<uint64_t>(node),
-                                static_cast<uint64_t>(pnode),
-                                static_cast<uint64_t>(other_prev), curr_depth,
-                                pr_depth, other_depth, baseline, curr_cn,
-                                loop_cn, other_in_cn, copy_est.global_ref_depth,
-                                copy_est.raw_loop_cn, copy_est.raw_curr_cn,
-                                copy_est.loop_cn_rounded,
-                                copy_est.curr_cn_rounded,
-                                copy_est.other_cn_rounded,
-                                copy_est.turn_event_gain,
-                                copy_est.turn_event_threshold,
-                                copy_est.turn_forced_single, copy_est.base_cn,
-                                copy_est.base_cn_rounded, copy_est.loop_turns,
-                                extra_turns, copy_est.score);
+                            // const double baseline = depth_stats.baseline;
+                            // const double curr_cn = curr_depth / baseline;
+                            // const double loop_cn = pr_depth / baseline;
+                            // const double other_in_cn = other_depth / baseline;
+                            // fprintf(
+                            //     stderr,
+                            //     "[open_simple_loopsv2] cur=%" PRIu64
+                            //     " loop=%" PRIu64 " "
+                            //     "other_in=%" PRIu64 " curr_d=%.3f loop_d=%.3f "
+                            //     "other_in_d=%.3f "
+                            //     "baseline=%.3f curr_cn=%.3f loop_cn=%.3f "
+                            //     "other_in_cn=%.3f "
+                            //     "global_ref_d=%.3f raw(loop/curr)=%.3f/%.3f "
+                            //     "rounded(loop/curr)=%d/%d "
+                            //     "other_cn_round=%d turn_gain/thr=%.3f/%.3f "
+                            //     "force_t1=%d "
+                            //     "base_cn(real/round)=%.3f/%d "
+                            //     "loop_turns=%d extra_turns=%d score=%.3f\n",
+                            //     static_cast<uint64_t>(node),
+                            //     static_cast<uint64_t>(pnode),
+                            //     static_cast<uint64_t>(other_prev), curr_depth,
+                            //     pr_depth, other_depth, baseline, curr_cn,
+                            //     loop_cn, other_in_cn, copy_est.global_ref_depth,
+                            //     copy_est.raw_loop_cn, copy_est.raw_curr_cn,
+                            //     copy_est.loop_cn_rounded,
+                            //     copy_est.curr_cn_rounded,
+                            //     copy_est.other_cn_rounded,
+                            //     copy_est.turn_event_gain,
+                            //     copy_est.turn_event_threshold,
+                            //     copy_est.turn_forced_single, copy_est.base_cn,
+                            //     copy_est.base_cn_rounded, copy_est.loop_turns,
+                            //     extra_turns, copy_est.score);
 
                             for (int turn = 0; turn < extra_turns; ++turn) {
                                 current->second.seq.push_back(
@@ -1605,9 +1605,10 @@ struct GraphCleaning {
             //                       active_set);
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
-            dump_initial_clean_contig_stats(
-                dbgi.dbg, active_set,
-                acfg.output + ".initial_clean_contig_stats.tsv");
+            cut_low_support_edges(dbgi.dbg, active_set);
+            // dump_initial_clean_contig_stats(
+            //     dbgi.dbg, active_set,
+            //     acfg.output + ".initial_clean_contig_stats.tsv");
             const auto initial_depth_stats =
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {

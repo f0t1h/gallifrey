@@ -102,6 +102,7 @@ struct asm_config {
     bool parallel_file_reading = false;
     syncmer_params syncmer;
     bool print_precleanup_graph = false;
+    bool print_prelayout_graph = false;
     bool silent = false;
     struct {
         uint64_t projected_count = 100'000'000;

@@ -48,8 +48,12 @@ int asm_program(CLI::App &parent) {
     app.add_flag("--rle", p->rle, "Enable Run Length Encoding")
         ->capture_default_str();
 
+
     app.add_flag("--print-raw-dbg", p->print_precleanup_graph,
-                 "Print DBG before cleanup (with .raw suffix)")
+                 "Print DBG before cleanup (with .raw.gfa suffix)")
+        ->capture_default_str();
+    app.add_flag("--print-bi-dbg", p->print_prelayout_graph,
+                 "Print DBG before layout (with .bi.gfa suffix)")
         ->capture_default_str();
     app.add_flag("--silent", p->silent, "Do not print progress to stderr")
         ->capture_default_str();
