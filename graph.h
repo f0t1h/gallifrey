@@ -1619,7 +1619,6 @@ struct GraphCleaning {
                 // pop_bubbles(dbgi.dbg, dbgi.lci,
                 //             cfg.min_bubble_depth_difference_percentage,
                 //             active_set);
-                cut_low_support_edges(dbgi.dbg, active_set);
                 if (cfg.enable_loop_opening) {
                     open_simple_loopsv2(dbgi.dbg, active_set,
                                         initial_depth_stats);
