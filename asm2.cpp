@@ -193,8 +193,9 @@ struct assembler {
                     ll[i],
                     [&lr, i,
                      lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            lr.data, lr.pos[i + lcmer_l - 1].second,
+                        SequenceContainerType::append_nibbles(
+                            val.second.seq, lr.data,
+                            lr.pos[i + lcmer_l - 1].second,
                             lr.pos[i + lcmer_l].second, val.first);
                     });
             }
@@ -221,11 +222,9 @@ struct assembler {
 
             dbgi.dbg.modify_if(val, [&](dbg_index::dbg_map_t::value_type &val) {
                 if (val.second.seq.size() == 0) {
-                    if (to - from > 0) {
-                        val.second.seq.emplace_back(lr.data, from, to,
-                                                    val.first);
-                        // assert((to & 3) + 4 < lr.data_length);
-                    }
+                    SequenceContainerType::append_nibbles(val.second.seq,
+                                                          lr.data, from, to,
+                                                          val.first);
                 }
             });
             uint32_t in_core = lr.cores[i];
@@ -566,8 +565,9 @@ struct assembler {
                 dbgi.dbg.modify_if(
                     ll[i], [&lr, i, &subseqs,
                             this](dbg_index::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            subseqs, lr.pos[i + olc_lcmer_l - 1].second,
+                        SequenceContainerType::append_subseqs(
+                            val.second.seq, subseqs,
+                            lr.pos[i + olc_lcmer_l - 1].second,
                             lr.pos[i + olc_lcmer_l].second);
                     });
             }
@@ -627,48 +627,22 @@ struct assembler {
             size_t to = cur_end;
             size_t sub_len = to - from;
 
-            core_seqs.emplace_back(sub_len, 0);
-            auto &result = core_seqs.back();
-            size_t dest_pos = 0;
-
             // Advance frag_idx until we reach the fragment containing 'from'
             while (frag_idx < seqs.size() &&
                    frag_cumulative + seqs[frag_idx].len <= from) {
                 frag_cumulative += seqs[frag_idx].len;
                 ++frag_idx;
             }
-
-            // Extract bases from fragments, starting from current position
-            size_t cur_frag = frag_idx;
-            size_t cur_cumulative = frag_cumulative;
-
-            while (cur_frag < seqs.size() && dest_pos < sub_len) {
-                const auto &frag = seqs[cur_frag];
-                size_t frag_start = cur_cumulative;
-                size_t frag_end = cur_cumulative + frag.len;
-
-                // Compute overlap of [frag_start, frag_end) with [from, to)
-                size_t overlap_start = std::max(frag_start, from);
-                size_t overlap_end = std::min(frag_end, to);
-
-                if (overlap_start < overlap_end) {
-                    size_t local_from = overlap_start - frag_start;
-                    size_t copy_len = overlap_end - overlap_start;
-
-                    // Copy bases from frag to result
-                    for (size_t b = 0; b < copy_len; ++b) {
-                        size_t src_bit =
-                            (frag.skip_first_n + local_from + b) * 2;
-                        uint64_t code =
-                            (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
-                        size_t dst_bit = dest_pos * 2;
-                        result.data[dst_bit >> 6] |= code << (dst_bit & 63);
-                        ++dest_pos;
-                    }
-                    result.origin_node = frag.origin_node;
-                }
-                cur_cumulative += frag.len;
-                ++cur_frag;
+            // One core -> one run of records (split if it exceeds capacity).
+            // Keep exactly one (possibly empty) record per core so the per-core
+            // consumer's regrouping stays aligned.
+            if (sub_len == 0) {
+                core_seqs.emplace_back(static_cast<size_t>(0),
+                                       static_cast<uint8_t>(0));
+            } else {
+                SequenceContainerType::append_subseqs(
+                    core_seqs, seqs, frag_idx, from - frag_cumulative,
+                    to - frag_cumulative);
             }
 
             prev_end = cur_end;
@@ -685,9 +659,7 @@ struct assembler {
         lr.clear();
 
         gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
+        rc_vector(seqs, rev_seqs);
         init_lps_crumbled(&str, rev_seqs, syncmer_functor);
         lps_deepen(&str, lcp_level);
 
@@ -707,10 +679,7 @@ struct assembler {
         gtl::vector<SequenceContainerType> core_seqs;
 
         gtl::vector<SequenceContainerType> rev_seqs;
-        rev_seqs.reserve(seqs.size());
-        for (auto it = seqs.rbegin(); it != seqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
+        rc_vector(seqs, rev_seqs);
 
         init_lps_crumbled(&str, rev_seqs, syncmer_functor);
         lps_deepen(&str, lcp_level);
@@ -741,48 +710,19 @@ struct assembler {
             size_t to = cur_end;
             size_t sub_len = to - from;
 
-            core_seqs.emplace_back(sub_len, 0);
-            auto &result = core_seqs.back();
-            size_t dest_pos = 0;
-
             // Advance frag_idx until we reach the fragment containing 'from'
             while (frag_idx < rev_seqs.size() &&
                    frag_cumulative + rev_seqs[frag_idx].len <= from) {
                 frag_cumulative += rev_seqs[frag_idx].len;
                 ++frag_idx;
             }
-
-            // Extract bases from fragments, starting from current position
-            size_t cur_frag = frag_idx;
-            size_t cur_cumulative = frag_cumulative;
-
-            while (cur_frag < rev_seqs.size() && dest_pos < sub_len) {
-                const auto &frag = rev_seqs[cur_frag];
-                size_t frag_start = cur_cumulative;
-                size_t frag_end = cur_cumulative + frag.len;
-
-                // Compute overlap of [frag_start, frag_end) with [from, to)
-                size_t overlap_start = std::max(frag_start, from);
-                size_t overlap_end = std::min(frag_end, to);
-
-                if (overlap_start < overlap_end) {
-                    size_t local_from = overlap_start - frag_start;
-                    size_t copy_len = overlap_end - overlap_start;
-
-                    // Copy bases from frag to result
-                    for (size_t b = 0; b < copy_len; ++b) {
-                        size_t src_bit =
-                            (frag.skip_first_n + local_from + b) * 2;
-                        uint64_t code =
-                            (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
-                        size_t dst_bit = dest_pos * 2;
-                        result.data[dst_bit >> 6] |= code << (dst_bit & 63);
-                        ++dest_pos;
-                    }
-                    result.origin_node = frag.origin_node;
-                }
-                cur_cumulative += frag.len;
-                ++cur_frag;
+            if (sub_len == 0) {
+                core_seqs.emplace_back(static_cast<size_t>(0),
+                                       static_cast<uint8_t>(0));
+            } else {
+                SequenceContainerType::append_subseqs(
+                    core_seqs, rev_seqs, frag_idx, from - frag_cumulative,
+                    to - frag_cumulative);
             }
 
             prev_end = cur_end;
@@ -826,9 +766,12 @@ struct assembler {
         }
         gtl::vector<SequenceContainerType> seqs;
         for (size_t i = 1; i < ll.size() - 1; ++i) {
-            seqs.emplace_back(rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
-                              lr.pos[i + olc_lcmer_l].second);
-            seqs.back().origin_node = ll[i];
+            const size_t before = seqs.size();
+            SequenceContainerType::append_subseqs(
+                seqs, rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
+                lr.pos[i + olc_lcmer_l].second);
+            for (size_t k = before; k < seqs.size(); ++k)
+                seqs[k].origin_node = ll[i];
         }
         // TODO: index it if needed
         return seqs;
@@ -862,10 +805,7 @@ struct assembler {
                 // good_n.fetch_add(1);
                 lr.clear();
                 gtl::vector<SequenceContainerType> rev_seqs;
-                for (auto it = node.second.seq.rbegin();
-                     it != node.second.seq.rend(); ++it) {
-                    rev_seqs.emplace_back(it->reverse_complement());
-                }
+                rc_vector(node.second.seq, rev_seqs);
                 init_lps_crumbled(&str, rev_seqs, syncmer_functor);
                 lps_deepen(&str, lcp_level);
 
@@ -1114,6 +1054,25 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
     }
 }
 
+// A core's subseq may be stored as a run of records (continued() flag) when it
+// exceeds a fixed record's capacity. Regroup core_seqs into one string per core
+// so per-core checks work in both the heap and fixed-capacity modes.
+[[maybe_unused]] static gtl::vector<std::string> core_strings_(
+    const gtl::vector<SequenceContainerType> &cs) {
+    gtl::vector<std::string> out;
+    std::vector<char> buf(1 << 16);
+    std::string cur;
+    for (const auto &r : cs) {
+        r.convert_to_ascii(buf.data());
+        cur.append(buf.data(), r.len);
+        if (!r.continued()) {
+            out.push_back(cur);
+            cur.clear();
+        }
+    }
+    return out;
+}
+
 TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -1173,21 +1132,20 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
             CHECK_EQ(lr.pos[i].second, lr_original.pos[i].second);
         }
 
-        REQUIRE(lr.cores.size() == core_seqs.size());
-        REQUIRE(lr.pos.size() == core_seqs.size());
+        auto cs_strs = core_strings_(core_seqs);
+        REQUIRE(lr.cores.size() == cs_strs.size());
+        REQUIRE(lr.pos.size() == cs_strs.size());
 
-        // Verify non-overlapping extraction: core_seqs[i] should be [prev_end,
+        // Verify non-overlapping extraction: core i should be [prev_end,
         // cur_end)
-        char buffer[2048];
         size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
+        for (size_t i = 0; i < cs_strs.size(); ++i) {
             size_t cur_end = lr.pos[i].second;
             // Expected is the non-overlapping portion: [prev_end, cur_end)
             std::string expected =
                 concat_ref.substr(prev_end, cur_end - prev_end);
 
-            core_seqs[i].convert_to_ascii(buffer);
-            std::string actual(buffer);
+            std::string actual = cs_strs[i];
 
             INFO("Core ", i, " prev_end=", prev_end, " cur_end=", cur_end);
             CHECK_EQ(expected, actual);
@@ -1228,21 +1186,20 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
             rev_concat_ref += std::string(temp_buf);
         }
 
-        REQUIRE(lr.cores.size() == core_seqs.size());
-        REQUIRE(lr.pos.size() == core_seqs.size());
+        auto cs_strs = core_strings_(core_seqs);
+        REQUIRE(lr.cores.size() == cs_strs.size());
+        REQUIRE(lr.pos.size() == cs_strs.size());
 
-        // Verify non-overlapping extraction: core_seqs[i] should be [prev_end,
+        // Verify non-overlapping extraction: core i should be [prev_end,
         // cur_end)
-        char buffer[2048];
         size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
+        for (size_t i = 0; i < cs_strs.size(); ++i) {
             size_t cur_end = lr.pos[i].second;
             // Expected is the non-overlapping portion: [prev_end, cur_end)
             std::string expected =
                 rev_concat_ref.substr(prev_end, cur_end - prev_end);
 
-            core_seqs[i].convert_to_ascii(buffer);
-            std::string actual(buffer);
+            std::string actual = cs_strs[i];
 
             INFO("Core ", i, " prev_end=", prev_end, " cur_end=", cur_end);
             CHECK_EQ(expected, actual);
@@ -1267,9 +1224,9 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
         // Find non-overlapping portions that span fragment boundaries
         [[maybe_unused]] bool found_spanning_seq = false;
-        char buffer[2048];
+        auto cs_strs = core_strings_(core_seqs);
         size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
+        for (size_t i = 0; i < cs_strs.size(); ++i) {
             size_t cur_end = lr.pos[i].second;
 
             // Check if this non-overlapping portion [prev_end, cur_end) spans a
@@ -1284,8 +1241,7 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
                 // portion
                 std::string expected =
                     concat_ref.substr(prev_end, cur_end - prev_end);
-                core_seqs[i].convert_to_ascii(buffer);
-                std::string actual(buffer);
+                std::string actual = cs_strs[i];
 
                 INFO("Spanning seq ", i, " prev_end=", prev_end,
                      " cur_end=", cur_end, " frag1_end=", frag1_end,
@@ -1331,9 +1287,9 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
         // Find non-overlapping portions that span fragment boundaries
         [[maybe_unused]] bool found_spanning_seq = false;
-        char buffer[2048];
+        auto cs_strs = core_strings_(core_seqs);
         size_t prev_end = 0;
-        for (size_t i = 0; i < core_seqs.size(); ++i) {
+        for (size_t i = 0; i < cs_strs.size(); ++i) {
             size_t cur_end = lr.pos[i].second;
 
             // Check if this non-overlapping portion [prev_end, cur_end) spans a
@@ -1348,8 +1304,7 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
                 // portion
                 std::string expected =
                     rev_concat_ref.substr(prev_end, cur_end - prev_end);
-                core_seqs[i].convert_to_ascii(buffer);
-                std::string actual(buffer);
+                std::string actual = cs_strs[i];
 
                 INFO("Spanning seq ", i, " prev_end=", prev_end,
                      " cur_end=", cur_end, " frag1_end=", frag1_end,

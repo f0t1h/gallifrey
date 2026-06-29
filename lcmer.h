@@ -21,7 +21,45 @@
 
 #include "ext/lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
+#ifdef LASM_CRUMBLED_FIXED
+using SequenceContainerType = CrumbledFixedSeq<LASM_CRUMBLED_FIXED_WORDS>;
+#else
 using SequenceContainerType = CrumbledSubSeq64;
+#endif
+
+// Number of logical subseqs (observations/cores) in a node's seq vector. A
+// logical subseq that overflows a fixed record is split into several records
+// ending in one continued()==false record, so this counts those terminators.
+// For the never-split type it is exactly v.size(). Several graph-cleanup
+// heuristics use this as a length/observation proxy.
+inline size_t logical_seq_count(const gtl::vector<SequenceContainerType> &v) {
+#ifdef LASM_CRUMBLED_FIXED
+    size_t n = 0;
+    for (const auto &r : v)
+        if (!r.continued()) ++n;
+    return n;
+#else
+    return v.size();
+#endif
+}
+
+// Reverse-complement a fragment vector, preserving observation structure. RC
+// reverses record order, so a split observation's run is reversed too; the
+// continued() flag must be rebuilt: dst record for src index i is continued iff
+// i>0 and src[i-1] was continued (i.e. it is not the first record of its src
+// observation, which becomes the last of the reversed observation). For the
+// never-split type set_continued is a no-op, so this reduces to the plain RC.
+inline void rc_vector(const gtl::vector<SequenceContainerType> &src,
+                      gtl::vector<SequenceContainerType> &dst) {
+    const size_t n = src.size();
+    dst.reserve(n);
+    for (auto it = src.rbegin(); it != src.rend(); ++it)
+        dst.emplace_back(it->reverse_complement());
+    for (size_t p = 0; p < n; ++p) {
+        const size_t i = n - 1 - p;  // src index for dst[p]
+        dst[p].set_continued(i > 0 && src[i - 1].continued());
+    }
+}
 
 struct lcp_bit_type {
     uint64_t hi;
@@ -416,6 +454,57 @@ struct KmerViewOnCrumbs {
     constexpr int_type get() const noexcept { return value; }
 };
 
+// Forward base cursor presenting a vector of CrumbledSubSeq fragments as one
+// seamless base stream. Tracks the global real-base position `g`, which equals
+// the per-fragment driver's `l_so_far + it1 - skip_first_n`. Crossing a
+// fragment boundary leaves `g` continuous, so boundaries are invisible to the
+// k-mer/RLE scan -- a long sequence split across records yields identical cores
+// to the same sequence in one record. Cost: one increment + one (well
+// predicted) branch per base; the branch fires only at fragment ends.
+struct CrumbCursor {
+    const gtl::vector<SequenceContainerType> *seqs;
+    const uint64_t *words = nullptr;
+    size_t frag = 0;
+    size_t off = 0;   // data offset within current fragment (includes skip)
+    size_t end = 0;   // cap of current fragment = len + skip
+    size_t g = 0;     // global real-base position (excludes skip padding)
+    bool obs_boundary = false;  // transient: just crossed a continued()==false end
+
+    explicit CrumbCursor(const gtl::vector<SequenceContainerType> &s)
+        : seqs(&s) {
+        load_frag();
+    }
+    void load_frag() {
+        while (frag < seqs->size() && (*seqs)[frag].len == 0) ++frag;
+        if (frag < seqs->size()) {
+            const auto &f = (*seqs)[frag];
+            words = f.words();
+            off = static_cast<size_t>(f.skip_first_n);
+            end = static_cast<size_t>(f.len) +
+                  static_cast<size_t>(f.skip_first_n);
+        }
+    }
+    bool at_end() const { return frag >= seqs->size(); }
+    uint8_t cur() const {
+        const size_t bit = off * 2;
+        return static_cast<uint8_t>((words[bit >> 6] >> (bit & 63)) & 3u);
+    }
+    // Advance one real base. A continued()==true record flows seamlessly into
+    // the next (a single subseq was split across records). A continued()==false
+    // record end is an observation boundary -> set obs_boundary so the scan
+    // restarts there, reproducing the original per-record seam exactly.
+    void advance() {
+        ++off;
+        ++g;
+        if (off >= end) {
+            const bool cont = (*seqs)[frag].continued();
+            ++frag;
+            load_frag();
+            if (!cont) obs_boundary = true;
+        }
+    }
+};
+
 // Crumb view for 64-bit packed sequences (2 bits/base, 32 bases/word).
 template <class INT_TYPE = uint64_t>
 struct KmerViewOnCrumbs64 {
@@ -461,6 +550,32 @@ struct KmerViewOnCrumbs64 {
         value = ((value << 2) & kmask) | at;
         prev = at;
         return index + 1;
+    }
+
+    // Seamless variants: identical RLE/shift logic, but bases come from a
+    // CrumbCursor that spans fragments. For a single-fragment cursor these
+    // behave bit-identically to the indexed versions above; across fragments
+    // a run is collapsed continuously (no per-record seam).
+    void move_get_rle(CrumbCursor &c) {
+        c.obs_boundary = false;  // consume the transient signal from last cross
+        if (c.at_end()) return;
+        uint8_t at = c.cur();
+        while (at == prev) {
+            c.advance();
+            // Stop at the whole-stream end OR an observation boundary, without
+            // shifting -- matching the original move_get_rle's end-of-record
+            // early return; the next observation is re-scanned from its start.
+            if (c.at_end() || c.obs_boundary) return;
+            at = c.cur();
+        }
+        value = ((value << 2) & kmask) | at;
+        prev = at;
+        c.advance();
+    }
+    void fill_rle(CrumbCursor &c) {
+        move_get_rle(c);
+        for (int_type i = 0; i < k && !c.at_end() && !c.obs_boundary; i++)
+            move_get_rle(c);
     }
     constexpr int_type get() const noexcept { return value; }
     char *to_string() const {
@@ -1066,28 +1181,21 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         return core_index;
     }
     KmerViewOnCrumbs64<uint64_t> kmer_view{syncmer_functor.k()};
-    size_t it1 =
-        kmer_view.fill_rle(sseqs[0].data, sseqs[0].len + sseqs[0].skip_first_n,
-                           sseqs[0].skip_first_n);
-    size_t l_so_far = 0;
-    for (size_t i = 0; i < sseqs.size(); ++i) {
-        for (; it1 < sseqs[i].len + sseqs[i].skip_first_n;) {
-            if (syncmer_functor(kmer_view.get())) {
-                init_core_kmer<uint32_t>(&(str->cores[core_index]),
-                                         kmer_view.get(),
-                                         l_so_far + it1 - sseqs[i].skip_first_n,
-                                         l_so_far + it1 + syncmer_functor.k() -
-                                             sseqs[i].skip_first_n,
-                                         syncmer_functor.k());
-                core_index++;
-            }
-            it1 = kmer_view.move_get_rle(sseqs[i].data, it1,
-                                         sseqs[i].len + sseqs[i].skip_first_n);
+    // Scan the whole fragment vector as one seamless base stream. cur.g is the
+    // global real-base position, identical to the old driver's
+    // `l_so_far + it1 - skip_first_n`, so core positions are unchanged -- but
+    // there is no per-fragment seam, so splitting a sequence across records
+    // produces the same cores as keeping it whole.
+    CrumbCursor cur(sseqs);
+    kmer_view.fill_rle(cur);
+    while (!cur.at_end()) {
+        if (syncmer_functor(kmer_view.get())) {
+            init_core_kmer<uint32_t>(&(str->cores[core_index]), kmer_view.get(),
+                                     cur.g, cur.g + syncmer_functor.k(),
+                                     syncmer_functor.k());
+            core_index++;
         }
-        if (sseqs.size() > i + 1) {
-            it1 = sseqs[i + 1].skip_first_n;
-        }
-        l_so_far += sseqs[i].len;
+        kmer_view.move_get_rle(cur);
     }
     return core_index;
 }

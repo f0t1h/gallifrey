@@ -29,6 +29,13 @@ endif()
 enable_testing()
 # Build options
 option(LASM_NATIVE "Optimize for the build host CPU (-march=native); produces non-portable binaries" OFF)
+# Small-string optimization for CrumbledSubSeq64: store short sequences inline
+# in the struct (no heap alloc, no pointer-chase) instead of pointing to heap.
+option(LASM_CRUMBLED_SSO "Enable inline (SSO) storage for CrumbledSubSeq64" OFF)
+set(LASM_CRUMBLED_SSO_WORDS "" CACHE STRING "Inline word capacity for CrumbledSubSeq64 SSO (default 14 -> 128B struct)")
+# Fixed-capacity, never-heap storage: long subseqs split into multiple records.
+option(LASM_CRUMBLED_FIXED "Enable fixed-capacity (split-on-overflow) CrumbledFixedSeq" OFF)
+set(LASM_CRUMBLED_FIXED_WORDS "" CACHE STRING "Inline word capacity per CrumbledFixedSeq record (default 8 -> 80B struct, 256 bases)")
 
 # Compiler flags
 # Debug flags
@@ -48,6 +55,22 @@ if(LASM_NATIVE)
     add_compile_options($<$<CONFIG:RelWithDebInfo>:-mtune=native>)
 endif()
 
+if(LASM_CRUMBLED_SSO)
+    message(STATUS "CrumbledSubSeq64: inline SSO storage ENABLED")
+    add_compile_definitions(LASM_CRUMBLED_SSO)
+    if(NOT LASM_CRUMBLED_SSO_WORDS STREQUAL "")
+        add_compile_definitions(LASM_CRUMBLED_SSO_WORDS=${LASM_CRUMBLED_SSO_WORDS})
+    endif()
+endif()
+
+if(LASM_CRUMBLED_FIXED)
+    message(STATUS "CrumbledFixedSeq: fixed-capacity (split-on-overflow) ENABLED")
+    add_compile_definitions(LASM_CRUMBLED_FIXED)
+    if(NOT LASM_CRUMBLED_FIXED_WORDS STREQUAL "")
+        add_compile_definitions(LASM_CRUMBLED_FIXED_WORDS=${LASM_CRUMBLED_FIXED_WORDS})
+    endif()
+endif()
+
 if(PGO_GENERATE)
     message(STATUS "Building with PGO instrumentation")
     add_compile_options(-fprofile-generate)
@@ -65,7 +88,7 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(HTS REQUIRED IMPORTED_TARGET htslib)
 
-set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp dump_cores.cpp)
+set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp dump_cores.cpp bench_layout.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE ./ext)

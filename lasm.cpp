@@ -8,6 +8,7 @@
 #define LCPTOOLS_IMPL
 #include "asm.h"
 #include "bamdoctor.h"
+#include "bench_layout.h"
 #include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
 using std::string;
@@ -178,6 +179,7 @@ int main(int argc, char **argv) {
     AsmProgram hifi{app};
     SamReadTesting bamdoctor{app};
     DumpCoresProgram dumpcores{app};
+    BenchLayoutProgram benchlayout{app};
 
     CLI11_PARSE(app, argc, argv);
     return 0;

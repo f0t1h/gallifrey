@@ -699,6 +699,18 @@ inline gtl::vector<SequenceContainerType> collect_path_sequences(
     gtl::vector<SequenceContainerType> merged_seqs;
     merged_seqs.reserve(n_nodes);
 
+    // A long core may be stored as several consecutive records (continued()
+    // flag). Map each contig's core ordinal -> first record index so a core can
+    // be regrouped. For the never-split type this is just the identity.
+    gtl::flat_hash_map<size_t, gtl::vector<uint32_t>> core_first;
+    for (auto &[cid, recs] : contig_core_seqs) {
+        auto &cf = core_first[cid];
+        if (recs.empty()) continue;
+        cf.push_back(0);
+        for (size_t r = 0; r + 1 < recs.size(); ++r)
+            if (!recs[r].continued()) cf.push_back(static_cast<uint32_t>(r + 1));
+    }
+
     for (size_t ci = 0; ci < paths.size(); ++ci) {
         if (ci > 0 && !merged_seqs.empty())
             merged_seqs.emplace_back(0, 0);
@@ -747,11 +759,19 @@ inline gtl::vector<SequenceContainerType> collect_path_sequences(
             emit_contig = use_contig;
 
             auto cs_it = contig_core_seqs.find(use_contig);
+            auto cf_it = core_first.find(use_contig);
             if (cs_it != contig_core_seqs.end() &&
-                use_core < cs_it->second.size()) {
-                auto &core_seq = cs_it->second[use_core];
-                if (core_seq.len > 0)
-                    merged_seqs.push_back(std::move(core_seq));
+                cf_it != core_first.end() &&
+                use_core < cf_it->second.size()) {
+                auto &recs = cs_it->second;
+                // Emit the whole record run of core `use_core`.
+                for (size_t r = cf_it->second[use_core]; r < recs.size();) {
+                    const bool last = !recs[r].continued();
+                    if (recs[r].len > 0)
+                        merged_seqs.push_back(std::move(recs[r]));
+                    ++r;
+                    if (last) break;
+                }
             }
         }
     }
@@ -808,15 +828,13 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             if (!nodes[pick].is_forward_lane) {
                 const auto &raw = *nodes[pick].raw_seqs;
                 gtl::vector<SequenceContainerType> rev;
-                rev.reserve(raw.size());
-                for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
-                    rev.emplace_back(rit->reverse_complement());
+                rc_vector(raw, rev);
                 return rev;
             }
             const auto &raw = *nodes[pick].raw_seqs;
             gtl::vector<SequenceContainerType> result;
-            result.reserve(1);
-            result.emplace_back(raw.begin(), raw.end());
+            SequenceContainerType::append_concat(result, raw.begin(),
+                                                 raw.end());
             return result;
         }
     }
@@ -833,9 +851,7 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
         gtl::vector<SequenceContainerType> rev_seqs;
         const gtl::vector<SequenceContainerType> *seqs_ptr = &raw;
         if (!nodes[ci].is_forward_lane) {
-            rev_seqs.reserve(raw.size());
-            for (auto rit = raw.rbegin(); rit != raw.rend(); ++rit)
-                rev_seqs.emplace_back(rit->reverse_complement());
+            rc_vector(raw, rev_seqs);
             seqs_ptr = &rev_seqs;
         }
 
@@ -847,9 +863,9 @@ inline gtl::vector<SequenceContainerType> build_layout_sequence_from_nodes(
             size_t total_len = 0;
             for (const auto &f : frags) total_len += f.len;
             if (total_len == 0) continue;
-            SequenceContainerType synth(frags.begin(), frags.end());
             gtl::vector<SequenceContainerType> synth_vec;
-            synth_vec.push_back(std::move(synth));
+            SequenceContainerType::append_concat(synth_vec, frags.begin(),
+                                                 frags.end());
             lcp_read synth_lr;
             synth_lr.cores.push_back(0);
             synth_lr.pos.emplace_back(0u, static_cast<uint32_t>(total_len));

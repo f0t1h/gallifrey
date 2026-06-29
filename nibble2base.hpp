@@ -1,6 +1,7 @@
 #ifndef NIBBLE2BASE_HPP
 #define NIBBLE2BASE_HPP
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstring>
@@ -256,14 +257,107 @@ T reverse_complement_kmer(T kmer, int K) {
     return kmer;
 }
 
+// Small-string-optimization (SSO) toggle. When LASM_CRUMBLED_SSO is defined,
+// CrumbledSubSeq64 stores its packed words inline (in a union over the data
+// pointer slot) whenever they fit in LASM_CRUMBLED_SSO_WORDS words, avoiding a
+// heap allocation and the dependent pointer-chase on access. Otherwise it keeps
+// the original pointer-to-heap behaviour. All sequence-data access goes through
+// words(); skip_first_n semantics are identical in both modes (the inline
+// buffer holds the exact same bit layout a heap buffer would).
+
+#ifdef LASM_CRUMBLED_SSO
+#ifndef LASM_CRUMBLED_SSO_WORDS
+#define LASM_CRUMBLED_SSO_WORDS 14  // 14*8 = 112 B inline -> 128 B struct
+#endif
+
+#endif
 // 64-bit packed variant: 32 bases per word, 2 bits per base.
 struct CrumbledSubSeq64 {
+#ifdef LASM_CRUMBLED_SSO
+    size_t len : 57;
+    bool is_inline : 1;
+    int skip_first_n : 6;  // offset within first word in bases (0-31)
+    uint64_t origin_node;
+    union {
+        uint64_t *heap_;
+        uint64_t inline_[LASM_CRUMBLED_SSO_WORDS];
+    } store_;
+#else
     size_t len : 58;
     int skip_first_n : 6;  // offset within first word in bases (0-31)
     uint64_t *data;
     uint64_t origin_node;
+#endif
     struct from_ascii {};
     struct from_nibbles {};
+
+    // Single point of access to the packed words (inline or heap).
+    const uint64_t *words() const {
+#ifdef LASM_CRUMBLED_SSO
+        return is_inline ? store_.inline_ : store_.heap_;
+#else
+        return data;
+#endif
+    }
+    uint64_t *words() {
+#ifdef LASM_CRUMBLED_SSO
+        return is_inline ? store_.inline_ : store_.heap_;
+#else
+        return data;
+#endif
+    }
+    // Set up zeroed storage for `nwords` words (inline if it fits, else heap).
+    void alloc_words_(size_t nwords) {
+#ifdef LASM_CRUMBLED_SSO
+        if (nwords <= LASM_CRUMBLED_SSO_WORDS) {
+            is_inline = true;
+            std::memset(store_.inline_, 0, sizeof(store_.inline_));
+        } else {
+            is_inline = false;
+            store_.heap_ = new uint64_t[nwords]();
+        }
+#else
+        data = new uint64_t[nwords]();
+#endif
+    }
+    void free_words_() {
+#ifdef LASM_CRUMBLED_SSO
+        if (!is_inline) delete[] store_.heap_;
+#else
+        delete[] data;
+#endif
+    }
+    // Never split (heap-backed): each logical subseq is exactly one record, so
+    // a core is never continued. Mirrors CrumbledFixedSeq::continued() so the
+    // per-core consumers use one code path in both modes.
+    bool continued() const { return false; }
+    void set_continued(bool) {}  // no-op: never split
+
+    // Uniform append API (single-record here; CrumbledFixedSeq splits).
+    template <class Vec>
+    static void append_nibbles(Vec &v, const uint8_t *nibbles, size_t from,
+                               size_t to, uint64_t origin) {
+        if (to > from) v.emplace_back(nibbles, from, to, origin, from_nibbles{});
+    }
+    template <class Vec>
+    static void append_ascii(Vec &v, const char *bases, size_t from, size_t to,
+                             uint64_t origin) {
+        if (to > from) v.emplace_back(bases, from, to, origin, from_ascii{});
+    }
+    template <class Vec>
+    static void append_subseqs(Vec &v, const gtl::vector<CrumbledSubSeq64> &s,
+                               size_t from, size_t to) {
+        v.emplace_back(s, from, to);
+    }
+    template <class Vec>
+    static void append_subseqs(Vec &v, const gtl::vector<CrumbledSubSeq64> &s,
+                               size_t start_idx, size_t from, size_t to) {
+        v.emplace_back(s, start_idx, from, to);
+    }
+    template <class Vec, class It>
+    static void append_concat(Vec &v, It first, It last) {
+        v.emplace_back(first, last);
+    }
 
     static constexpr size_t bases_per_word = 32;
     static constexpr size_t storage_size(size_t bases) noexcept {
@@ -313,13 +407,15 @@ struct CrumbledSubSeq64 {
     CrumbledSubSeq64(const uint8_t *nibbles, size_t from, size_t to,
                      uint64_t origin_node, from_nibbles) noexcept
         : len(to - from),
+#ifdef LASM_CRUMBLED_SSO
+          is_inline(true),
+#endif
           skip_first_n(static_cast<uint8_t>(from & 31)),
-          data(nullptr),
           origin_node(origin_node) {
         const size_t aligned_from = from & ~static_cast<size_t>(31);
         const size_t total_bases = (to - aligned_from);
-        data = new uint64_t[storage_size(total_bases)]();
-        pack_range(data, aligned_from, to, [&](size_t idx) {
+        alloc_words_(storage_size(total_bases));
+        pack_range(words(), aligned_from, to, [&](size_t idx) {
             return static_cast<uint64_t>(seq_nt16_int[bam_seqi(nibbles, idx)]);
         });
     }
@@ -331,38 +427,56 @@ struct CrumbledSubSeq64 {
     CrumbledSubSeq64(const char *bases, size_t from, size_t to,
                      uint64_t origin_node, from_ascii) noexcept
         : len(to - from),
+#ifdef LASM_CRUMBLED_SSO
+          is_inline(true),
+#endif
           skip_first_n(static_cast<uint8_t>(from & 31)),
-          data(nullptr),
           origin_node(origin_node) {
         const size_t aligned_from = from & ~static_cast<size_t>(31);
         const size_t total_bases = (to - aligned_from);
-        data = new uint64_t[storage_size(total_bases)]();
-        pack_range(data, aligned_from, to, [&](size_t idx) {
+        alloc_words_(storage_size(total_bases));
+        pack_range(words(), aligned_from, to, [&](size_t idx) {
             return static_cast<uint64_t>(base_to_code(bases[idx]));
         });
     }
 
     CrumbledSubSeq64(size_t length, uint8_t skip_bases) noexcept
         : len(length),
+#ifdef LASM_CRUMBLED_SSO
+          is_inline(true),
+#endif
           skip_first_n(static_cast<uint8_t>(skip_bases & 63)),
-          data(new uint64_t[storage_size(length + skip_bases)]()),
-          origin_node(0) {}
+          origin_node(0) {
+        alloc_words_(storage_size(length + skip_bases));
+    }
     CrumbledSubSeq64() noexcept : CrumbledSubSeq64(0, 0) {}
     CrumbledSubSeq64(CrumbledSubSeq64 &&other) noexcept
         : len(other.len),
+#ifdef LASM_CRUMBLED_SSO
+          is_inline(other.is_inline),
+#endif
           skip_first_n(other.skip_first_n),
-          data(other.data),
           origin_node(other.origin_node) {
+#ifdef LASM_CRUMBLED_SSO
+        store_ = other.store_;       // bitwise: copies inline data or pointer
+        other.is_inline = true;      // neutralize: source dtor frees nothing
+        other.len = 0;
+#else
+        data = other.data;
         other.data = nullptr;
+#endif
         other.origin_node = 0;
     }
 
     template <std::forward_iterator It>
     CrumbledSubSeq64(It first, It last)
         : len(combined_length(first, last)),
+#ifdef LASM_CRUMBLED_SSO
+          is_inline(true),
+#endif
           skip_first_n(0),
-          data(new uint64_t[storage_size(len + 32)]()),
           origin_node(0) {
+        alloc_words_(storage_size(len + 32));
         size_t dest_pos = 0;
         for (auto it = first; it != last; ++it) {
             const auto &frag = *it;
@@ -370,9 +484,9 @@ struct CrumbledSubSeq64 {
                 const size_t src_bit =
                     (static_cast<size_t>(frag.skip_first_n) + b) * 2;
                 const uint64_t code =
-                    (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                    (frag.words()[src_bit >> 6] >> (src_bit & 63)) & 0x3;
                 const size_t dst_bit = dest_pos * 2;
-                data[dst_bit >> 6] |= code << (dst_bit & 63);
+                words()[dst_bit >> 6] |= code << (dst_bit & 63);
                 ++dest_pos;
             }
             origin_node = frag.origin_node;
@@ -381,7 +495,12 @@ struct CrumbledSubSeq64 {
 
     CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t start_idx, size_t from,
                      size_t to)
-        : len{to - from}, skip_first_n{0}, data{new uint64_t[storage_size(to - from + 32)]()}, origin_node{0} {
+        : len{to - from},
+#ifdef LASM_CRUMBLED_SSO
+          is_inline{true},
+#endif
+          skip_first_n{0}, origin_node{0} {
+        alloc_words_(storage_size(to - from + 32));
         size_t sub_len = (from < to) ? (to - from) : 0;
         if (sub_len == 0 || subseqs.empty()) {
             return;
@@ -408,9 +527,9 @@ struct CrumbledSubSeq64 {
                 for (size_t b = 0; b < copy_len; ++b) {
                     size_t src_bit = (frag.skip_first_n + local_from + b) * 2;
                     uint64_t code =
-                        (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                        (frag.words()[src_bit >> 6] >> (src_bit & 63)) & 0x3;
                     size_t dst_bit = dest_pos * 2;
-                    data[dst_bit >> 6] |= code << (dst_bit & 63);
+                    words()[dst_bit >> 6] |= code << (dst_bit & 63);
                     ++dest_pos;
                 }
                 origin_node = frag.origin_node;
@@ -420,7 +539,12 @@ struct CrumbledSubSeq64 {
     };
     CrumbledSubSeq64(const gtl::vector<CrumbledSubSeq64> &subseqs, size_t from,
                      size_t to)
-        : len{to - from}, skip_first_n{0}, data{new uint64_t[storage_size(to - from + 32)]()}, origin_node{0} {
+        : len{to - from},
+#ifdef LASM_CRUMBLED_SSO
+          is_inline{true},
+#endif
+          skip_first_n{0}, origin_node{0} {
+        alloc_words_(storage_size(to - from + 32));
         size_t sub_len = (from < to) ? (to - from) : 0;
         if (sub_len == 0 || subseqs.empty()) {
             return;
@@ -447,9 +571,9 @@ struct CrumbledSubSeq64 {
                 for (size_t b = 0; b < copy_len; ++b) {
                     size_t src_bit = (frag.skip_first_n + local_from + b) * 2;
                     uint64_t code =
-                        (frag.data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+                        (frag.words()[src_bit >> 6] >> (src_bit & 63)) & 0x3;
                     size_t dst_bit = dest_pos * 2;
-                    data[dst_bit >> 6] |= code << (dst_bit & 63);
+                    words()[dst_bit >> 6] |= code << (dst_bit & 63);
                     ++dest_pos;
                 }
                 origin_node = frag.origin_node;
@@ -457,30 +581,32 @@ struct CrumbledSubSeq64 {
             cumulative += frag.len;
         }
     };
-    CrumbledSubSeq64(size_t len, int skip_first_n, uint64_t *data,
-                     uint64_t origin_node) noexcept
-        : len{len},
-          skip_first_n{skip_first_n},
-          data(data),
-          origin_node(origin_node) {}
     static CrumbledSubSeq64 copy_of(const CrumbledSubSeq64 &other) {
+        CrumbledSubSeq64 r(other.len,
+                           static_cast<uint8_t>(other.skip_first_n));
         const size_t words = storage_size(other.len + other.skip_first_n);
-        uint64_t *copied_data = new uint64_t[words]();
-        std::memcpy(copied_data, other.data, words * sizeof(uint64_t));
-        return CrumbledSubSeq64(other.len, other.skip_first_n, copied_data,
-                                other.origin_node);
+        std::memcpy(r.words(), other.words(), words * sizeof(uint64_t));
+        r.origin_node = other.origin_node;
+        return r;
     }
     CrumbledSubSeq64(const CrumbledSubSeq64 &other) = delete;
     CrumbledSubSeq64 &operator=(const CrumbledSubSeq64 &other) = delete;
-    ~CrumbledSubSeq64() { delete[] data; }
+    ~CrumbledSubSeq64() { free_words_(); }
     CrumbledSubSeq64 &operator=(CrumbledSubSeq64 &&other) noexcept {
         if (this != &other) {
-            delete[] data;
-            data = other.data;
-            skip_first_n = other.skip_first_n;
+            free_words_();
             len = other.len;
+            skip_first_n = other.skip_first_n;
             origin_node = other.origin_node;
+#ifdef LASM_CRUMBLED_SSO
+            is_inline = other.is_inline;
+            store_ = other.store_;
+            other.is_inline = true;
+            other.len = 0;
+#else
+            data = other.data;
             other.data = nullptr;
+#endif
             other.origin_node = 0;
         }
         return *this;
@@ -490,11 +616,12 @@ struct CrumbledSubSeq64 {
         static constexpr const char *lut = "ACGT";
         size_t base_index = 0;
 
+        const uint64_t *w = words();
         auto scalar_emit = [&](size_t count) {
             const size_t bit_base = static_cast<size_t>(skip_first_n) * 2;
             for (size_t i = 0; i < count; ++i) {
                 const size_t bit_index = bit_base + (base_index + i) * 2;
-                const uint64_t word = data[bit_index >> 6];
+                const uint64_t word = w[bit_index >> 6];
                 buffer[base_index + i] = lut[(word >> (bit_index & 63)) & 0x3];
             }
             base_index += count;
@@ -507,40 +634,294 @@ struct CrumbledSubSeq64 {
 
     [[nodiscard]] CrumbledSubSeq64 reverse_complement() const {
         CrumbledSubSeq64 rc{len, 0};
+        const uint64_t *src = words();
+        uint64_t *dst = rc.words();
         for (size_t i = 0; i < len; ++i) {
             const size_t src_bit = (skip_first_n + (len - 1 - i)) * 2;
-            const uint64_t code = (data[src_bit >> 6] >> (src_bit & 63)) & 0x3;
+            const uint64_t code = (src[src_bit >> 6] >> (src_bit & 63)) & 0x3;
             const uint64_t complement = code ^ 0x3;
             const size_t dst_bit = i * 2;
-            rc.data[dst_bit >> 6] |= complement << (dst_bit & 63);
+            dst[dst_bit >> 6] |= complement << (dst_bit & 63);
         }
         return rc;
     }
     [[nodiscard]] CrumbledSubSeq64 reverse_complement_old() const {
         assert(skip_first_n >= 0);
         CrumbledSubSeq64 rc{len, 31};
+        const uint64_t *src = words();
+        uint64_t *dst = rc.words();
         if (len < 32) {
             // Fix the skip_first
-            uint64_t word = (data[0] >> skip_first_n * 2);
+            uint64_t word = (src[0] >> skip_first_n * 2);
             if (storage_size(len + skip_first_n) > 1) {
-                word |= (data[1] << (64 - skip_first_n * 2));
+                word |= (src[1] << (64 - skip_first_n * 2));
             }
 
-            rc.data[0] = reverse_complement_kmer(word, len);
+            dst[0] = reverse_complement_kmer(word, len);
             rc.skip_first_n = 0;
             return rc;
         }
         size_t num_blocks = storage_size(len + skip_first_n);
         for (size_t i = 0; i < num_blocks - 1; ++i) {
-            rc.data[num_blocks - i - 1] = reverse_complement_kmer(data[i], 32);
+            dst[num_blocks - i - 1] = reverse_complement_kmer(src[i], 32);
         }
         if ((len + skip_first_n) % 32 != 0)
-            rc.data[0] = reverse_complement_kmer(data[num_blocks - 1],
-                                                 (len + skip_first_n) % 32);
+            dst[0] = reverse_complement_kmer(src[num_blocks - 1],
+                                             (len + skip_first_n) % 32);
         rc.skip_first_n = (num_blocks * 32 - len) - skip_first_n;
         return rc;
     }
 };
+
+#ifdef LASM_CRUMBLED_FIXED
+#ifndef LASM_CRUMBLED_FIXED_WORDS
+#define LASM_CRUMBLED_FIXED_WORDS 8
+#endif
+
+// Fixed-capacity, never-heap variant. Each record stores up to N*32 bases
+// inline (2 bits/base). A logical subsequence longer than the capacity is
+// stored as several consecutive records in the same vector; since every
+// CrumbledSubSeq64 vector is consumed as a concatenation, this is transparent.
+// The struct is trivially copyable: no pointer, no heap, no destructor work.
+// skip_first_n is always 0 (records pack from bit 0); the field is retained so
+// the concatenation/k-mer consumers that read it keep working unchanged.
+template <int N>
+struct CrumbledFixedSeq {
+    static constexpr size_t bases_per_word = 32;
+    static constexpr size_t capacity_bases = static_cast<size_t>(N) * bases_per_word;
+
+    size_t len : 57;       // bases stored in THIS record (0 .. capacity_bases)
+    bool cont_ : 1;        // true => the NEXT record continues the same core
+    int skip_first_n : 6;  // always 0
+    uint64_t origin_node;
+    uint64_t words_[N];
+
+    struct from_ascii {};
+    struct from_nibbles {};
+
+    const uint64_t *words() const { return words_; }
+    uint64_t *words() { return words_; }
+    // True when the following record in the vector is part of the same logical
+    // core/subseq (set by the splitting append_* helpers). Concatenation
+    // consumers ignore it; per-core consumers use it to regroup split cores.
+    bool continued() const { return cont_; }
+    void set_continued(bool b) { cont_ = b; }
+
+    static constexpr size_t storage_size(size_t bases) noexcept {
+        return bases / bases_per_word + 1;
+    }
+    static inline uint8_t base_to_code(char c) {
+        switch (c) {
+            case 'c':
+            case 'C':
+                return 1;
+            case 'g':
+            case 'G':
+                return 2;
+            case 'u':
+            case 'U':
+            case 't':
+            case 'T':
+                return 3;
+            default:
+                return 0;
+        }
+    }
+    template <std::forward_iterator It>
+    static size_t combined_length(It first, It last) {
+        size_t total = 0;
+        for (auto it = first; it != last; ++it)
+            total += static_cast<size_t>((*it).len);
+        return total;
+    }
+
+    CrumbledFixedSeq() noexcept
+        : len(0), cont_(false), skip_first_n(0), origin_node(0) {
+        std::memset(words_, 0, sizeof(words_));
+    }
+    // Zeroed record of `length` bases (length <= capacity_bases).
+    CrumbledFixedSeq(size_t length, uint8_t /*skip*/) noexcept
+        : len(length), cont_(false), skip_first_n(0), origin_node(0) {
+        assert(length <= capacity_bases);
+        std::memset(words_, 0, sizeof(words_));
+    }
+    // Single-record packers. The range MUST fit (<= capacity_bases); callers
+    // that may exceed it use the append_* helpers below, which split.
+    CrumbledFixedSeq(const uint8_t *nibbles, size_t from, size_t to,
+                     uint64_t origin, from_nibbles) noexcept
+        : len(to - from), cont_(false), skip_first_n(0), origin_node(origin) {
+        assert(len <= capacity_bases);
+        std::memset(words_, 0, sizeof(words_));
+        for (size_t i = 0; i < len; ++i) {
+            const uint64_t code =
+                static_cast<uint64_t>(seq_nt16_int[bam_seqi(nibbles, from + i)]) & 0x3;
+            const size_t bit = i * 2;
+            words_[bit >> 6] |= code << (bit & 63);
+        }
+    }
+    CrumbledFixedSeq(const uint8_t *nibbles, size_t from, size_t to,
+                     uint64_t origin) noexcept
+        : CrumbledFixedSeq(nibbles, from, to, origin, from_nibbles{}) {}
+    CrumbledFixedSeq(const char *bases, size_t from, size_t to, uint64_t origin,
+                     from_ascii) noexcept
+        : len(to - from), cont_(false), skip_first_n(0), origin_node(origin) {
+        assert(len <= capacity_bases);
+        std::memset(words_, 0, sizeof(words_));
+        for (size_t i = 0; i < len; ++i) {
+            const uint64_t code = base_to_code(bases[from + i]) & 0x3;
+            const size_t bit = i * 2;
+            words_[bit >> 6] |= code << (bit & 63);
+        }
+    }
+    // Iterator-concat into a SINGLE record (combined length must fit). Used by
+    // tests / callers that want a single object; long merges use append_concat.
+    template <std::forward_iterator It>
+    CrumbledFixedSeq(It first, It last)
+        : len(combined_length(first, last)),
+          cont_(false),
+          skip_first_n(0),
+          origin_node(0) {
+        assert(len <= capacity_bases);
+        std::memset(words_, 0, sizeof(words_));
+        size_t dest = 0;
+        for (auto it = first; it != last; ++it) {
+            const auto &frag = *it;
+            for (size_t b = 0; b < frag.len; ++b) {
+                const size_t sbit = (frag.skip_first_n + b) * 2;
+                const uint64_t code = (frag.words()[sbit >> 6] >> (sbit & 63)) & 0x3;
+                const size_t dbit = dest * 2;
+                words_[dbit >> 6] |= code << (dbit & 63);
+                ++dest;
+            }
+            origin_node = frag.origin_node;
+        }
+    }
+
+    char *convert_to_ascii(char *buffer) const {
+        static constexpr const char *lut = "ACGT";
+        for (size_t i = 0; i < len; ++i) {
+            const size_t bit = i * 2;
+            buffer[i] = lut[(words_[bit >> 6] >> (bit & 63)) & 0x3];
+        }
+        buffer[len] = '\0';
+        return buffer;
+    }
+    // Length-preserving: input is <= capacity_bases, so output is one record.
+    [[nodiscard]] CrumbledFixedSeq reverse_complement() const {
+        CrumbledFixedSeq rc(len, 0);
+        for (size_t i = 0; i < len; ++i) {
+            const size_t sbit = (len - 1 - i) * 2;
+            const uint64_t code = (words_[sbit >> 6] >> (sbit & 63)) & 0x3;
+            const size_t dbit = i * 2;
+            rc.words_[dbit >> 6] |= (code ^ 0x3) << (dbit & 63);
+        }
+        return rc;  // origin_node intentionally left 0 (matches old behaviour)
+    }
+    static CrumbledFixedSeq copy_of(const CrumbledFixedSeq &other) {
+        return other;  // trivially copyable
+    }
+
+    // ---- splitting append helpers -------------------------------------
+    // Universal primitive: append ceil(total_len/capacity_bases) records,
+    // pulling each logical base code from fetch(global_index).
+    template <class Vec, class Fetch>
+    static void append_fetch(Vec &v, size_t total_len, uint64_t origin,
+                             Fetch &&fetch) {
+        size_t done = 0;
+        while (done < total_len) {
+            const size_t chunk = std::min(capacity_bases, total_len - done);
+            v.emplace_back(chunk, static_cast<uint8_t>(0));
+            CrumbledFixedSeq &rec = v.back();
+            rec.origin_node = origin;
+            for (size_t b = 0; b < chunk; ++b) {
+                const uint64_t code = fetch(done + b) & 0x3;
+                const size_t bit = b * 2;
+                rec.words_[bit >> 6] |= code << (bit & 63);
+            }
+            done += chunk;
+            rec.cont_ = (done < total_len);  // more records follow => continued
+        }
+    }
+    template <class Vec>
+    static void append_nibbles(Vec &v, const uint8_t *nibbles, size_t from,
+                               size_t to, uint64_t origin) {
+        if (to <= from) return;
+        append_fetch(v, to - from, origin, [&](size_t i) -> uint64_t {
+            return seq_nt16_int[bam_seqi(nibbles, from + i)];
+        });
+    }
+    template <class Vec>
+    static void append_ascii(Vec &v, const char *bases, size_t from, size_t to,
+                             uint64_t origin) {
+        if (to <= from) return;
+        append_fetch(v, to - from, origin, [&](size_t i) -> uint64_t {
+            return base_to_code(bases[from + i]);
+        });
+    }
+    // Extract concatenated range [from,to) of `subseqs` into split records.
+    template <class Vec>
+    static void append_subseqs(Vec &v, const gtl::vector<CrumbledFixedSeq> &subseqs,
+                               size_t start_idx, size_t from, size_t to) {
+        const size_t sub_len = (from < to) ? (to - from) : 0;
+        if (sub_len == 0 || subseqs.empty()) return;
+        // Pre-create zeroed records so any range not covered by a fragment
+        // stays 0 (matches the old buffer-then-scatter-fill behaviour).
+        const size_t first_rec = v.size();
+        for (size_t done = 0; done < sub_len; done += capacity_bases)
+            v.emplace_back(std::min(capacity_bases, sub_len - done),
+                           static_cast<uint8_t>(0));
+        // Mark all but the last record of THIS subseq as continued.
+        for (size_t r = first_rec; r + 1 < v.size(); ++r) v[r].cont_ = true;
+        size_t cumulative = 0, dest_pos = 0;
+        for (size_t i = start_idx; i < subseqs.size() && dest_pos < sub_len; ++i) {
+            const auto &frag = subseqs[i];
+            const size_t fs = cumulative, fe = cumulative + frag.len;
+            const size_t os = std::max(fs, from), oe = std::min(fe, to);
+            if (os < oe) {
+                const size_t local_from = os - fs, clen = oe - os;
+                for (size_t b = 0; b < clen; ++b) {
+                    const size_t sbit = (frag.skip_first_n + local_from + b) * 2;
+                    const uint64_t code =
+                        (frag.words()[sbit >> 6] >> (sbit & 63)) & 0x3;
+                    CrumbledFixedSeq &rec = v[first_rec + dest_pos / capacity_bases];
+                    const size_t off = (dest_pos % capacity_bases) * 2;
+                    rec.words_[off >> 6] |= code << (off & 63);
+                    rec.origin_node = frag.origin_node;
+                    ++dest_pos;
+                }
+            }
+            cumulative += frag.len;
+        }
+    }
+    template <class Vec>
+    static void append_subseqs(Vec &v, const gtl::vector<CrumbledFixedSeq> &subseqs,
+                               size_t from, size_t to) {
+        append_subseqs(v, subseqs, 0, from, to);
+    }
+    // Append the concatenation of [first,last) as one continued run of records.
+    template <class Vec, std::forward_iterator It>
+    static void append_concat(Vec &v, It first, It last) {
+        const size_t total = combined_length(first, last);
+        if (total == 0) return;
+        uint64_t origin = 0;
+        for (auto it = first; it != last; ++it) origin = (*it).origin_node;
+        // Single fetch over the concatenation via a running fragment cursor.
+        It cur = first;
+        size_t base_in_frag = 0;
+        append_fetch(v, total, origin, [&](size_t) -> uint64_t {
+            while (cur != last && base_in_frag >= (*cur).len) {
+                ++cur;
+                base_in_frag = 0;
+            }
+            const auto &frag = *cur;
+            const size_t sbit = (frag.skip_first_n + base_in_frag) * 2;
+            ++base_in_frag;
+            return (frag.words()[sbit >> 6] >> (sbit & 63)) & 0x3;
+        });
+    }
+};
+#endif  // LASM_CRUMBLED_FIXED
+
 struct seqveciterator {
     size_t idx = 0;
     size_t bidx = 0;

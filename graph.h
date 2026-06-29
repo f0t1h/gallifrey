@@ -129,7 +129,9 @@ struct dbg_index_base {
             // tests; the release path degrades to 0.0 rather than letting inf
             // propagate into depth comparisons.
             assert(!seq.empty());
-            return seq.empty() ? 0.0 : (double)counts.core_count / seq.size();
+            return seq.empty() ? 0.0
+                               : (double)counts.core_count /
+                                     logical_seq_count(seq);
         }
     };
     using dbg_map_t = gtl::parallel_flat_hash_map<
@@ -300,7 +302,7 @@ struct GraphCleaning {
             const double d = it->second.avg_core_count();
             if (d <= 0.0) continue;
 
-            const size_t len_proxy = it->second.seq.size();
+            const size_t len_proxy = logical_seq_count(it->second.seq);
             const bool topology_stable =
                 (it->second.prev.size() <= 1 &&
                  it->second.forward_edge_count <= 1);
@@ -370,7 +372,7 @@ struct GraphCleaning {
             if (it == dbg.end()) continue;
             const auto &node = it->second;
             if (node.redirected() || node.seq.empty()) continue;
-            const size_t len_proxy = node.seq.size();
+            const size_t len_proxy = logical_seq_count(node.seq);
             const double avg_cc = node.avg_core_count();
             std::fprintf(out, "%" PRIu64 "\t%zu\t%.6f\n", node_id, len_proxy,
                          avg_cc);
@@ -694,8 +696,10 @@ struct GraphCleaning {
                     if (prev_it != dbg.end() && !prev_it->second.redirected()) {
                         if (prev_it->second.avg_core_count() <
                                 current->second.avg_core_count() &&
-                            prev_it->second.seq.size() < max_tip_length &&
-                            current->second.seq.size() > 2 * max_tip_length &&
+                            logical_seq_count(prev_it->second.seq) <
+                                max_tip_length &&
+                            logical_seq_count(current->second.seq) >
+                                2 * max_tip_length &&
                             prev_it->second.prev.size() == 0 &&
                             prev_it->second.forward_edge_count == 1) {
                             dbg.erase(prev_it);  // MARK
@@ -831,26 +835,29 @@ struct GraphCleaning {
                                     other_it->second.avg_core_count();
                                 if (d > 0.0) other_depth = d;
                             }
-                            // Lets combine the sequences here.
-                            SequenceContainerType cur_seq{
-                                current->second.seq.begin(),
-                                current->second.seq.end()};
-                            SequenceContainerType pre_seq{
-                                pit->second.seq.begin(), pit->second.seq.end()};
+                            // Lets combine the sequences here. Build the merged
+                            // runs as (possibly split) record vectors.
+                            gtl::vector<SequenceContainerType> pre_v, cur_v;
+                            SequenceContainerType::append_concat(
+                                cur_v, current->second.seq.begin(),
+                                current->second.seq.end());
+                            SequenceContainerType::append_concat(
+                                pre_v, pit->second.seq.begin(),
+                                pit->second.seq.end());
 
                             const auto copy_est = infer_loop_copy_numbers(
                                 other_depth, pr_depth, curr_depth, depth_stats);
                             const int extra_turns =
                                 std::max(0, copy_est.loop_turns - 1);
 
-                            for (int turn = 0; turn < extra_turns; ++turn) {
-                                current->second.seq.push_back(
-                                    SequenceContainerType::copy_of(pre_seq));
-                                current->second.seq.push_back(
-                                    SequenceContainerType::copy_of(cur_seq));
+                            for (int turn = 0; turn < extra_turns + 1; ++turn) {
+                                for (auto &r : pre_v)
+                                    current->second.seq.push_back(
+                                        SequenceContainerType::copy_of(r));
+                                for (auto &r : cur_v)
+                                    current->second.seq.push_back(
+                                        SequenceContainerType::copy_of(r));
                             }
-                            current->second.seq.push_back(std::move(pre_seq));
-                            current->second.seq.push_back(std::move(cur_seq));
 
                             // Get rid of the looping node
                             return i;

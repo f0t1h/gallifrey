@@ -387,9 +387,9 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         lcp_read lr;
         parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq, 3,
                                     &str1, fnctr, chs, lr, pos_buf);
-        gtl::vector<CrumbledSubSeq64> ss;
-        ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
-                        CrumbledSubSeq64::from_nibbles{});
+        gtl::vector<SequenceContainerType> ss;
+        SequenceContainerType::append_nibbles(ss, bam_get_seq(rec), 0,
+                                              rec->core.l_qseq, 0);
 
         lcp_read lr2;
         init_lps_crumbled(&str2, ss, fnctr);
@@ -582,3 +582,140 @@ TEST_CASE("onehot_to_rle correctness") {
         sam_close(fp);
     }
 }
+
+TEST_CASE("init_lps_crumbled is transparent to fragment splitting") {
+    using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, syncmer::MurMur>;
+    decltype(asm_config::syncmer) spara;
+    spara.k = 10;
+    spara.density = 0.05;
+    SyncmerType fn(spara, 11);
+
+    std::string dna;
+    srand(7);
+    for (int i = 0; i < 600; ++i) dna.push_back("ACGT"[rand() % 4]);
+
+    auto cores_of = [&](const gtl::vector<SequenceContainerType> &v) {
+        lps str = {0, 0, 0, nullptr};
+        init_lps_crumbled(&str, v, fn);
+        gtl::vector<uint32_t> out;
+        for (int i = 0; i < str.size; ++i) out.push_back(str.cores[i].label);
+        free_lps(&str);
+        return out;
+    };
+    auto build = [&](std::initializer_list<std::pair<int, int>> ranges) {
+        gtl::vector<SequenceContainerType> v;
+        for (auto [a, b] : ranges)
+            SequenceContainerType::append_ascii(v, dna.c_str(), a, b, 0);
+        return cores_of(v);
+    };
+
+    // Same bases, different fragment boundaries -> identical cores. In fixed
+    // mode the {0,600} build internally splits at the capacity; the {0,200},...
+    // build uses clean per-record fragments, so this checks the split path.
+    const auto full = build({{0, 600}});
+    CHECK(full == build({{0, 200}, {200, 400}, {400, 600}}));
+    CHECK(full == build({{0, 300}, {300, 600}}));
+
+    // Reverse-complement path (as used in fold_dbg_graph): RC each record in
+    // reverse order, then derive cores. Must also be split-transparent.
+    auto rc_cores = [&](std::initializer_list<std::pair<int, int>> ranges) {
+        gtl::vector<SequenceContainerType> v;
+        for (auto [a, b] : ranges)
+            SequenceContainerType::append_ascii(v, dna.c_str(), a, b, 0);
+        gtl::vector<SequenceContainerType> rev;
+        for (auto it = v.rbegin(); it != v.rend(); ++it)
+            rev.emplace_back(it->reverse_complement());
+        return cores_of(rev);
+    };
+    const auto rcfull = rc_cores({{0, 600}});
+    CHECK(rcfull == rc_cores({{0, 200}, {200, 400}, {400, 600}}));
+
+    // Homopolymer run straddling the capacity boundary: in single-fragment
+    // (old) mode there is never a fragment boundary; splitting introduces one
+    // mid-run, which the RLE-based k-mer scan must handle identically.
+    {
+        std::string hp;
+        for (int i = 0; i < 200; ++i) hp.push_back("ACGT"[rand() % 4]);
+        while (hp.size() < 290) hp.push_back('A');  // long run across any cap
+        for (int i = 0; i < 200; ++i) hp.push_back("ACGT"[rand() % 4]);
+        gtl::vector<SequenceContainerType> a, b;
+        SequenceContainerType::append_ascii(a, hp.c_str(), 0, hp.size(), 0);
+        SequenceContainerType::append_ascii(b, hp.c_str(), 0, 150, 0);
+        SequenceContainerType::append_ascii(b, hp.c_str(), 150, hp.size(), 0);
+        CHECK(cores_of(a) == cores_of(b));
+    }
+}
+
+#ifdef LASM_CRUMBLED_FIXED
+TEST_CASE("CrumbledFixedSeq split/concat round-trip") {
+    using Fixed = CrumbledFixedSeq<LASM_CRUMBLED_FIXED_WORDS>;
+    const size_t cap = Fixed::capacity_bases;
+
+    // Deterministic DNA string spanning a few records.
+    std::string dna;
+    const char *L = "ACGT";
+    for (size_t i = 0; i < cap * 2 + 7; ++i) dna.push_back(L[(i * 7 + 3) % 4]);
+
+    auto concat = [&](const gtl::vector<Fixed> &v) {
+        gtl::vector<char> buf(cap + 1);
+        std::string out;
+        for (const auto &r : v) {
+            r.convert_to_ascii(buf.data());
+            out.append(buf.data(), r.len);
+        }
+        return out;
+    };
+
+    SUBCASE("append_ascii splits and concatenates back") {
+        gtl::vector<Fixed> v;
+        Fixed::append_ascii(v, dna.c_str(), 0, dna.size(), 42);
+        CHECK(v.size() == (dna.size() + cap - 1) / cap);
+        for (const auto &r : v) CHECK(r.len <= cap);
+        CHECK(Fixed::combined_length(v.begin(), v.end()) == dna.size());
+        CHECK(concat(v) == dna);
+        for (const auto &r : v) CHECK(r.origin_node == 42);
+    }
+
+    SUBCASE("append_subseqs 5-arg relative (as used in build_lr_cores)") {
+        gtl::vector<Fixed> v;
+        Fixed::append_ascii(v, dna.c_str(), 0, dna.size(), 0);
+        // Extract several ranges exactly the way build_lr_cores_with_seqs does:
+        // advance frag_idx to the fragment containing `from`, then pass
+        // relative offsets with that start hint.
+        for (auto [from, to] : {std::pair<size_t, size_t>{0, 100},
+                                {100, 400}, {300, 500},
+                                {cap - 3, cap + cap + 5},
+                                {0, dna.size()}}) {
+            size_t frag_idx = 0, frag_cum = 0;
+            while (frag_idx < v.size() && frag_cum + v[frag_idx].len <= from) {
+                frag_cum += v[frag_idx].len;
+                ++frag_idx;
+            }
+            gtl::vector<Fixed> out;
+            Fixed::append_subseqs(out, v, frag_idx, from - frag_cum,
+                                  to - frag_cum);
+            CHECK(concat(out) == dna.substr(from, to - from));
+        }
+    }
+
+    SUBCASE("append_subseqs extracts a boundary-crossing range") {
+        gtl::vector<Fixed> v;
+        Fixed::append_ascii(v, dna.c_str(), 0, dna.size(), 7);
+        const size_t from = cap - 5, to = cap + 13;  // crosses a record edge
+        gtl::vector<Fixed> sub;
+        Fixed::append_subseqs(sub, v, from, to);
+        CHECK(Fixed::combined_length(sub.begin(), sub.end()) == to - from);
+        CHECK(concat(sub) == dna.substr(from, to - from));
+    }
+
+    SUBCASE("reverse_complement round-trips") {
+        Fixed one(dna.c_str(), 0, std::min(cap, dna.size()), 1,
+                  Fixed::from_ascii{});
+        Fixed rcrc = one.reverse_complement().reverse_complement();
+        gtl::vector<char> a(cap + 1), b(cap + 1);
+        one.convert_to_ascii(a.data());
+        rcrc.convert_to_ascii(b.data());
+        CHECK(std::string(a.data()) == std::string(b.data()));
+    }
+}
+#endif
