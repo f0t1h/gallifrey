@@ -31,17 +31,24 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     std::queue<std::pair<u64, typename RecigMapT::mapped_type>> q;
     gtl::flat_hash_set<u64> visited;
 
+    // Precompute node → length once (was an O(N) scan of `recig` per node).
+    // Mirrors the original precedence: a node's length is the `qry.size` of the
+    // first entry keyed by that node (when > 0); otherwise the `tgt.size` of the
+    // first entry (in iteration order) that references it as a target.
+    gtl::flat_hash_map<u64, i64> first_qry_len;  // key node → its first qry.size
+    gtl::flat_hash_map<u64, i64> first_tgt_len;  // target node → first tgt.size>0
+    for (const auto &kv : recig) {
+        const auto &rm = kv.second;
+        first_qry_len.try_emplace(kv.first, static_cast<i64>(rm.qry.size));
+        if (rm.tgt.size > 0)
+            first_tgt_len.try_emplace(rm.node, static_cast<i64>(rm.tgt.size));
+    }
+
     auto infer_len_for_node = [&](u64 id) -> i64 {
-        auto out_range = recig.equal_range(id);
-        if (out_range.first != out_range.second) {
-            const auto &rm = out_range.first->second;
-            if (rm.qry.size > 0) return static_cast<i64>(rm.qry.size);
-        }
-        for (const auto &kv : recig) {
-            if (kv.second.node != id) continue;
-            const auto &rm = kv.second;
-            if (rm.tgt.size > 0) return static_cast<i64>(rm.tgt.size);
-        }
+        auto qit = first_qry_len.find(id);
+        if (qit != first_qry_len.end() && qit->second > 0) return qit->second;
+        auto tit = first_tgt_len.find(id);
+        if (tit != first_tgt_len.end()) return tit->second;
         return 0;
     };
 
@@ -814,14 +821,31 @@ struct PostLayoutCleaning {
         }
     }
 
+    // Drop the reciprocal adjacency entry for a removed edge from a neighbor's
+    // fwd/rev list (matched by unique edge key).
+    static void drop_adj_edge(gtl::vector<adj_entry> &lst, const edge_key &k) {
+        lst.erase(std::remove_if(lst.begin(), lst.end(),
+                                 [&](const adj_entry &a) { return a.key == k; }),
+                  lst.end());
+    }
+
     // Remove short C-node tips: C-nodes with no successors (or no predecessors)
     // and sequence length below max_tip_len.
+    //
+    // Each pass decides all removals from a *consistent snapshot* of `adj`
+    // (matching the previous full-rebuild-between-passes behavior), then applies
+    // them while patching neighbor adjacency incrementally — avoiding an
+    // O(edges) rebuild per pass (measured serial hotspot).
     static size_t cut_tips(supernode_vec &supernodes, edge_map &merged_edges,
                            adj_map &adj, size_t max_tip_len) {
         size_t removed = 0;
         bool changed = true;
+        gtl::vector<size_t> to_remove;
         while (changed) {
             changed = false;
+            to_remove.clear();
+
+            // Decide removals from the current (frozen) adjacency snapshot.
             for (size_t i = 0; i < supernodes.size(); ++i) {
                 auto &sn = supernodes[i];
                 if (sn.name.empty()) continue;  // already removed
@@ -842,20 +866,33 @@ struct PostLayoutCleaning {
                 for (const auto &s : sn.seqs()) seq_len += s.len;
                 if (seq_len >= max_tip_len) continue;
 
-                // Remove this tip: erase its edges and mark node removed
+                to_remove.push_back(i);
+            }
+
+            // Apply removals: erase edges and patch each neighbor's reciprocal
+            // adjacency entry so the next pass sees updated degrees.
+            for (size_t i : to_remove) {
+                auto adj_it = adj.find(i);
                 if (adj_it != adj.end()) {
-                    for (const auto &e : adj_it->second.fwd)
+                    for (const auto &e : adj_it->second.fwd) {  // i → neighbor
                         merged_edges.erase(e.key);
-                    for (const auto &e : adj_it->second.rev)
+                        if (e.neighbor == i) continue;  // self-loop
+                        auto nit = adj.find(e.neighbor);
+                        if (nit != adj.end())
+                            drop_adj_edge(nit->second.rev, e.key);
+                    }
+                    for (const auto &e : adj_it->second.rev) {  // neighbor → i
                         merged_edges.erase(e.key);
+                        if (e.neighbor == i) continue;  // self-loop
+                        auto nit = adj.find(e.neighbor);
+                        if (nit != adj.end())
+                            drop_adj_edge(nit->second.fwd, e.key);
+                    }
                 }
-                sn.name.clear();
+                supernodes[i].name.clear();
                 adj.erase(i);
                 changed = true;
                 ++removed;
-            }
-            if (changed) {
-                build_adjacency(merged_edges, adj);
             }
         }
         return removed;
@@ -1183,10 +1220,13 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     PostLayoutCleaning::run(supernodes, merged_edges);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Post-layout cleaning");
 
-    // ── Parallel ASCII conversion of supernode sequences ─────────────
+    // ── Parallel S-line formatting ───────────────────────────────────
+    // Each worker converts a supernode's sequences to ASCII and builds the
+    // complete `S` line (prefix + sequence + tags). Doing the whole line here
+    // keeps the megabase `%s` formatting off the serial write path below.
     constexpr size_t N_GAP_LEN = 64;
     const size_t n_super = supernodes.size();
-    gtl::vector<std::string> super_seq_strs(n_super);
+    gtl::vector<std::string> super_line_strs(n_super);
     {
         int nthreads_print = as.threads.work;
         if (nthreads_print < 1) nthreads_print = 1;
@@ -1201,14 +1241,20 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                 while (true) {
                     size_t i = next_idx.fetch_add(1);
                     if (i >= n_super) break;
-                    if (supernodes[i].name.empty()) continue;  // removed
-                    const auto &sn_seqs = supernodes[i].seqs();
-                    std::string &dst = super_seq_strs[i];
+                    const auto &sn = supernodes[i];
+                    if (sn.name.empty()) continue;  // removed
+                    const auto &sn_seqs = sn.seqs();
+                    std::string &dst = super_line_strs[i];
                     size_t total_len = 0;
-                    for (const auto &s : sn_seqs) {
+                    for (const auto &s : sn_seqs)
                         total_len += (s.len == 0) ? N_GAP_LEN : s.len;
-                    }
-                    dst.reserve(total_len);
+
+                    dst.reserve(total_len + sn.name.size() + 48);
+                    dst.append("S\t");
+                    dst.append(sn.name);
+                    dst.push_back('\t');
+
+                    const size_t seq_start = dst.size();
                     for (const auto &s : sn_seqs) {
                         if (s.len == 0) {
                             dst.append(N_GAP_LEN, 'N');
@@ -1218,36 +1264,71 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
                         s.convert_to_ascii((char *)local_chs.data);
                         dst.append((const char *)local_chs.data, s.len);
                     }
-                    if (dst.empty()) dst = "*";
+                    if (dst.size() == seq_start) dst.push_back('*');  // no seq
+
+                    dst.append("\tTP:Z:");
+                    dst.append(sn.is_layout ? "layout" : "unitig");
+                    dst.push_back('\t');
+                    dst.append(sn.is_layout ? "LY" : "UI");
+                    dst.append(":i:");
+                    dst.append(std::to_string(static_cast<uint64_t>(sn.aux_id)));
+                    dst.push_back('\n');
                 }
             });
         }
         for (auto &w : workers) w.join();
     }
-    TIME_CHECKPOINT(LayoutEmit, stderr, "Convert to ASCII");
+    TIME_CHECKPOINT(LayoutEmit, stderr, "Format S-lines");
 
-    // ── Sequential write ─────────────────────────────────────────────
-    for (size_t i = 0; i < n_super; ++i) {
-        const auto &sn = supernodes[i];
-        if (sn.name.empty()) continue;  // removed by post-layout cleaning
-        const char *tp = sn.is_layout ? "layout" : "unitig";
-        const char *id_tag = sn.is_layout ? "LY" : "UI";
-        std::fprintf(out, "S\t%s\t%s\tTP:Z:%s\t%s:i:%" PRIu64 "\n",
-                     sn.name.c_str(), super_seq_strs[i].c_str(), tp, id_tag,
-                     static_cast<uint64_t>(sn.aux_id));
-    }
-    for (const auto &[_, edge] : merged_edges) {
-        const auto &src_name = supernodes[edge.src_super].name;
-        const auto &dst_name = supernodes[edge.dst_super].name;
-        std::fprintf(
-            out,
-            "L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
-            "EC:i:%zu\tFN:i:%" PRIu64 "\tTN:i:%" PRIu64 "\n",
-            src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
-            edge.src_ori, edge.dst_ori, side_label(edge.src_side),
-            side_label(edge.dst_side), edge.count,
-            static_cast<uint64_t>(edge.example_from),
-            static_cast<uint64_t>(edge.example_to));
+    // ── Buffered write ───────────────────────────────────────────────
+    // Accumulate output into a 4 MiB buffer and flush in large fwrites to
+    // minimize write() syscalls (the serial write was I/O-bound at ~60% util).
+    // Oversized lines (megabase S-lines) bypass the buffer with a direct write.
+    {
+        constexpr size_t FLUSH_AT = size_t{1} << 22;  // 4 MiB
+        std::string wbuf;
+        wbuf.reserve(FLUSH_AT + 4096);
+        auto flush = [&]() {
+            if (!wbuf.empty()) {
+                std::fwrite(wbuf.data(), 1, wbuf.size(), out);
+                wbuf.clear();
+            }
+        };
+        auto emit = [&](const char *data, size_t len) {
+            if (len >= FLUSH_AT) {
+                flush();
+                std::fwrite(data, 1, len, out);
+                return;
+            }
+            if (wbuf.size() + len > FLUSH_AT) flush();
+            wbuf.append(data, len);
+        };
+
+        for (size_t i = 0; i < n_super; ++i) {
+            if (super_line_strs[i].empty()) continue;  // removed
+            emit(super_line_strs[i].data(), super_line_strs[i].size());
+        }
+
+        char lbuf[1024];
+        for (const auto &[_, edge] : merged_edges) {
+            const auto &src_name = supernodes[edge.src_super].name;
+            const auto &dst_name = supernodes[edge.dst_super].name;
+            int n = std::snprintf(
+                lbuf, sizeof(lbuf),
+                "L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
+                "EC:i:%zu\tFN:i:%" PRIu64 "\tTN:i:%" PRIu64 "\n",
+                src_name.c_str(), edge.src_ori, dst_name.c_str(), edge.dst_ori,
+                edge.src_ori, edge.dst_ori, side_label(edge.src_side),
+                side_label(edge.dst_side), edge.count,
+                static_cast<uint64_t>(edge.example_from),
+                static_cast<uint64_t>(edge.example_to));
+            // Clamp to what actually fit (snprintf returns the untruncated
+            // length); names are small so truncation should never happen.
+            if (n > 0)
+                emit(lbuf, std::min<size_t>(static_cast<size_t>(n),
+                                            sizeof(lbuf) - 1));
+        }
+        flush();
     }
     TIME_CHECKPOINT(LayoutEmit, stderr, "GFA writing");
 }

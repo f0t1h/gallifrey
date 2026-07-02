@@ -1548,3 +1548,58 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
         CHECK_EQ(merged[3].len, 6u);
     }
 }
+
+TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
+    using namespace layout_graph_emit;
+
+    auto add_node = [](supernode_vec &sn, const char *name, bool layout,
+                       size_t len) {
+        supernode_out s;
+        s.name = name;
+        s.is_layout = layout;
+        s.ref_seqs = nullptr;
+        s.aux_id = 0;
+        std::string seq(len, 'A');
+        s.owned_seqs.emplace_back(seq.c_str(), 0, len, 0,
+                                  SequenceContainerType::from_ascii{});
+        sn.push_back(std::move(s));
+    };
+    auto add_edge = [](edge_map &em, u64 s, u64 d) {
+        edge_key k{s, d, '+', '+', uint8_t{0}, uint8_t{0}};
+        edge_agg a;
+        a.src_super = s;
+        a.dst_super = d;
+        a.count = 1;
+        em[k] = a;
+    };
+
+    // Topology (M = layout, C = unitig; short len 4, long len 50):
+    //   M0 → C1(short, tip)                 → removed
+    //   M0 → C2(short) → C3(short, dead-end) → both peeled (C3 then C2)
+    //   M0 → C4(long, tip)                  → kept (too long)
+    supernode_vec sn;
+    add_node(sn, "M0", true, 100);
+    add_node(sn, "C1", false, 4);
+    add_node(sn, "C2", false, 4);
+    add_node(sn, "C3", false, 4);
+    add_node(sn, "C4", false, 50);
+
+    edge_map edges;
+    add_edge(edges, 0, 1);
+    add_edge(edges, 0, 2);
+    add_edge(edges, 2, 3);
+    add_edge(edges, 0, 4);
+
+    PostLayoutCleaning::run(sn, edges, /*max_tip_len*/ 10);
+
+    CHECK_FALSE(sn[0].name.empty());  // M-node never removed
+    CHECK(sn[1].name.empty());        // short tip removed
+    CHECK(sn[2].name.empty());        // peeled after C3
+    CHECK(sn[3].name.empty());        // short dead-end removed
+    CHECK_FALSE(sn[4].name.empty());  // long tip kept
+
+    // Only the M0 → C4 edge survives.
+    REQUIRE_EQ(edges.size(), 1u);
+    CHECK_EQ(edges.begin()->second.src_super, 0u);
+    CHECK_EQ(edges.begin()->second.dst_super, 4u);
+}
