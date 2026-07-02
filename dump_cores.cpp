@@ -63,11 +63,16 @@ static void ascii_to_bam_nibbles(const std::string &seq,
 static int run_dump_cores(const std::string &input_path,
                           const std::string &output_path, int syncmer_k,
                           int submer_s, int submer_t, int lcp_level,
-                          uint64_t seed) {
+                          uint64_t seed, int lcp_low_level, double density) {
     syncmer_params spara;
     spara.k = syncmer_k;
-    spara.mincode.s = submer_s;
-    spara.mincode.t = submer_t;
+    if (lcp_low_level > 0) {
+        spara.lcp_low_level = lcp_low_level;
+        spara.density = density;
+    } else {
+        spara.mincode.s = submer_s;
+        spara.mincode.t = submer_t;
+    }
 
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -132,8 +137,14 @@ DumpCoresProgram::DumpCoresProgram(CLI::App &parent) {
     app.add_option("-l,--level", lcp_level, "LCP level to compute")
         ->capture_default_str();
     app.add_option("--seed", seed, "Random seed")->capture_default_str();
+    app.add_option("--lcp-low-level", lcp_low_level,
+                   "Use regular LCP to this level + subsample (>0 enables)")
+        ->capture_default_str();
+    app.add_option("--density", density,
+                   "With --lcp-low-level: fraction of LCP low-level cores to keep")
+        ->capture_default_str();
     app.callback([this]() {
         return run_dump_cores(input, output, syncmer_k, submer_s, submer_t,
-                              lcp_level, seed);
+                              lcp_level, seed, lcp_low_level, density);
     });
 }

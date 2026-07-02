@@ -153,6 +153,12 @@ struct GenericSyncmerRule {
           table_size{2 << (2 * k() - 1)},
           pure_lcp(false),
           table(table_size, 0) {
+        if (cfg.type() == syncmer_params::typeenum::LcpSubsample) {
+            // Core selection is done by LCP+subsample; the lookup table is
+            // never queried, so skip building it (and its misleading density
+            // log).
+            return;
+        }
         if (cfg.mincode.s.has_value()) {
             s_mask = (1U << s()) - 1U;
         } else {
@@ -195,6 +201,10 @@ struct GenericSyncmerRule {
             case syncmer_params::typeenum::Density: {
                 return hf(val & k_mask) < threshold();
             }
+            case syncmer_params::typeenum::LcpSubsample:
+                // Core selection is done by regular LCP + subsampling, not by
+                // this k-mer functor; it is constructed but never queried.
+                return false;
             case syncmer_params::typeenum::Invalid:
             default:
                 // Unreachable: syncmer_params::validate() rejects Invalid

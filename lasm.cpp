@@ -64,7 +64,8 @@ public:
         app.add_option("--syncmer-k", cfg.syncmer.k, "K-mer length")
             ->capture_default_str();
         app.add_option("--density", cfg.syncmer.density,
-                       "Density of selected k-mers")
+                       "Density of selected k-mers; with --lcp-low-level it is "
+                       "the fraction of LCP low-level cores to keep")
             ->check(CLI::Range(0.0, 1.0));
         app.add_option("--submer-s", cfg.syncmer.mincode.s,
                        "Size of submers for mincode syncmers")
@@ -74,6 +75,10 @@ public:
                        "syncmer if omitted)")
             ->excludes("--density")
             ->needs("--submer-s");
+        app.add_option("--lcp-low-level", cfg.syncmer.lcp_low_level,
+                       "Use regular LCP to this level, subsample (by --density), "
+                       "then deepen (alternative to syncmers)")
+            ->excludes("--submer-s");
         auto bfg = app.add_option_group("bloomfilter",
                                         "Parameters to setup bloom filter");
         bfg->add_option("--projected-element-count", cfg.bloom.projected_count,

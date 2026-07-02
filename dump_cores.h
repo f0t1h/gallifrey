@@ -21,6 +21,8 @@ class DumpCoresProgram {
     int submer_t = 5;
     int lcp_level = 4;
     uint64_t seed = 0;
+    int lcp_low_level = 0;   // >0 selects LCP-subsample mode
+    double density = 0.2;    // with lcp_low_level: fraction of cores kept
 
 public:
     explicit DumpCoresProgram(CLI::App &parent);

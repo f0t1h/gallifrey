@@ -12,8 +12,21 @@
 #include <string>
 #include <vector>
 struct syncmer_params {
-    enum class typeenum { Density, MinCodeOpen, MinCodeClosed, Invalid };
+    enum class typeenum {
+        Density,
+        MinCodeOpen,
+        MinCodeClosed,
+        LcpSubsample,
+        Invalid
+    };
     constexpr typeenum type() const {
+        // LCP-subsample is an alternative to syncmer selection: compute regular
+        // LCP cores to a low level, subsample them by density, then deepen.
+        // `density` is shared: with --lcp-low-level it is the LCP-core subsample
+        // rate; otherwise it selects density syncmers (checked lcp-low first).
+        if (lcp_low_level.has_value()) {
+            return typeenum::LcpSubsample;
+        }
         if (density.has_value()) {
             return typeenum::Density;
         }
@@ -32,6 +45,9 @@ struct syncmer_params {
         std::optional<unsigned long> s;
         std::optional<unsigned long> t;
     } mincode;
+    // LCP-subsample mode parameter. When set, `density` (above) is reused as the
+    // fraction of low-level LCP cores kept, rather than the syncmer density.
+    std::optional<int> lcp_low_level;  // LCP level before subsampling
     std::string spaced_seed_mask = "11111111111111111111111111111111";
 
     // Validating mask builder: returns the packed mask or an error message.
@@ -90,9 +106,27 @@ struct syncmer_params {
     // exit()-ing from deep inside a constructor.
     std::expected<void, std::string> validate() const {
         if (type() == typeenum::Invalid) {
-            return std::unexpected(
-                std::string("Provide a k-mer selection: either --density or "
-                            "--submer-s (optionally with --submer-t)"));
+            return std::unexpected(std::string(
+                "Provide a core selection: --density, --submer-s "
+                "(optionally with --submer-t), or --lcp-low-level (with "
+                "--density as the subsample rate)"));
+        }
+        if (type() == typeenum::LcpSubsample) {
+            if (!density.has_value()) {
+                return std::unexpected(std::string(
+                    "--lcp-low-level requires --density (used as the LCP-core "
+                    "subsample rate)"));
+            }
+            const double d = *density;
+            if (d <= 0.0 || d > 1.0) {
+                return std::unexpected(
+                    std::string("--density must be in (0, 1]"));
+            }
+            if (*lcp_low_level < 1) {
+                return std::unexpected(
+                    std::string("--lcp-low-level must be >= 1"));
+            }
+            return {};  // LCP mode does not use the spaced-seed mask
         }
         if (auto r = compute_spaced_mask_checked(); !r) {
             return std::unexpected(r.error());
@@ -102,7 +136,11 @@ struct syncmer_params {
     void print_cfg(FILE *f) const {
         fprintf(f, "spaced-seed-mask: \"%s\"\n", spaced_seed_mask.c_str());
         fprintf(f, "k: %d\n", k);
-        if (density.has_value()) {
+        if (lcp_low_level.has_value()) {
+            fprintf(f, "core-selection: \"lcp-subsample\"\n");
+            fprintf(f, "lcp-low-level: %d\n", *lcp_low_level);
+            fprintf(f, "subsample-density: %f\n", density.value_or(0.0));
+        } else if (density.has_value()) {
             fprintf(f, "kmer-selection: \"density\"\n");
             fprintf(f, "Density: %f\n", *density);
         } else if (mincode.s.has_value()) {

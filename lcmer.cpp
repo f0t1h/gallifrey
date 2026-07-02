@@ -402,6 +402,47 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         CHECK(lr.cores.size() == lr2.cores.size());
     }
 
+    SUBCASE("LcpSubsample re-LCP consistency (parse vs crumbled)") {
+        using SYNCMER_HASHER = syncmer::MurMur;
+        using SyncmerType =
+            syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
+        decltype(asm_config::syncmer) spara;
+        spara.k = 8;
+        spara.lcp_low_level = 2;
+        spara.density = 0.3;
+        SyncmerType fnctr(spara, 11);
+        const int final_level = 3;
+
+        charsi chs;
+        pos_scratch pos_buf;
+        lcp_read lr;
+        lps str1 = {0, 0, 0, nullptr};
+        parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq,
+                                    final_level, &str1, fnctr, chs, lr, pos_buf);
+
+        gtl::vector<CrumbledSubSeq64> ss;
+        ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
+                        CrumbledSubSeq64::from_nibbles{});
+        lps str2 = {0, 0, 0, nullptr};
+        lcp_read lr2;
+        init_lps_crumbled(&str2, ss, fnctr);
+        lps_deepen(&str2, final_level);
+        for (int i = 0; i < str2.size; ++i) {
+            lr2.cores.emplace_back(str2.cores[i].label);
+            lr2.pos.emplace_back(str2.cores[i].start, str2.cores[i].end);
+        }
+        // Same sequence + same params must yield identical cores (labels and
+        // positions), else node re-parses cannot match the DBG index -> few hits.
+        REQUIRE(lr.cores.size() == lr2.cores.size());
+        for (size_t i = 0; i < lr.cores.size(); ++i) {
+            CHECK(lr.cores[i] == lr2.cores[i]);
+            CHECK(lr.pos[i].first == lr2.pos[i].first);
+            CHECK(lr.pos[i].second == lr2.pos[i].second);
+        }
+        free_lps(&str1);
+        free_lps(&str2);
+    }
+
     bam_hdr_destroy(hdr);
     sam_close(fp);
     free(seq_gt);

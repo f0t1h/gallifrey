@@ -19,6 +19,7 @@
 #include <string>
 #include <type_traits>
 
+#include "asm.h"  // syncmer_params (core selection mode + LCP-subsample params)
 #include "ext/lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
 using SequenceContainerType = CrumbledSubSeq64;
@@ -1120,6 +1121,83 @@ inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
                                         rle_buf, pos_buf);
 }
 
+// ── LCP-subsample core construction (alternative to syncmers) ──────────
+// One-time setup of the LCP character tables (alphabet[]). The syncmer path
+// never calls parse1/parse2, so these tables are otherwise uninitialized; this
+// only sets char->code maps, which lps_deepen/parse3 do not read, so enabling
+// it cannot change syncmer-mode results.
+inline void ensure_lcp_init() {
+    static const int once = (LCP_INIT(), 0);
+    (void)once;
+}
+
+// Decode BAM 4-bit packed bases into ASCII 'A'/'C'/'G'/'T' for regular LCP
+// (parse1 maps chars via alphabet[]). LCP collapses homopolymer runs itself and
+// reports positions in this string's coordinates, so no separate RLE/position
+// remap is needed -- the resulting core positions are already read coordinates.
+inline void decode_bam_to_chars(const uint8_t *data, size_t len, char *out,
+                                bool reversed) {
+    static const char lut[4] = {'A', 'C', 'G', 'T'};
+    if (!reversed) {
+        for (size_t i = 0; i < len; ++i)
+            out[i] = lut[seq_nt16_int[bam_seqi(data, i)] & 3];
+    } else {
+        for (size_t i = 0; i < len; ++i)
+            out[i] = lut[(seq_nt16_int[bam_seqi(data, len - 1 - i)] & 3) ^ 3];
+    }
+}
+
+// Context-free hash of a core label; selection depends only on the label, so
+// the same substring selects the same cores across reads (locally consistent).
+inline uint32_t subsample_hash(uint32_t x, uint32_t seed) {
+    x ^= seed;
+    x *= 0x9E3779B1u;
+    x ^= x >> 16;
+    x *= 0x85EBCA6Bu;
+    x ^= x >> 13;
+    return x;
+}
+
+// Keep cores whose label-hash falls under the density threshold; compact in
+// place. Subsampled cores remain a valid (gapped) core sequence for deepening,
+// exactly like the sparse cores the syncmer path feeds to lps_deepen.
+inline void subsample_cores(lps *str, double density, uint32_t seed) {
+    const uint64_t threshold = (uint64_t)(density * 4294967296.0);  // d * 2^32
+    int w = 0;
+    for (int i = 0; i < str->size; ++i) {
+        if (subsample_hash(str->cores[i].label, seed) < threshold) {
+            if (w != i) str->cores[w] = str->cores[i];
+            ++w;
+        }
+    }
+    str->size = w;
+}
+
+// Restart LCP over the subsampled cores instead of continuing to deepen them.
+//
+// The retained cores are a gapped subset of a deepened LCP: their bit_reps are
+// DCT compressions taken relative to their ORIGINAL neighbors, and DCT's
+// core_compress reads the level-1 flag bit (0x8000...) to pick between the
+// char-decoding branch and the atomic-symbol branch. Continuing lps_deepen on a
+// subsampled (broken-adjacency) sequence therefore runs DCT under assumptions
+// that no longer hold. Mirroring the syncmer path -- which rebuilds fresh
+// level-1 cores from its selected units and deepens anew -- we reseed each
+// retained core as a fresh atomic level-1 symbol keyed on its label, then let
+// the caller deepen from level 1.
+//
+// No fixed-length/k-mer assumption: each symbol keeps its original (variable
+// length) [start,end) span, and the label is its substring identity. The flag
+// bit is left clear so DCT uses the general atomic-symbol branch (cores are
+// arbitrary substrings, not char triples).
+inline void reseed_cores_as_level1(lps *str) {
+    for (int i = 0; i < str->size; ++i) {
+        str->cores[i].bit_rep = str->cores[i].label;  // atomic symbol identity
+        str->cores[i].bit_size = 32;                  // ulabel is 32-bit
+        // label / start / end preserved (variable span, read coordinates)
+    }
+    str->level = 1;
+}
+
 inline void init_lps_crumbled(lps *lps_ptr,
                               const gtl::vector<SequenceContainerType> &sseqs,
                               const auto &syncmer_functor) {
@@ -1129,8 +1207,29 @@ inline void init_lps_crumbled(lps *lps_ptr,
         len += sseq.len;
     }
     prepare_lps(lps_ptr, len);
-    lps_ptr->size =
-        parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+    if (syncmer_functor.cfg.type() == syncmer_params::typeenum::LcpSubsample) {
+        // Build the LCP-subsample seed on the decoded concatenation. The caller
+        // deepens to the final level afterwards (as it does for the syncmer
+        // seed), so here we only go: parse1 -> low level -> subsample.
+        ensure_lcp_init();
+        static thread_local std::string buf;
+        buf.resize(len + 1);
+        size_t off = 0;
+        for (auto &sseq : sseqs) {
+            sseq.convert_to_ascii(buf.data() + off);  // trailing \0 overwritten
+            off += sseq.len;
+        }
+        lps_ptr->level = 1;
+        lps_ptr->size = parse1(buf.data(), buf.data() + len, lps_ptr->cores, 0);
+        lps_deepen(lps_ptr, syncmer_functor.cfg.lcp_low_level.value());
+        subsample_cores(lps_ptr, syncmer_functor.cfg.density.value(),
+                        (uint32_t)syncmer_functor.seed);
+        // Restart LCP from the subsampled cores; caller deepens from level 1.
+        reseed_cores_as_level1(lps_ptr);
+    } else {
+        lps_ptr->size =
+            parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
+    }
     assert(lps_ptr->size < lps_ptr->capacity);
 }
 
@@ -1143,16 +1242,31 @@ inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
     chs.require(len);
     pos_buf.require(len);
     prepare_lps(str, len);
-    if (reversed) {
+    if (syncmer_functor.cfg.type() == syncmer_params::typeenum::LcpSubsample) {
+        // Regular LCP -> low level -> subsample -> deepen to the final level.
+        ensure_lcp_init();
+        char *s = reinterpret_cast<char *>(chs.data);
+        decode_bam_to_chars(data, len, s, reversed);
+        str->level = 1;
+        str->size = parse1(s, s + len, str->cores, 0);
+        lps_deepen(str, syncmer_functor.cfg.lcp_low_level.value());
+        subsample_cores(str, syncmer_functor.cfg.density.value(),
+                        (uint32_t)syncmer_functor.seed);
+        // Restart LCP over the subsampled cores as fresh level-1 symbols, then
+        // deepen anew (instead of continuing to deepen the broken adjacency).
+        reseed_cores_as_level1(str);
+        lps_deepen(str, lcp_level);
+    } else if (reversed) {
         onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
         str->size = parse1_bam_syncmers(chs.data, len, str, syncmer_functor,
                                         chs, pos_buf);
+        lps_deepen(str, lcp_level);
     } else {
         int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
         str->size = parse1_bam_syncmers(chs.data, pos_buf.data, rle_len, str,
                                         syncmer_functor);
+        lps_deepen(str, lcp_level);
     }
-    lps_deepen(str, lcp_level);
 
     for (int i = 0; i < str->size; ++i) {
         lr.cores.emplace_back(str->cores[i].label);
