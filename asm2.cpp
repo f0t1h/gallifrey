@@ -1412,3 +1412,139 @@ TEST_CASE(
         CHECK_EQ(merged.origin_node, 0);
     }
 }
+
+// ── Characterization tests: layout_graph_emit core algorithms ──────────
+// These pin down the observable behavior of the seed-chain DAG pipeline
+// (build_scd_graph → find_heaviest_paths → collect_path_sequences) so the
+// planned complexity/quality refactors (docs/layout-graph-plan.md) can be
+// proven behavior-preserving. They exercise the pure struct-based functions
+// in isolation, without the assembler.
+TEST_CASE("layout_graph_emit::build_scd_graph merges shared cores") {
+    using namespace layout_graph_emit;
+
+    // Two contigs sharing cores 20 and 30 (contig0: 10,20,30; contig1: 20,30,40).
+    // contig ids double as indices into `nodes`.
+    gtl::vector<lane_node> nodes(2);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 100, /*fwd*/ true, nullptr};
+    nodes[1] = {/*id*/ 1, /*from*/ 10, /*to*/ 110, /*fwd*/ true, nullptr};
+
+    gtl::flat_hash_map<size_t, lcp_read> contig_lr;
+    lcp_read lr0;
+    lr0.cores = {10u, 20u, 30u};
+    lr0.pos = {{0u, 1u}, {1u, 2u}, {2u, 3u}};
+    lcp_read lr1;
+    lr1.cores = {20u, 30u, 40u};
+    lr1.pos = {{0u, 1u}, {1u, 2u}, {2u, 3u}};
+    contig_lr[0] = std::move(lr0);
+    contig_lr[1] = std::move(lr1);
+
+    gtl::vector<size_t> contig_order = {0, 1};
+
+    gtl::vector<scd_node> scd;
+    gtl::vector<scd_adj_t> scd_fwd;
+    gtl::flat_hash_map<uint32_t, gtl::vector<uint32_t>> label_nodes;
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs;
+
+    build_scd_graph(contig_order, contig_lr, nodes, scd, scd_fwd, label_nodes,
+                    node_contigs);
+
+    // contig0 creates 3 nodes; contig1 merges 20 & 30, adds only 40 → 4 total.
+    CHECK_EQ(scd.size(), 4u);
+    CHECK_EQ(scd_fwd.size(), scd.size());
+    CHECK_EQ(node_contigs.size(), scd.size());
+
+    // Weights: shared cores seen twice, private cores once.
+    auto weight_of_label = [&](uint32_t label) -> int {
+        for (const auto &n : scd)
+            if (n.core_label == label) return n.weight;
+        return -1;
+    };
+    CHECK_EQ(weight_of_label(10u), 1);
+    CHECK_EQ(weight_of_label(20u), 2);
+    CHECK_EQ(weight_of_label(30u), 2);
+    CHECK_EQ(weight_of_label(40u), 1);
+
+    // Merged nodes carry both contigs' provenance.
+    for (size_t idx = 0; idx < scd.size(); ++idx) {
+        if (scd[idx].core_label == 20u || scd[idx].core_label == 30u)
+            CHECK_EQ(node_contigs[idx].size(), 2u);
+    }
+}
+
+TEST_CASE("layout_graph_emit::find_heaviest_paths follows the heaviest chain") {
+    using namespace layout_graph_emit;
+
+    // Graph: 0→1→2 (main chain) plus a light branch 0→3.
+    // All weights 1 → main-chain sink (2, dp=3) beats branch sink (3, dp=2).
+    gtl::vector<lane_node> nodes(1);
+    nodes[0] = {/*id*/ 0, /*from*/ 0, /*to*/ 100, /*fwd*/ true, nullptr};
+
+    gtl::vector<scd_node> scd(4);
+    for (auto &n : scd) { n.contig_idx = 0; n.core_idx = 0; n.weight = 1; }
+    scd[0].core_label = 0;
+    scd[1].core_label = 1;
+    scd[2].core_label = 2;
+    scd[3].core_label = 3;
+
+    gtl::vector<scd_adj_t> scd_fwd(4);
+    scd_fwd[0].push_back({1u, 1});
+    scd_fwd[1].push_back({2u, 1});
+    scd_fwd[0].push_back({3u, 1});
+
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+
+    REQUIRE_EQ(paths.size(), 1u);         // single connected component
+    REQUIRE_EQ(paths[0].path.size(), 3u);
+    CHECK_EQ(paths[0].path[0], 0u);
+    CHECK_EQ(paths[0].path[1], 1u);
+    CHECK_EQ(paths[0].path[2], 2u);       // heaviest sink, not the branch
+    CHECK_EQ(paths[0].total_weight, 3);
+}
+
+TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
+    using namespace layout_graph_emit;
+
+    auto make_seq = [](const char *s) {
+        return SequenceContainerType(s, 0, std::strlen(s), 0,
+                                     SequenceContainerType::from_ascii{});
+    };
+
+    // node_contigs: node0→(contig0,core0), node1→(contig0,core1),
+    //               node2→(contig1,core0)
+    gtl::vector<gtl::vector<std::pair<size_t, size_t>>> node_contigs(3);
+    node_contigs[0] = {{0, 0}};
+    node_contigs[1] = {{0, 1}};
+    node_contigs[2] = {{1, 0}};
+
+    gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>>
+        contig_core_seqs;
+    contig_core_seqs[0].push_back(make_seq("ACGT"));      // len 4
+    contig_core_seqs[0].push_back(make_seq("TTTT"));      // len 4
+    contig_core_seqs[1].push_back(make_seq("GGGGGG"));    // len 6
+
+    SUBCASE("single component, path order preserved") {
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
+
+        auto merged = collect_path_sequences(paths, node_contigs,
+                                             contig_core_seqs, 3);
+        REQUIRE_EQ(merged.size(), 2u);
+        CHECK_EQ(merged[0].len, 4u);
+        CHECK_EQ(merged[1].len, 4u);
+    }
+
+    SUBCASE("two components separated by a zero-length gap") {
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 2, gtl::vector<uint32_t>{0u, 1u}});
+        paths.push_back({200, 300, 1, gtl::vector<uint32_t>{2u}});
+
+        auto merged = collect_path_sequences(paths, node_contigs,
+                                             contig_core_seqs, 3);
+        // seqA, seqB, GAP, seqC
+        REQUIRE_EQ(merged.size(), 4u);
+        CHECK_EQ(merged[0].len, 4u);
+        CHECK_EQ(merged[1].len, 4u);
+        CHECK_EQ(merged[2].len, 0u);   // gap sentinel between components
+        CHECK_EQ(merged[3].len, 6u);
+    }
+}
