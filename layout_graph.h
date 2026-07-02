@@ -466,9 +466,20 @@ inline gtl::vector<comp_path> find_heaviest_paths(
                 }
             }
             if (ext_source >= 0) {
+                // Greedily walk max-dp successors from the earlier source until
+                // we rejoin the main path. Only prepend if we actually reconnect
+                // (mirrors the forward extension's overlap guard) — otherwise the
+                // prefix would splice a disconnected chain onto the layout. The
+                // `walked` set bounds the walk so a cyclic SCD can't loop forever.
                 gtl::vector<uint32_t> prefix;
+                gtl::flat_hash_set<uint32_t> walked;
                 uint32_t cur = static_cast<uint32_t>(ext_source);
+                bool reconnected = true;
                 while (!on_path.contains(cur)) {
+                    if (!walked.insert(cur).second) {  // revisited → cycle
+                        reconnected = false;
+                        break;
+                    }
                     prefix.push_back(cur);
                     uint32_t best_succ = UINT32_MAX;
                     int64_t best_dp_val = -1;
@@ -478,10 +489,13 @@ inline gtl::vector<comp_path> find_heaviest_paths(
                             best_succ = v;
                         }
                     }
-                    if (best_succ == UINT32_MAX) break;
+                    if (best_succ == UINT32_MAX) {  // dead-end before path
+                        reconnected = false;
+                        break;
+                    }
                     cur = best_succ;
                 }
-                if (!prefix.empty()) {
+                if (reconnected && !prefix.empty()) {
                     prefix.insert(prefix.end(), path.begin(), path.end());
                     path = std::move(prefix);
                 }
