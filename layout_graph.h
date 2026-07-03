@@ -340,6 +340,10 @@ inline void build_scd_graph(
 }
 
 // ── Phase 2: Find heaviest path per connected component ─────────────
+// Single longest-weight DP with an implicit virtual source (wired to every
+// in-degree-0 node) and virtual sink (wired from every out-degree-0 node):
+// dp[] realizes the source side, best_end the sink side. One source→sink
+// traceback per component; no post-hoc span extension.
 inline gtl::vector<comp_path> find_heaviest_paths(
     const gtl::vector<scd_node> &scd,
     const gtl::vector<scd_adj_t> &scd_fwd,
@@ -434,106 +438,30 @@ inline gtl::vector<comp_path> find_heaviest_paths(
         }
         if (best_end < 0) continue;
 
+        // Traceback the heaviest path ending at best_end. Because dp[] is the
+        // longest-weight path from a virtual source wired to every in-degree-0
+        // node, and best_end is the heaviest out-degree-0 node (a virtual sink
+        // wired from every real sink), this single traceback IS the heaviest
+        // virtual-source→virtual-sink path for the component. No post-hoc span
+        // extension exists (the old forward/backward heuristics — C13's bug
+        // class — are gone); the path is edge-connected by construction.
         gtl::vector<uint32_t> path;
         for (int32_t cur = best_end; cur >= 0; cur = parent[cur])
             path.push_back(static_cast<uint32_t>(cur));
         std::reverse(path.begin(), path.end());
 
-        // Extend at both ends
-        {
-            gtl::flat_hash_set<uint32_t> on_path(path.begin(), path.end());
-            i64 path_max_to = INT64_MIN;
-            for (uint32_t nid : path)
-                path_max_to = std::max(path_max_to,
-                                       nodes[scd[nid].contig_idx].to);
-            i64 path_min_from = INT64_MAX;
-            for (uint32_t nid : path)
-                path_min_from = std::min(path_min_from,
-                                         nodes[scd[nid].contig_idx].from);
-
-            // Forward extension
-            int32_t ext_sink = -1;
-            i64 ext_to = path_max_to;
-            for (size_t i = 0; i < n; ++i) {
-                if (comp_id[i] != c) continue;
-                if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                i64 to = nodes[scd[i].contig_idx].to;
-                if (to > ext_to && scd_fwd[i].empty()) {
-                    ext_to = to;
-                    ext_sink = static_cast<int32_t>(i);
-                }
-            }
-            if (ext_sink >= 0) {
-                gtl::vector<uint32_t> ext_path;
-                for (int32_t cur = ext_sink; cur >= 0; cur = parent[cur])
-                    ext_path.push_back(static_cast<uint32_t>(cur));
-                std::reverse(ext_path.begin(), ext_path.end());
-                size_t branch_pos = 0;
-                bool found_overlap = false;
-                for (size_t i = 0; i < ext_path.size(); ++i) {
-                    if (on_path.contains(ext_path[i])) {
-                        branch_pos = i;
-                        found_overlap = true;
-                    }
-                }
-                if (!found_overlap) [[unlikely]] {
-                    std::fprintf(stderr,
-                        "[layout-dag] WARNING: forward extension has no "
-                        "overlap with main path (%s:%d)\n",
-                        __FILE__, __LINE__);
-                } else {
-                    for (size_t i = branch_pos + 1; i < ext_path.size(); ++i)
-                        path.push_back(ext_path[i]);
-                }
-            }
-
-            // Backward extension
-            int32_t ext_source = -1;
-            i64 ext_from = path_min_from;
-            for (size_t i = 0; i < n; ++i) {
-                if (comp_id[i] != c) continue;
-                if (on_path.contains(static_cast<uint32_t>(i))) continue;
-                i64 from = nodes[scd[i].contig_idx].from;
-                if (from < ext_from && scd_rev[i].empty()) {
-                    ext_from = from;
-                    ext_source = static_cast<int32_t>(i);
-                }
-            }
-            if (ext_source >= 0) {
-                // Greedily walk max-dp successors from the earlier source until
-                // we rejoin the main path. Only prepend if we actually reconnect
-                // (mirrors the forward extension's overlap guard) — otherwise the
-                // prefix would splice a disconnected chain onto the layout. The
-                // `walked` set bounds the walk so a cyclic SCD can't loop forever.
-                gtl::vector<uint32_t> prefix;
-                gtl::flat_hash_set<uint32_t> walked;
-                uint32_t cur = static_cast<uint32_t>(ext_source);
-                bool reconnected = true;
-                while (!on_path.contains(cur)) {
-                    if (!walked.insert(cur).second) {  // revisited → cycle
-                        reconnected = false;
-                        break;
-                    }
-                    prefix.push_back(cur);
-                    uint32_t best_succ = UINT32_MAX;
-                    int64_t best_dp_val = -1;
-                    for (auto &[v, w] : scd_fwd[cur]) {
-                        if (dp[v] > best_dp_val) {
-                            best_dp_val = dp[v];
-                            best_succ = v;
-                        }
-                    }
-                    if (best_succ == UINT32_MAX) {  // dead-end before path
-                        reconnected = false;
-                        break;
-                    }
-                    cur = best_succ;
-                }
-                if (reconnected && !prefix.empty()) {
-                    prefix.insert(prefix.end(), path.begin(), path.end());
-                    path = std::move(prefix);
-                }
-            }
+        // Invariant I3: consecutive path nodes share an SCD edge. parent[] only
+        // ever points at a real predecessor, so this holds by construction —
+        // verify defensively since NDEBUG makes assert() a no-op on release.
+        for (size_t pi = 1; pi < path.size(); ++pi) {
+            bool linked = false;
+            for (auto &[v, w] : scd_fwd[path[pi - 1]])
+                if (v == path[pi]) { linked = true; break; }
+            if (!linked) [[unlikely]]
+                std::fprintf(stderr,
+                    "[layout-dag] layout=%" PRIu64 " WARNING: emitted path not "
+                    "edge-connected at index %zu (%s:%d)\n",
+                    static_cast<uint64_t>(layout_idx), pi, __FILE__, __LINE__);
         }
 
         i64 min_pos = INT64_MAX, max_pos = INT64_MIN;

@@ -1627,14 +1627,16 @@ TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
     CHECK_EQ(edges.begin()->second.dst_super, 4u);
 }
 
-TEST_CASE("layout_graph_emit::find_heaviest_paths drops non-reconnecting "
-          "backward extension (C13)") {
+TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
+          "heaviest chain, never a disconnected prefix (R1)") {
     using namespace layout_graph_emit;
 
     // Main heaviest path A(0)→B(1)→C(2). An earlier source D(3) branches to a
-    // heavy dead-end E(4) and also to A. The greedy backward walk from D prefers
-    // E (higher dp) and dead-ends there before reaching the path, so nothing
-    // should be prepended — the result must stay the connected chain [0,1,2].
+    // heavy dead-end E(4) and also to A. Under the old span-extension heuristics
+    // (C13) a greedy backward walk from D could try to splice D/E onto the front;
+    // R1 removed all extensions, so the result is purely the virtual-source→sink
+    // heaviest path — the connected chain [0,1,2]. D(3) and E(4) are never
+    // prepended because they are not on that traceback.
     gtl::vector<lane_node> nodes(5);
     nodes[0] = {0, 10, 20, true, nullptr};  // A
     nodes[1] = {1, 20, 30, true, nullptr};  // B
@@ -1663,13 +1665,56 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths drops non-reconnecting "
     auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
 
     // The result must be exactly the connected chain [0,1,2] — D(3),E(4) are
-    // NOT prepended, since the greedy backward walk dead-ends at E before
-    // reaching the path (0→1 and 1→2 are the only edges among these nodes).
+    // NOT prepended, since with extensions removed the emitted path is just the
+    // heaviest edge-connected traceback (0→1 and 1→2 are the only edges here).
     REQUIRE_EQ(paths.size(), 1u);
     REQUIRE_EQ(paths[0].path.size(), 3u);
     CHECK_EQ(paths[0].path[0], 0u);
     CHECK_EQ(paths[0].path[1], 1u);
     CHECK_EQ(paths[0].path[2], 2u);
+}
+
+TEST_CASE("layout_graph_emit::find_heaviest_paths does not forward-extend to a "
+          "wider-span lighter sink (R1)") {
+    using namespace layout_graph_emit;
+
+    // Heaviest chain A(0)→B(1)→C(2) (C is heavy). B also branches to D(3), a
+    // sink whose `to` (50) is wider than the whole main path (max_to 30) but
+    // whose path weight is lower. The OLD forward extension spliced D on after
+    // B — emitting [0,1,2,3] to grab the extra span. R1 removed extensions, so
+    // the result is exactly the heaviest edge-connected chain [0,1,2]; the
+    // wider-but-lighter D is dropped. This is the behavior R1 deliberately
+    // changes (verify with QUAST that dropping such span does not regress).
+    gtl::vector<lane_node> nodes(4);
+    nodes[0] = {0, 0, 10, true, nullptr};   // A
+    nodes[1] = {1, 10, 20, true, nullptr};  // B
+    nodes[2] = {2, 20, 30, true, nullptr};  // C (main sink)
+    nodes[3] = {3, 20, 50, true, nullptr};  // D (wider `to`, lighter)
+
+    gtl::vector<scd_node> scd(4);
+    for (uint32_t i = 0; i < 4; ++i) {
+        scd[i].contig_idx = i;
+        scd[i].core_idx = 0;
+        scd[i].core_label = i;
+    }
+    scd[0].weight = 1;  // A
+    scd[1].weight = 1;  // B
+    scd[2].weight = 2;  // C → dp[C]=4 beats dp[D]=3
+    scd[3].weight = 1;  // D
+
+    gtl::vector<scd_adj_t> scd_fwd(4);
+    scd_fwd[0].push_back({1u, 1});  // A→B
+    scd_fwd[1].push_back({2u, 1});  // B→C
+    scd_fwd[1].push_back({3u, 1});  // B→D (wider-span lighter branch)
+
+    auto paths = find_heaviest_paths(scd, scd_fwd, nodes, /*layout_idx*/ 0);
+
+    REQUIRE_EQ(paths.size(), 1u);
+    REQUIRE_EQ(paths[0].path.size(), 3u);   // NOT 4 — D is not appended
+    CHECK_EQ(paths[0].path[0], 0u);
+    CHECK_EQ(paths[0].path[1], 1u);
+    CHECK_EQ(paths[0].path[2], 2u);
+    CHECK_EQ(paths[0].total_weight, 4);
 }
 
 TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
