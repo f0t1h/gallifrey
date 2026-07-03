@@ -836,6 +836,10 @@ struct assembler {
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
 
+        // Discard a reciprocal match that spans less than this fraction (1/N) of
+        // the query node's cores — too short to be a reliable overlap.
+        constexpr size_t MIN_OVERLAP_CORE_FRACTION_DIV = 20;
+
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
@@ -888,7 +892,7 @@ struct assembler {
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
                         if (to_core - from_core <
-                            lr.pos.size() / 20) {  // TODO: parameterize this
+                            lr.pos.size() / MIN_OVERLAP_CORE_FRACTION_DIV) {
                             continue;
                         }
                         hits.fetch_add(1);
@@ -1547,6 +1551,25 @@ TEST_CASE("layout_graph_emit::collect_path_sequences concatenates with gaps") {
         CHECK_EQ(merged[2].len, 0u);   // gap sentinel between components
         CHECK_EQ(merged[3].len, 6u);
     }
+
+    SUBCASE("fallback picks longest representative, not arbitrary first (C12)") {
+        // A single-node path whose node has two candidate contigs and no
+        // continuity hint. The fallback must pick the longer core sequence
+        // (contig 3, len 6), not the first-listed one (contig 5, len 2).
+        gtl::vector<gtl::vector<std::pair<size_t, size_t>>> nc(1);
+        nc[0] = {{5, 0}, {3, 0}};  // first-listed (5) is the SHORT one
+
+        gtl::flat_hash_map<size_t, gtl::vector<SequenceContainerType>> ccs;
+        ccs[5].push_back(make_seq("AC"));      // len 2 (arbitrary nc[0] choice)
+        ccs[3].push_back(make_seq("ACGTAC"));  // len 6 (longest representative)
+
+        gtl::vector<comp_path> paths;
+        paths.push_back({0, 100, 1, gtl::vector<uint32_t>{0u}});
+
+        auto merged = collect_path_sequences(paths, nc, ccs, 1);
+        REQUIRE_EQ(merged.size(), 1u);
+        CHECK_EQ(merged[0].len, 6u);  // longest, not nc[0]'s len 2
+    }
 }
 
 TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
@@ -1647,4 +1670,57 @@ TEST_CASE("layout_graph_emit::find_heaviest_paths drops non-reconnecting "
     CHECK_EQ(paths[0].path[0], 0u);
     CHECK_EQ(paths[0].path[1], 1u);
     CHECK_EQ(paths[0].path[2], 2u);
+}
+
+TEST_CASE("layout_graph_emit::resolve_layout_orientations policies (C10)") {
+    using namespace layout_graph_emit;
+    using layout_graph_algo::layout_result_t;
+
+    auto mk = [](i64 a, i64 b, bool o) { return std::make_tuple(a, b, o); };
+
+    SUBCASE("no conflict → both policies agree, conflicts=0") {
+        layout_result_t layouts;
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, true));
+        layouts.back().emplace(200u, mk(0, 10, false));
+
+        size_t conf = 123;
+        auto fw = resolve_layout_orientations(
+            layouts, orientation_policy::first_wins, &conf);
+        CHECK_EQ(conf, 0u);
+        CHECK_EQ(fw.at(100u), true);
+        CHECK_EQ(fw.at(200u), false);
+
+        auto mv = resolve_layout_orientations(
+            layouts, orientation_policy::majority_vote, &conf);
+        CHECK_EQ(conf, 0u);
+        CHECK_EQ(mv.at(100u), true);
+        CHECK_EQ(mv.at(200u), false);
+    }
+
+    SUBCASE("conflict → first_wins and majority_vote differ") {
+        // node 100: layout0 says '+', layouts 1&2 say '-' (majority '-').
+        // node 200: only layout0, '+', no conflict.
+        layout_result_t layouts;
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, true));
+        layouts.back().emplace(200u, mk(0, 10, true));
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, false));
+        layouts.emplace_back();
+        layouts.back().emplace(100u, mk(0, 10, false));
+
+        size_t conf = 0;
+        auto fw = resolve_layout_orientations(
+            layouts, orientation_policy::first_wins, &conf);
+        CHECK_EQ(conf, 1u);            // exactly node 100 conflicts
+        CHECK_EQ(fw.at(100u), true);   // layout 0 claimed it first
+        CHECK_EQ(fw.at(200u), true);
+
+        auto mv = resolve_layout_orientations(
+            layouts, orientation_policy::majority_vote, &conf);
+        CHECK_EQ(conf, 1u);
+        CHECK_EQ(mv.at(100u), false);  // 2 '-' outvote 1 '+'
+        CHECK_EQ(mv.at(200u), true);
+    }
 }
