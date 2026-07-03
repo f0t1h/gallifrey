@@ -468,60 +468,31 @@ struct assembler {
         }
         return sum;
     }
-    struct rev_match {
-        u64 node;
-        struct ival {
-            u64 from;
-            u64 to;
-            u64 size;
-        };
-        ival tgt;
-        ival qry;
-
-        // Matching LCMER indices.
-        //
-        // Convention:
-        // - *_query_* refer to the QUERY/SOURCE node (the map key / "from"
-        // node)
-        // - *_target_* refer to the TARGET node (rev_match::node)
-        //
-        // These indices are later used to "switch" between SequenceContainer
-        // streams at overlap boundaries without base-offset arithmetic.
-        LCmer first_matching_lcmer_query;
-        LCmer last_matching_lcmer_query;
-        LCmer first_matching_lcmer_target;
-        LCmer last_matching_lcmer_target;
+    // One documented coordinate space for overlaps: inclusive core indices on a
+    // node's (reverse-complemented) core sequence. `len` is the node's core-span
+    // length in *steps* (cores - 1), carried so downstream never re-derives it.
+    struct CoreSpan {
+        u64 from;
+        u64 to;
+        u64 len;
     };
 
-    auto btg_connected_components(gtl::btree_multimap<u64, rev_match> &recig) {
-        gtl::vector<gtl::vector<u64>> components;
-        gtl::flat_hash_set<u64> visited;
-        for (const auto &[from, to] : recig) {
-            gtl::vector<u64> component;
-            gtl::vector<u64> stack;
-            stack.push_back(from);
-            while (!stack.empty()) {
-                u64 node = stack.back();
-                stack.pop_back();
-                if (visited.find(node) != visited.end()) {
-                    continue;
-                }
-                visited.emplace(node);
-                component.push_back(node);
-                auto range = recig.equal_range(node);
-                for (auto it = range.first; it != range.second; ++it) {
-                    if (visited.find(it->second.node) == visited.end()) {
-                        stack.push_back(it->second.node);
-                    }
-                }
-            }
-            if (component.size() > 1) {
-                components.push_back(component);
-            }
-        }
-        return components;
-    }
+    // Phase-A record: on some key node, an overlap with `other` covers `self`
+    // (coordinates on the key node itself). Only the key node's own span is
+    // known at this stage; the partner's span is joined in phase B.
+    struct SelfMatch {
+        u64 other;
+        CoreSpan self;
+    };
 
+    // Phase-B record (a reciprocal overlap), keyed by the query node: `target`
+    // is the partner node id; `query`/`target_span` are each node's core span in
+    // the shared overlap. No reinterpreted fields — names match meaning.
+    struct Overlap {
+        u64 target;
+        CoreSpan query;
+        CoreSpan target_span;
+    };
 
     auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
                     auto &node, dbg_index &dbgi, u64 &idx, int tid) {
@@ -843,7 +814,7 @@ struct assembler {
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
-        gtl::parallel_flat_hash_map_d<u64, gtl::vector<rev_match>, HT_SHARD_BC,
+        gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
         for_each_map(
@@ -897,13 +868,9 @@ struct assembler {
                         }
                         hits.fetch_add(1);
 
-                        // Store match intervals in CORE indices (inclusive).
-                        // IMPORTANT: rev_match fields are u64 and we keep them
-                        // semantically as core-space indices here. Base-space
-                        // scaling happens at emission time.
-                        //
-                        // We also store "length" fields in core-space to keep
-                        // conversions consistent. Core-space length is number
+                        // Store the overlap on THIS node in CORE indices
+                        // (inclusive; see CoreSpan). Base-space scaling happens
+                        // only at emission time. Core-space length is the number
                         // of steps between endpoints: (cores.size() - 1).
                         const u64 core_len_steps =
                             (lr.cores.size() > 0)
@@ -915,22 +882,17 @@ struct assembler {
                             [&](auto &val) {
                                 val.second.emplace_back(
                                     id,
-                                    rev_match::ival{static_cast<u64>(from_core),
-                                                    static_cast<u64>(to_core),
-                                                    core_len_steps},
-                                    rev_match::ival{0, 0, 0}, from_lcmer,
-                                    to_lcmer, LCmer{}, LCmer{});
+                                    CoreSpan{static_cast<u64>(from_core),
+                                             static_cast<u64>(to_core),
+                                             core_len_steps});
                             },
                             [&](const auto &ctr) {
                                 ctr(node.first,
-                                    gtl::vector<rev_match>{rev_match{
+                                    gtl::vector<SelfMatch>{SelfMatch{
                                         id,
-                                        rev_match::ival{
-                                            static_cast<u64>(from_core),
-                                            static_cast<u64>(to_core),
-                                            core_len_steps},
-                                        rev_match::ival{0, 0, 0}, from_lcmer,
-                                        to_lcmer, LCmer{}, LCmer{}}});
+                                        CoreSpan{static_cast<u64>(from_core),
+                                                 static_cast<u64>(to_core),
+                                                 core_len_steps}}});
                             });
                     }
                 }
@@ -938,51 +900,21 @@ struct assembler {
             },
             threads.work);
 
-        gtl::btree_multimap<u64, rev_match> reciprocal;
+        gtl::btree_multimap<u64, Overlap> reciprocal;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
-                // if (k < match.node) {  // smaller node is the key
-                auto it = matched.find(
-                    match.node);  // and matched node also has overlaps
+                // Keep the overlap only if the partner records the reverse one
+                // too (a reciprocal match). `match.self` is k's core span in the
+                // overlap; `ff->self` is the partner's. Both are core-index
+                // spans (see CoreSpan); base-space scaling happens at emission.
+                auto it = matched.find(match.other);
                 if (it != matched.end()) {
                     auto ff = std::find_if(
                         it->second.begin(), it->second.end(),
-                        [k](const auto &val) { return val.node == k; });
-                    if (ff != it->second.end()) {  // and has the reverse match
-                        // Store both query and target coordinates in CORE-INDEX
-                        // space. match.from/to are core indices on k's rev_comp
-                        // (query) ff->from/to are core indices on match.node's
-                        // rev_comp (target)
-                        //
-                        // NOTE: rev_match uses generic u64 fields; here we
-                        // interpret them as core-space units. Base-space
-                        // scaling will be applied only when emitting merged
-                        // sequences / reporting.
-                        rev_match full_match;
-                        full_match.node = match.node;
-                        full_match.tgt.from =
-                            ff->tgt.from;  // ts (target start) in cores
-                        full_match.tgt.to =
-                            ff->tgt.to;  // te (target end) in cores
-                        full_match.tgt.size =
-                            ff->tgt.size;  // tlen in cores (steps)
-                        full_match.qry.from =
-                            match.tgt.from;  // qs (query start) in cores
-                        full_match.qry.to =
-                            match.tgt.to;  // qe (query end) in cores
-                        full_match.qry.size =
-                            match.tgt.size;  // qlen in cores (steps)
-                        full_match.first_matching_lcmer_query =
-                            match.first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_query =
-                            match.last_matching_lcmer_query;
-                        full_match.first_matching_lcmer_target =
-                            ff->first_matching_lcmer_query;
-                        full_match.last_matching_lcmer_target =
-                            ff->last_matching_lcmer_query;
-                        reciprocal.emplace(k, full_match);
-
-                    } else {  // Handle after reciprocals are good
+                        [k](const auto &val) { return val.other == k; });
+                    if (ff != it->second.end()) {
+                        reciprocal.emplace(
+                            k, Overlap{match.other, match.self, ff->self});
                     }
                 }
             }

@@ -32,16 +32,17 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
     gtl::flat_hash_set<u64> visited;
 
     // Precompute node → length once (was an O(N) scan of `recig` per node).
-    // Mirrors the original precedence: a node's length is the `qry.size` of the
-    // first entry keyed by that node (when > 0); otherwise the `tgt.size` of the
-    // first entry (in iteration order) that references it as a target.
-    gtl::flat_hash_map<u64, i64> first_qry_len;  // key node → its first qry.size
-    gtl::flat_hash_map<u64, i64> first_tgt_len;  // target node → first tgt.size>0
+    // Mirrors the original precedence: a node's length is the `query.len` of the
+    // first overlap keyed by that node (when > 0); otherwise the `target_span.len`
+    // of the first overlap (in iteration order) that references it as a target.
+    gtl::flat_hash_map<u64, i64> first_qry_len;  // key node → its first query.len
+    gtl::flat_hash_map<u64, i64> first_tgt_len;  // target node → first tgt len>0
     for (const auto &kv : recig) {
         const auto &rm = kv.second;
-        first_qry_len.try_emplace(kv.first, static_cast<i64>(rm.qry.size));
-        if (rm.tgt.size > 0)
-            first_tgt_len.try_emplace(rm.node, static_cast<i64>(rm.tgt.size));
+        first_qry_len.try_emplace(kv.first, static_cast<i64>(rm.query.len));
+        if (rm.target_span.len > 0)
+            first_tgt_len.try_emplace(rm.target,
+                                      static_cast<i64>(rm.target_span.len));
     }
 
     auto infer_len_for_node = [&](u64 id) -> i64 {
@@ -49,6 +50,15 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
         if (qit != first_qry_len.end() && qit->second > 0) return qit->second;
         auto tit = first_tgt_len.find(id);
         if (tit != first_tgt_len.end()) return tit->second;
+        // Invariant I1: every participating node carries a core-span length
+        // (CoreSpan.len ≥ 1). fold_dbg_graph only admits nodes with
+        // cores.size() ≥ olc_lcmer_l+1, so this branch is unreachable on real
+        // input (C11-verified: zero hits on chr22). Warn rather than silently
+        // emitting a zero-length node if the invariant is ever violated.
+        std::fprintf(stderr,
+                     "[layout] WARNING: node %" PRIu64 " carries no core length "
+                     "(invariant I1 violated); treating as 0\n",
+                     static_cast<uint64_t>(id));
         return 0;
     };
 
@@ -76,7 +86,7 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
             q.pop();
 
             u64 src = node.first;
-            u64 tgt = node.second.node;
+            u64 tgt = node.second.target;
             if (visited.contains(tgt)) continue;
             visited.emplace(tgt);
 
@@ -84,12 +94,13 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
             (void)epos;
             bool target_orient = !s_orient;
 
-            long long qs = s_orient
-                               ? (node.second.qry.size - node.second.qry.to)
-                               : node.second.qry.from;
-            long long ts = target_orient
-                               ? (node.second.tgt.size - node.second.tgt.to)
-                               : node.second.tgt.from;
+            long long qs =
+                s_orient ? (node.second.query.len - node.second.query.to)
+                         : node.second.query.from;
+            long long ts =
+                target_orient
+                    ? (node.second.target_span.len - node.second.target_span.to)
+                    : node.second.target_span.from;
 
             i64 delta = static_cast<i64>(qs - ts);
             i64 target_start = spos + delta;
@@ -101,7 +112,7 @@ inline layout_result_t connected_comp_plus_layout(const RecigMapT &recig) {
 
             auto range = recig.equal_range(tgt);
             for (auto it = range.first; it != range.second; ++it) {
-                if (!visited.contains(it->second.node)) q.push(*it);
+                if (!visited.contains(it->second.target)) q.push(*it);
             }
         }
     }
