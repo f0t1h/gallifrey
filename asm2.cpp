@@ -37,6 +37,30 @@
 using std::string;
 enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 
+// OLC end-skip policy: cores skipped at each end of a DBG node before
+// overlap-anchoring (see find_lcmer_ranges). Written as function-like macros of
+// the OLC lcmer length `l` so they scale with --olc-lcmer-l and can be retuned
+// at compile time without editing source, e.g.:
+//   cmake -DCMAKE_CXX_FLAGS='-DOLC_SKIP_FIRST(l)=0 -DOLC_SKIP_LAST(l)=((l))'
+// The old (l, 2l) required >=4*l cores and forced ~29% of good nodes (chr22)
+// into singletons; the (1, l/2) default drops singleton contigs 87.0%->84.5%
+// and lifts N50 +13% with no extra misassemblies. A node needs
+// (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l)) cores to anchor any overlap.
+#ifndef OLC_SKIP_FIRST
+#define OLC_SKIP_FIRST(l) (1)
+#endif
+#ifndef OLC_SKIP_LAST
+#define OLC_SKIP_LAST(l) ((l) / 2)
+#endif
+
+// Prototype: also keep one-directional (non-reciprocal) overlaps. When A finds
+// B but B never finds A, the reverse overlap normally gets dropped. Enabling
+// this synthesizes an approximate reverse span so those extra nodes can still
+// join a layout. Off by default; build with -DOLC_NONRECIPROCAL=1 to measure.
+#ifndef OLC_NONRECIPROCAL
+#define OLC_NONRECIPROCAL 0
+#endif
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSyncmerRule<uint32_t, SYNCMER_HASHER>;
@@ -65,9 +89,23 @@ struct assembler {
           syncmer_params{cfg.syncmer},
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
-          olc_lcmer_l{cfg.dbg_lcmer_l},
+          olc_lcmer_l{cfg.olc_lcmer_l},
           parallel_file_reading{cfg.parallel_file_reading} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
+        // Overlap detection (fold_dbg_graph → find_lcmer_ranges) queries the
+        // DBG, which is keyed by length-`dbg_lcmer_l` lcmers. The litecmer hash
+        // is window-length dependent, so querying with a different length misses
+        // every key. The two lengths must therefore match for overlaps to be
+        // found; warn loudly rather than silently produce an empty graph.
+        if (olc_lcmer_l != dbg_lcmer_l) {
+            fprintf(stderr,
+                    "[config] WARNING: --olc-lcmer-l (%d) != --dbg-lcmer-l (%d). "
+                    "Overlap detection queries the DBG built at --dbg-lcmer-l, "
+                    "so mismatched lengths lose overlaps and collapse the "
+                    "layout. Set them equal unless you are deliberately "
+                    "probing this behavior.\n",
+                    olc_lcmer_l, dbg_lcmer_l);
+        }
     }
 
     template <class BFT>
@@ -139,8 +177,11 @@ struct assembler {
     }
     static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
                                   int lcmer_l) {
-        long skip_first = lcmer_l;
-        long skip_last = 2 * lcmer_l;
+        // Cores skipped at each node end before overlap-anchoring (see the
+        // OLC_SKIP_* macros). Node ends are boundary-noisy, so a small skip
+        // avoids false anchors.
+        long skip_first = OLC_SKIP_FIRST(lcmer_l);
+        long skip_last = OLC_SKIP_LAST(lcmer_l);
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
@@ -494,57 +535,6 @@ struct assembler {
         CoreSpan target_span;
     };
 
-    auto add_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                    auto &node, dbg_index &dbgi, u64 &idx, int tid) {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        // dbgi.dbg.for_each([&](auto &node) {
-        if (node.second.redirected()) {
-            return;
-        }
-        // good_n.fetch_add(1);
-        lr.clear();
-
-        // Extract a subsequence [from, to) from the concatenated rev_seqs
-        // Returns a single CrumbledSubSeq64 containing the extracted range
-
-        init_lps_crumbled(&str, subseqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-
-
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
-            // good_n.fetch_sub(1);
-            free_lps(&str);
-            return;
-        }
-        gtl::vector<u64> ll = {0};
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            ll.push_back(dbgi.emplace_nobloomfilter(l, idx, tid));
-        }
-        ll.push_back(0);
-
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            if (insert_lcmer_helper(ll, i, dbgi)) {
-                dbgi.dbg.modify_if(
-                    ll[i], [&lr, i, &subseqs,
-                            this](dbg_index::dbg_map_t::value_type &val) {
-                        val.second.seq.emplace_back(
-                            subseqs, lr.pos[i + olc_lcmer_l - 1].second,
-                            lr.pos[i + olc_lcmer_l].second);
-                    });
-            }
-        }
-    }
-
     static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
                                const SyncmerType &syncmer_functor,
                                int lcp_level, lps &str) -> lcp_read {
@@ -762,48 +752,6 @@ struct assembler {
         return {std::move(lr), std::move(core_seqs)};
     }
 
-    auto find_rev_lcmers(const gtl::vector<SequenceContainerType> &subseqs,
-                         dbg_index &dbgi, int tid, u64 &idx)
-        -> gtl::vector<SequenceContainerType> {
-        lps str = {0, 0, 0, 0};
-        lcp_read lr;
-        lr.clear();
-
-        gtl::vector<SequenceContainerType> rev_seqs;
-        for (auto it = subseqs.rbegin(); it != subseqs.rend(); ++it) {
-            rev_seqs.emplace_back(it->reverse_complement());
-        }
-        init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
-
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
-        if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 2)) {
-            free_lps(&str);
-            return {};
-        }
-        LCmer l{lr.cores.begin() + 1, olc_lcmer_l};  // Skip first core;
-        gtl::vector<u64> ll;
-
-        u64 lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-        ll.emplace_back(lval);
-        for (size_t i = 2; i + olc_lcmer_l + 1 < lr.cores.size(); ++i) {
-            uint32_t in_core = lr.cores[i + olc_lcmer_l];
-            l.update_lcmer(in_core, lr.cores[i], olc_lcmer_l);
-            lval = dbgi.emplace_nobloomfilter(l, idx, tid);
-            ll.emplace_back(lval);
-        }
-        gtl::vector<SequenceContainerType> seqs;
-        for (size_t i = 1; i < ll.size() - 1; ++i) {
-            seqs.emplace_back(rev_seqs, lr.pos[i + olc_lcmer_l - 1].second,
-                              lr.pos[i + olc_lcmer_l].second);
-            seqs.back().origin_node = ll[i];
-        }
-        // TODO: index it if needed
-        return seqs;
-    }
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
 
@@ -814,6 +762,10 @@ struct assembler {
         std::atomic<int> all_n{0};
         std::atomic<int> hits{0};
         std::atomic<int> bad{0};
+        // Phase-0 matching diagnostics: why do good nodes fail to match?
+        std::atomic<int> too_short{0};   // < 4*olc_lcmer_l cores → no ranges (#4)
+        std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
+        std::atomic<int> frac_drop{0};   // overlap < 5% of cores, filtered (#6)
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
@@ -858,14 +810,24 @@ struct assembler {
                 // `find_lcmer_ranges()` already returns [from_core,to_core] in
                 // core indices (inclusive), which is the correct coordinate
                 // system for connected_comp_plus_layout().
+                // Matching diagnostic: bucket why a good node yields no match.
+                // Mirrors find_lcmer_ranges' gate via the same OLC_SKIP_* macros.
+                if (lr.cores.size() <
+                    static_cast<size_t>(olc_lcmer_l + OLC_SKIP_FIRST(olc_lcmer_l) +
+                                        OLC_SKIP_LAST(olc_lcmer_l))) {
+                    too_short.fetch_add(1);  // fails find_lcmer_ranges gate (#4)
+                }
                 auto found_ranges = find_lcmer_ranges(lr, dbgi, olc_lcmer_l);
+                bool any_hit = false;
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
                         if (to_core - from_core <
                             lr.pos.size() / MIN_OVERLAP_CORE_FRACTION_DIV) {
+                            frac_drop.fetch_add(1);
                             continue;
                         }
+                        any_hit = true;
                         hits.fetch_add(1);
 
                         // Store the overlap on THIS node in CORE indices
@@ -896,11 +858,18 @@ struct assembler {
                             });
                     }
                 }
+                if (!any_hit &&
+                    lr.cores.size() >=
+                        static_cast<size_t>(olc_lcmer_l +
+                                            OLC_SKIP_FIRST(olc_lcmer_l) +
+                                            OLC_SKIP_LAST(olc_lcmer_l)))
+                    no_ranges.fetch_add(1);
                 free_lps(&str);
             },
             threads.work);
 
         gtl::btree_multimap<u64, Overlap> reciprocal;
+        int non_recip = 0, recip_kept = 0;
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // Keep the overlap only if the partner records the reverse one
@@ -908,19 +877,39 @@ struct assembler {
                 // overlap; `ff->self` is the partner's. Both are core-index
                 // spans (see CoreSpan); base-space scaling happens at emission.
                 auto it = matched.find(match.other);
-                if (it != matched.end()) {
-                    auto ff = std::find_if(
-                        it->second.begin(), it->second.end(),
-                        [k](const auto &val) { return val.other == k; });
-                    if (ff != it->second.end()) {
-                        reciprocal.emplace(
-                            k, Overlap{match.other, match.self, ff->self});
-                    }
+                auto ff = (it != matched.end())
+                              ? std::find_if(it->second.begin(),
+                                             it->second.end(),
+                                             [k](const auto &val) {
+                                                 return val.other == k;
+                                             })
+                              : gtl::vector<SelfMatch>::const_iterator{};
+                if (it != matched.end() && ff != it->second.end()) {
+                    reciprocal.emplace(k,
+                                       Overlap{match.other, match.self, ff->self});
+                    ++recip_kept;
+                } else {
+                    ++non_recip;  // one-directional match (#7)
+#if OLC_NONRECIPROCAL
+                    // Prototype: keep it anyway. We only know k's span
+                    // (match.self); approximate the partner's span as the same
+                    // shape (self-symmetric) so connected_comp_plus_layout can
+                    // still position the partner. Coarse — it measures whether
+                    // wiring these extra nodes in helps before we compute the
+                    // partner's real overlap interval.
+                    reciprocal.emplace(
+                        k, Overlap{match.other, match.self, match.self});
+#endif
                 }
             }
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
+        fprintf(stderr,
+                "[match-diag] too_short:%d no_ranges:%d frac_drop:%d "
+                "recip_kept:%d non_recip:%d\n",
+                too_short.load(), no_ranges.load(), frac_drop.load(), recip_kept,
+                non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
 

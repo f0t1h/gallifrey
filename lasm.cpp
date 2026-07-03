@@ -33,6 +33,11 @@ public:
         app.add_option("--dbg-lcmer-l", cfg.dbg_lcmer_l,
                        "DBG LCMER window length")
             ->capture_default_str();
+        app.add_option("--olc-lcmer-l", cfg.olc_lcmer_l,
+                       "OLC (overlap) LCMER window length. Overlap detection "
+                       "queries the DBG (built at --dbg-lcmer-l), so this must "
+                       "equal --dbg-lcmer-l or overlaps are lost")
+            ->capture_default_str();
         app.add_option("-t,--threads", cfg.threads.work,
                        "Number of worker threads")
             ->capture_default_str();
