@@ -132,10 +132,13 @@ struct dbg_index_base {
             return seq.empty() ? 0.0 : (double)counts.core_count / seq.size();
         }
     };
-    using dbg_map_t = gtl::parallel_flat_hash_map<
-        u64, bidbg_val, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
-        std::allocator<std::pair<const u64, bidbg_val>>, HT_SHARD_BC,
-        mutex_type>;
+    // Shared mutex-backed sharded map policy (shard count HT_SHARD_BC) used by
+    // both the DBG and the successor tracker.
+    template <class V>
+    using sharded_map_t = gtl::parallel_flat_hash_map<
+        u64, V, std::hash<u64>, gtl::priv::hash_default_eq<u64>,
+        std::allocator<std::pair<const u64, V>>, HT_SHARD_BC, mutex_type>;
+    using dbg_map_t = sharded_map_t<bidbg_val>;
 
     struct lci_type {
         u64 id;
@@ -147,12 +150,12 @@ struct dbg_index_base {
     dbg_map_t dbg;
     gtl::btree_set<u64> active_set;
 
-    // Side successor tracker, populated ONLY on the insert-classification path
-    // (--dump-insert-types); untouched on normal runs. The DBG stores only
-    // `prev` (in-edges), so detecting branch-OPEN events (a node gaining a
-    // second distinct successor) needs an out-edge view. Maps node id -> the
-    // successor ids seen so far during construction.
-    gtl::parallel_flat_hash_map<u64, gtl::vector<u64>> succ_track;
+    // Side successor tracker, populated on insertion-classification and
+    // --thread-bridge construction paths; untouched on ordinary runs. The DBG
+    // stores only `prev` (in-edges), so branch detection needs this out-edge
+    // view. Maps node id -> successor ids seen so far during construction.
+    using succ_map_t = sharded_map_t<gtl::vector<u64>>;
+    succ_map_t succ_track;
 
     // merge_info_map_t merge_map;
     BloomFilterType bf;

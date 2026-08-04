@@ -216,9 +216,9 @@ struct asm_config {
         int min_support = 5;  // reads needed to confirm a bridge adjacency
         int min_anchor = 10;  // min unitig length (cores) to be a bridge anchor
         // When non-empty, also materialize a scaffold FASTA at this path: the
-        // bridge edges are walked (orientation-aware) to concatenate the joined
-        // supernode sequences (N-gap between); unbridged supernodes are emitted
-        // as-is. Opt-in; the GFA output is unaffected.
+        // realization-safe bridge edges are walked (orientation-aware) to
+        // concatenate joined supernode sequences with sized N-gaps; uncertain,
+        // overlap, and unresolved-C links remain GFA-only. Opt-in.
         std::string fasta_path;
     } thread_bridge;
     struct {

@@ -1,4 +1,5 @@
 #include <CLI/CLI.hpp>
+#include <limits>
 #include <map>
 #include <string>
 // #include <vector>
@@ -71,19 +72,23 @@ public:
                        "Classify each read's DBG insertions "
                        "(novel/coverage/branch-open/branch-join) to this TSV")
             ->capture_default_str();
-        app.add_flag("--thread-bridge", cfg.thread_bridge.enable,
-                     "Read-threading bridge pass (confirmed bridges -> "
-                     "<output>.threads.tsv)")
-            ->capture_default_str();
+        auto *thread_bridge =
+            app.add_flag("--thread-bridge", cfg.thread_bridge.enable,
+                         "Read-threading bridge pass (confirmed bridges -> "
+                         "<output>.threads.tsv)")
+                ->capture_default_str();
         app.add_option("--thread-bridge-cap", cfg.thread_bridge.cap,
                        "Max retained reads per bridge key (counting bloom)")
+            ->check(CLI::Range(1, 255))
             ->capture_default_str();
         app.add_option("--thread-bridge-min-support", cfg.thread_bridge.min_support,
                        "Reads needed to confirm a threaded bridge")
+            ->check(CLI::Range(1, std::numeric_limits<int>::max()))
             ->capture_default_str();
         app.add_option("--thread-bridge-fasta", cfg.thread_bridge.fasta_path,
                        "Also write a scaffold FASTA (bridge-joined supernode "
                        "sequences) to this path")
+            ->needs(thread_bridge)
             ->capture_default_str();
         app.add_option("--spaced-seed-mask", cfg.syncmer.spaced_seed_mask,
                        "Mask for spaced seeding. 0->remove the position from "

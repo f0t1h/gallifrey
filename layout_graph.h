@@ -9,14 +9,18 @@
 #include <cinttypes>
 #include <cstdio>
 #include <cstring>
+#include <expected>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <map>
+#include <memory>
+#include <optional>
 #include <queue>
 // #include <stack>
 #include <string>
 #include <thread>
 #include <tuple>
+#include <utility>
 
 #include "graph.h"
 
@@ -885,6 +889,110 @@ struct supernode_out {
     }
 };
 
+enum class bridge_realization : uint8_t {
+    gap_safe,
+    overlap_unresolved,
+    gap_uncertain,
+};
+
+inline const char *bridge_realization_label(bridge_realization status) {
+    switch (status) {
+        case bridge_realization::gap_safe: return "gap_safe";
+        case bridge_realization::overlap_unresolved:
+            return "overlap_unresolved";
+        case bridge_realization::gap_uncertain: return "gap_uncertain";
+    }
+    return "gap_uncertain";
+}
+
+struct signed_gap_summary {
+    uint32_t count = 0;
+    int64_t median = 0;
+    int64_t p10 = 0;
+    int64_t p90 = 0;
+    int64_t mad = 0;
+};
+
+// One read's signed anchor-run separation. Keeping qname attached until final
+// superedge projection prevents one read from being counted again when several
+// confirmed anchor pairs collapse onto the same superedge.
+struct bridge_read_gap_observation {
+    u64 qname = 0;  // qname hash (read identity)
+    int64_t gap = 0;
+};
+
+// Sort `values` by `less`, then collapse each run of `same`-equal records to the
+// run's lower empirical median element (index floor((n-1)/2)). Shared by the
+// distinct-vote dedup and the per-qname read-gap collapse; both put `.gap` last
+// in `less`, so the retained element carries each group's lower median gap.
+template <class T, class Less, class Same>
+inline gtl::vector<T> collapse_runs_lower_median(gtl::vector<T> values,
+                                                 Less less, Same same) {
+    std::sort(values.begin(), values.end(), less);
+    gtl::vector<T> out;
+    out.reserve(values.size());
+    for (size_t first = 0; first < values.size();) {
+        size_t last = first + 1;
+        while (last < values.size() && same(values[last], values[first])) ++last;
+        out.push_back(values[first + (last - first - 1) / 2]);
+        first = last;
+    }
+    return out;
+}
+
+// Collapse all observations for each qname to its deterministic lower empirical
+// median. The returned gaps therefore have exactly one entry per distinct read.
+inline gtl::vector<int64_t> collapse_bridge_read_gaps_by_qname(
+    gtl::vector<bridge_read_gap_observation> observations) {
+    const auto collapsed = collapse_runs_lower_median(
+        std::move(observations),
+        [](const auto &a, const auto &b) {
+            return std::tie(a.qname, a.gap) < std::tie(b.qname, b.gap);
+        },
+        [](const auto &a, const auto &b) { return a.qname == b.qname; });
+    gtl::vector<int64_t> gaps;
+    gaps.reserve(collapsed.size());
+    for (const auto &o : collapsed) gaps.push_back(o.gap);
+    return gaps;
+}
+
+// Sorts observations in place. Quantiles use the deterministic lower empirical
+// index floor((n - 1) * p), and MAD uses the same median convention.
+inline signed_gap_summary summarize_signed_gaps(gtl::vector<int64_t> &gaps) {
+    signed_gap_summary result;
+    if (gaps.empty()) return result;
+    std::sort(gaps.begin(), gaps.end());
+    const size_t n = gaps.size();
+    auto quantile = [&](size_t numerator) {
+        return gaps[((n - 1) * numerator) / 100];
+    };
+    result.count = static_cast<uint32_t>(n);
+    result.median = quantile(50);
+    result.p10 = quantile(10);
+    result.p90 = quantile(90);
+    gtl::vector<int64_t> deviations;
+    deviations.reserve(n);
+    for (int64_t gap : gaps)
+        deviations.push_back(gap >= result.median ? gap - result.median
+                                                  : result.median - gap);
+    std::sort(deviations.begin(), deviations.end());
+    result.mad = deviations[(n - 1) / 2];
+    return result;
+}
+
+inline bridge_realization classify_bridge_realization(
+    const signed_gap_summary &gap) {
+    if (gap.median <= 0) return bridge_realization::overlap_unresolved;
+    // MAD can remain tiny when a near-zero mode hides a substantial alternate
+    // gap population. Keep such conflicting observations graph-only.
+    if (gap.median <= 500 && gap.p90 - gap.median > 1000)
+        return bridge_realization::gap_uncertain;
+    if (gap.count >= 5 &&
+        (gap.mad <= 500 || gap.p90 - gap.p10 <= 1000))
+        return bridge_realization::gap_safe;
+    return bridge_realization::gap_uncertain;
+}
+
 struct edge_agg {
     u64 src_super = 0;
     u64 dst_super = 0;
@@ -898,10 +1006,24 @@ struct edge_agg {
     // --thread-bridge: set on read-threaded scaffold edges injected after
     // layout cleaning. Tagged distinctly in the GFA so they are separable from
     // layout junction edges. tb_support = confirming read count; tb_gap =
-    // estimated tangle gap in bases (0 = abutting/overlap).
+    // signed anchor separation in read bases.
     bool thread_bridge = false;
     uint32_t tb_support = 0;
-    uint32_t tb_gap = 0;
+    int64_t tb_gap = 0;
+    signed_gap_summary tb_gap_summary;
+    bridge_realization tb_realization = bridge_realization::gap_uncertain;
+    bool tb_c_orientation_unresolved = false;
+};
+
+// One cleaned-unitig representative traversed inside a bridge's collapsed tangle,
+// with the raw DBG nodes at which the representative supporting read entered and
+// exited it. Tier-2 gap materialization reconstructs the gap sequence by walking
+// these reps through the layout's overlap-aware assembler; entry/exit fix the
+// sub-span and orientation the read actually traversed.
+struct tangle_segment {
+    u64 rep = 0;
+    u64 entry_raw = 0;
+    u64 exit_raw = 0;
 };
 
 // A confirmed read-threaded bridge: DBG unitig u abuts v (directed u->v), backed
@@ -912,8 +1034,35 @@ struct bridge_edge {
     u64 u = 0;
     u64 v = 0;
     uint32_t support = 0;
-    uint32_t gap = 0;
+    int64_t gap = 0;
+    signed_gap_summary gap_summary;
+    bridge_realization realization = bridge_realization::gap_uncertain;
+    gtl::vector<bridge_read_gap_observation> read_gap_observations;
+    // Representative tangle path (empty unless Tier-2 capture found one). The
+    // representative walk is the supporting read whose tangle length is closest
+    // to `gap`; ties broken deterministically for -t1 reproducibility.
+    gtl::vector<tangle_segment> gap_path;
+
+    bridge_edge() = default;
+    bridge_edge(u64 from, u64 to, uint32_t read_support, int64_t signed_gap = 0)
+        : u{from}, v{to}, support{read_support}, gap{signed_gap} {}
+    bridge_edge(u64 from, u64 to, uint32_t read_support, int64_t signed_gap,
+                signed_gap_summary summary, bridge_realization status,
+                gtl::vector<bridge_read_gap_observation> observations)
+        : u{from},
+          v{to},
+          support{read_support},
+          gap{signed_gap},
+          gap_summary{summary},
+          realization{status},
+          read_gap_observations{std::move(observations)} {}
 };
+
+inline bool thread_bridge_is_fasta_safe(const edge_agg &edge) {
+    return edge.thread_bridge &&
+           edge.tb_realization == bridge_realization::gap_safe &&
+           edge.tb_gap > 0 && !edge.tb_c_orientation_unresolved;
+}
 
 using edge_key = std::tuple<u64, u64, char, char, uint8_t, uint8_t>;
 using supernode_vec = gtl::vector<supernode_out>;
@@ -1352,22 +1501,35 @@ inline edge_map aggregate_superedges(
 // After layout cleaning, add a scaffold superedge for each confirmed bridge
 // (u->v) whose anchors resolve to distinct, live supernodes on real boundary
 // sides. Reuses the boundary/orientation gate of aggregate_superedges. A strict
-// 1:1 filter (each supernode endpoint used by exactly one bridge) keeps the
-// added edges simple-path only, so no branchy scaffolds are asserted. O(#bridges)
-// map lookups; no sequence work.
-inline size_t inject_thread_bridge_edges(
+// 1:1 filter (each known physical (supernode, side) endpoint used by exactly
+// one bridge) keeps M-only additions simple-path only. Standalone C endpoints
+// have no resolved side, remain diagnostic GFA links, and are never used for
+// FASTA scaffolding. No sequence work is performed.
+struct bridge_injection_result {
+    size_t added = 0;
+    size_t invalid_endpoint = 0;
+    size_t intra_supernode = 0;
+    size_t aggregated_records = 0;
+    size_t existing_edge = 0;
+    size_t projection_conflict = 0;
+    size_t endpoint_reuse = 0;
+};
+
+inline bridge_injection_result inject_thread_bridge_edges(
     const gtl::vector<bridge_edge> &bridges, const supernode_vec &supernodes,
     const gtl::flat_hash_map<u64, u64> &node_to_super,
     const gtl::flat_hash_set<u64> &nodes_in_layouts,
     const gtl::flat_hash_map<u64, bool> &node_layout_ori,
     const gtl::flat_hash_map<u64, uint8_t> &node_boundary_mask,
     edge_map &merged_edges) {
-    if (bridges.empty()) return 0;
+    bridge_injection_result result;
+    if (bridges.empty()) return result;
 
     // Resolve an anchor to (supernode, orientation char, side). is_src selects
     // the exit side (u) vs the entry side (v), matching aggregate_superedges.
     struct resolved {
         bool ok = false;
+        bool orientation_known = false;
         u64 super = 0;
         char ori = '+';
         uint8_t side = 0;
@@ -1391,65 +1553,213 @@ inline size_t inject_thread_bridge_edges(
             if (mit == node_boundary_mask.end() || (mit->second & side) == 0)
                 return {};  // anchor is not on a free contig boundary
         }
-        return {true, super, ori, side};
+        return {true, nodes_in_layouts.contains(id), super, ori, side};
     };
 
-    // Candidate edges + endpoint usage tally for the 1:1 filter.
-    struct candidate {
-        edge_key key;
-        edge_agg agg;
-        u64 ep_src, ep_dst;  // packed endpoint ids (super, side, dir)
+    using physical_endpoint = std::pair<u64, uint8_t>;
+    using physical_pair =
+        std::tuple<u64, uint8_t, u64, uint8_t>;
+    using super_pair = std::pair<u64, u64>;
+    struct projection {
+        physical_pair endpoints;
+        std::pair<std::optional<char>, std::optional<char>> orientations;
+        u64 first_anchor = 0;
+        u64 second_anchor = 0;
+        bool first_endpoint_known = false;
+        bool second_endpoint_known = false;
+        bool c_orientation_unresolved = false;
     };
-    auto pack_ep = [](u64 super, uint8_t side, int dir) -> u64 {
-        return (super << 3) ^ (static_cast<u64>(side) << 1) ^
-               static_cast<u64>(dir);
+    auto flip = [](char ori) { return ori == '+' ? '-' : '+'; };
+    auto project = [&](const resolved &src, const resolved &dst, u64 u,
+                       u64 v) {
+        const physical_endpoint src_ep{src.super, src.side};
+        const physical_endpoint dst_ep{dst.super, dst.side};
+        const std::optional<char> src_ori =
+            src.orientation_known ? std::optional<char>{src.ori} : std::nullopt;
+        const std::optional<char> dst_ori =
+            dst.orientation_known ? std::optional<char>{dst.ori} : std::nullopt;
+        if (src_ep <= dst_ep)
+            return projection{{src.super, src.side, dst.super, dst.side},
+                              {src_ori, dst_ori}, u, v,
+                              src.orientation_known, dst.orientation_known,
+                              !src.orientation_known || !dst.orientation_known};
+        // Reversing a GFA link flips both segment orientations.
+        return projection{{dst.super, dst.side, src.super, src.side},
+                           {dst_ori ? std::optional<char>{flip(*dst_ori)}
+                                    : std::nullopt,
+                            src_ori ? std::optional<char>{flip(*src_ori)}
+                                    : std::nullopt},
+                           v, u,
+                           dst.orientation_known, src.orientation_known,
+                           !src.orientation_known || !dst.orientation_known};
     };
-    gtl::vector<candidate> cands;
-    gtl::flat_hash_map<u64, int> ep_use;
-    // Both directions of a join are confirmed (forward and reverse-complement
-    // reads span the same adjacency), so collapse to one undirected edge per
-    // supernode pair. Supernode indices are small (< 2^32), pack losslessly.
-    gtl::flat_hash_set<u64> seen_pair;
+    auto projections_agree = [](const projection &a, const projection &b) {
+        if (a.endpoints != b.endpoints) return false;
+        const auto orientation_agrees = [](const std::optional<char> &x,
+                                           const std::optional<char> &y) {
+            return !x || !y || *x == *y;
+        };
+        return orientation_agrees(a.orientations.first,
+                                  b.orientations.first) &&
+               orientation_agrees(a.orientations.second,
+                                  b.orientations.second);
+    };
+    auto merge_projection_orientation = [](projection &dst,
+                                           const projection &src) {
+        if (!dst.orientations.first)
+            dst.orientations.first = src.orientations.first;
+        if (!dst.orientations.second)
+            dst.orientations.second = src.orientations.second;
+        dst.first_endpoint_known |= src.first_endpoint_known;
+        dst.second_endpoint_known |= src.second_endpoint_known;
+        dst.c_orientation_unresolved |= src.c_orientation_unresolved;
+    };
+
+    struct candidate_group {
+        projection projected;
+        bool initialized = false;
+        bool conflict = false;
+        gtl::vector<bridge_read_gap_observation> read_gaps;
+    };
+    std::map<super_pair, candidate_group> groups;
+    size_t bridge_record_index = 0;
     for (const auto &b : bridges) {
         if (b.u == b.v) continue;
         resolved su = resolve(b.u, /*is_src=*/true);
         resolved sv = resolve(b.v, /*is_src=*/false);
-        if (!su.ok || !sv.ok || su.super == sv.super) continue;
-        const u64 lo = std::min(su.super, sv.super);
-        const u64 hi = std::max(su.super, sv.super);
-        if (!seen_pair.insert((lo << 32) | hi).second)
-            continue;  // reciprocal / duplicate join already taken
-        edge_key key{su.super, sv.super, su.ori, sv.ori, su.side, sv.side};
-        if (merged_edges.count(key)) continue;  // layout already connects them
-        edge_agg agg;
-        agg.src_super = su.super;
-        agg.dst_super = sv.super;
-        agg.src_ori = su.ori;
-        agg.dst_ori = sv.ori;
-        agg.src_side = su.side;
-        agg.dst_side = sv.side;
-        agg.example_from = b.u;
-        agg.example_to = b.v;
-        agg.count = b.support;
-        agg.thread_bridge = true;
-        agg.tb_support = b.support;
-        agg.tb_gap = b.gap;
-        const u64 ep_src = pack_ep(su.super, su.side, 0);
-        const u64 ep_dst = pack_ep(sv.super, sv.side, 1);
-        ep_use[ep_src]++;
-        ep_use[ep_dst]++;
-        cands.push_back({key, agg, ep_src, ep_dst});
+        if (!su.ok || !sv.ok) {
+            ++result.invalid_endpoint;
+            continue;
+        }
+        if (su.super == sv.super) {
+            ++result.intra_supernode;
+            continue;
+        }
+        const super_pair pair{std::min(su.super, sv.super),
+                              std::max(su.super, sv.super)};
+        const projection p = project(su, sv, b.u, b.v);
+        auto &group = groups[pair];
+        if (!group.initialized) {
+            group.projected = p;
+            group.initialized = true;
+        } else if (!projections_agree(group.projected, p)) {
+            group.conflict = true;
+        } else {
+            ++result.aggregated_records;
+            merge_projection_orientation(group.projected, p);
+        }
+        if (!b.read_gap_observations.empty()) {
+            group.read_gaps.insert(group.read_gaps.end(),
+                                   b.read_gap_observations.begin(),
+                                   b.read_gap_observations.end());
+        } else {
+            // Compatibility for API callers that only provide aggregate
+            // support: represent each count as a record-local synthetic read via
+            // a distinct qname hash so the collapse keeps them separate.
+            // Production bridges always take the qname-preserving path above.
+            for (uint32_t i = 0; i < b.support; ++i)
+                group.read_gaps.push_back(
+                    {(static_cast<u64>(bridge_record_index) << 32) | i, b.gap});
+        }
+        ++bridge_record_index;
     }
 
-    size_t added = 0;
-    for (const auto &c : cands) {
-        // 1:1 filter: both endpoints used by exactly one candidate bridge.
-        if (ep_use[c.ep_src] != 1 || ep_use[c.ep_dst] != 1) continue;
-        if (merged_edges.count(c.key)) continue;  // paranoia vs candidate dup
-        merged_edges[c.key] = c.agg;
-        ++added;
+    struct candidate {
+        edge_key key;
+        edge_agg agg;
+        physical_endpoint first_endpoint;
+        physical_endpoint second_endpoint;
+        bool first_endpoint_known = false;
+        bool second_endpoint_known = false;
+    };
+    gtl::vector<candidate> candidates;
+    std::map<physical_endpoint, size_t> endpoint_use;
+    for (auto &[_, group] : groups) {
+        if (group.conflict) {
+            ++result.projection_conflict;
+            continue;
+        }
+        auto [ss, sside, ds, dside] = group.projected.endpoints;
+        bool equivalent_existing = false;
+        bool conflicting_existing = false;
+        for (const auto &[existing_key, existing] : merged_edges) {
+            (void)existing_key;
+            const projection ep = project(
+                {true, existing.src_side != 0, existing.src_super,
+                 existing.src_ori, existing.src_side},
+                {true, existing.dst_side != 0, existing.dst_super,
+                 existing.dst_ori, existing.dst_side},
+                existing.example_from, existing.example_to);
+            if (ep.endpoints != group.projected.endpoints) continue;
+            if (projections_agree(ep, group.projected))
+                equivalent_existing = true;
+            else
+                conflicting_existing = true;
+        }
+        if (equivalent_existing) {
+            ++result.existing_edge;
+            continue;
+        }
+        if (conflicting_existing) {
+            ++result.projection_conflict;
+            continue;
+        }
+
+        auto distinct_gaps =
+            collapse_bridge_read_gaps_by_qname(std::move(group.read_gaps));
+        const signed_gap_summary gap = summarize_signed_gaps(distinct_gaps);
+        const uint32_t support = gap.count;
+        const char sori = group.projected.orientations.first.value_or('+');
+        const char dori = group.projected.orientations.second.value_or('+');
+        edge_agg agg;
+        agg.src_super = ss;
+        agg.dst_super = ds;
+        agg.src_ori = sori;
+        agg.dst_ori = dori;
+        agg.src_side = sside;
+        agg.dst_side = dside;
+        agg.example_from = group.projected.first_anchor;
+        agg.example_to = group.projected.second_anchor;
+        agg.count = support;
+        agg.thread_bridge = true;
+        agg.tb_support = support;
+        agg.tb_gap = gap.median;
+        agg.tb_gap_summary = gap;
+        agg.tb_realization = classify_bridge_realization(gap);
+        agg.tb_c_orientation_unresolved =
+            group.projected.c_orientation_unresolved;
+        edge_key key{ss, ds, sori, dori, sside, dside};
+        physical_endpoint first{ss, sside}, second{ds, dside};
+        if (group.projected.first_endpoint_known) ++endpoint_use[first];
+        if (group.projected.second_endpoint_known) ++endpoint_use[second];
+        candidates.push_back({key, agg, first, second,
+                              group.projected.first_endpoint_known,
+                              group.projected.second_endpoint_known});
     }
-    return added;
+
+    for (const auto &c : candidates) {
+        // 1:1 filter: each orientation-resolved endpoint is used by exactly
+        // one candidate bridge. C/unknown side 0 is not a physical endpoint.
+        if ((c.first_endpoint_known && endpoint_use[c.first_endpoint] != 1) ||
+            (c.second_endpoint_known && endpoint_use[c.second_endpoint] != 1)) {
+            ++result.endpoint_reuse;
+            continue;
+        }
+        if (merged_edges.count(c.key)) {
+            ++result.existing_edge;
+            continue;
+        }
+        merged_edges[c.key] = c.agg;
+        ++result.added;
+    }
+    std::fprintf(stderr,
+                 "thread-bridge inject: added=%zu aggregated=%zu "
+                 "invalid=%zu intra=%zu existing=%zu conflict=%zu reuse=%zu\n",
+                 result.added, result.aggregated_records,
+                 result.invalid_endpoint, result.intra_supernode,
+                 result.existing_edge, result.projection_conflict,
+                 result.endpoint_reuse);
+    return result;
 }
 
 // ── Phase: format supernode S-lines (parallel) and write the GFA ────────
@@ -1538,7 +1848,7 @@ inline void write_gfa(const supernode_vec &supernodes,
     }
 
     char lbuf[1024];
-    char tbuf[64];
+    char tbuf[160];
     for (const auto &[_, edge] : merged_edges) {
         const auto &src_name = supernodes[edge.src_super].name;
         const auto &dst_name = supernodes[edge.dst_super].name;
@@ -1546,8 +1856,14 @@ inline void write_gfa(const supernode_vec &supernodes,
         // consumer can separate them from layout junction edges.
         tbuf[0] = '\0';
         if (edge.thread_bridge)
-            std::snprintf(tbuf, sizeof(tbuf), "\tTP:Z:bridge\tTB:i:%u\tGL:i:%u",
-                          edge.tb_support, edge.tb_gap);
+            std::snprintf(tbuf, sizeof(tbuf),
+                          "\tTP:Z:bridge\tTB:i:%u\tGL:i:%" PRId64
+                          "\tTR:Z:%s%s",
+                          edge.tb_support, edge.tb_gap,
+                          bridge_realization_label(edge.tb_realization),
+                          edge.tb_c_orientation_unresolved
+                              ? "\tCO:Z:unresolved"
+                              : "");
         int n = std::snprintf(
             lbuf, sizeof(lbuf),
             "L\t%s\t%c\t%s\t%c\t0M\tSO:Z:%c\tTO:Z:%c\tSS:Z:%s\tTS:Z:%s\t"
@@ -1571,15 +1887,26 @@ inline void write_gfa(const supernode_vec &supernodes,
 // the FASTA is a complete assembly (usable directly by QUAST). Branchy bridge
 // components (a node with >2 bridge ends) are NOT scaffolded — their members are
 // emitted standalone. Opt-in: does not touch the GFA path.
-inline void write_thread_bridge_fasta(const supernode_vec &supernodes,
-                                      const edge_map &merged_edges,
-                                      const std::string &path) {
-    FILE *fa = std::fopen(path.c_str(), "w");
+inline std::expected<void, std::string> write_thread_bridge_fasta(
+    const supernode_vec &supernodes, const edge_map &merged_edges,
+    const std::string &path) {
+    using file_handle = std::unique_ptr<FILE, decltype(&std::fclose)>;
+    file_handle fa{std::fopen(path.c_str(), "w"), &std::fclose};
     if (!fa) {
-        std::fprintf(stderr, "Cannot open --thread-bridge-fasta output: %s\n",
-                     path.c_str());
-        return;
+        return std::unexpected(
+            "Cannot open --thread-bridge-fasta output: " + path);
     }
+    const std::string paths_path = path + ".paths.tsv";
+    file_handle paths{std::fopen(paths_path.c_str(), "w"), &std::fclose};
+    if (!paths) {
+        return std::unexpected(
+            "Cannot open thread-bridge path sidecar: " + paths_path);
+    }
+    // Both required outputs are open before either receives content.
+    std::fprintf(paths.get(),
+                 "scaffold\torder\tsegment\torientation\tgap_before\t"
+                 "support\tfrom_anchor\tto_anchor\tsegment_start\t"
+                 "segment_end\n");
     auto flip = [](char o) { return o == '+' ? '-' : '+'; };
 
     // Supernode -> forward ASCII sequence (built lazily, reused across scaffolds).
@@ -1612,17 +1939,28 @@ inline void write_thread_bridge_fasta(const supernode_vec &supernodes,
         return r;
     };
 
-    // Undirected bridge adjacency. entry at X = {other, xo, oo, gap}: leaving X
-    // in orientation xo arrives at other in orientation oo, across `gap` bases of
-    // estimated tangle (Tier-1 sized N-gap; see propagation below).
-    struct binc { u64 other; char xo; char oo; uint32_t gap; };
+    // Undirected bridge adjacency. GL remains an anchor-run separation rather
+    // than an exact supernode-boundary distance. It is realized as an N-gap only
+    // for edges that passed thread_bridge_is_fasta_safe's conservative gates.
+    struct binc {
+        u64 other;
+        char xo;
+        char oo;
+        int64_t gap;
+        uint32_t support;
+        u64 from_anchor;
+        u64 to_anchor;
+    };
     gtl::flat_hash_map<u64, gtl::vector<binc>> badj;
     for (const auto &[k, e] : merged_edges) {
         (void)k;
-        if (!e.thread_bridge) continue;
-        badj[e.src_super].push_back({e.dst_super, e.src_ori, e.dst_ori, e.tb_gap});
+        if (!thread_bridge_is_fasta_safe(e)) continue;
+        badj[e.src_super].push_back(
+            {e.dst_super, e.src_ori, e.dst_ori, e.tb_gap, e.tb_support,
+             e.example_from, e.example_to});
         badj[e.dst_super].push_back(
-            {e.src_super, flip(e.dst_ori), flip(e.src_ori), e.tb_gap});
+            {e.src_super, flip(e.dst_ori), flip(e.src_ori), e.tb_gap,
+             e.tb_support, e.example_to, e.example_from});
     }
 
     gtl::flat_hash_set<u64> done;  // supernodes already emitted
@@ -1660,15 +1998,28 @@ inline void write_thread_bridge_fasta(const supernode_vec &supernodes,
         std::string scaffold;
         u64 cur = start;
         char strand = badj[start].front().xo;
-        uint32_t pending_gap = 0;  // gap bases of the edge that led to `cur`
+        int64_t pending_gap = 0;  // gap bases of the edge that led to `cur`
+        uint32_t pending_support = 0;
+        u64 pending_from_anchor = 0;
+        u64 pending_to_anchor = 0;
+        size_t path_order = 0;
         gtl::flat_hash_set<u64> visited;
         while (true) {
             visited.insert(cur);
             done.insert(cur);
             std::string s = ascii_of(cur);
             if (strand == '-') s = revcomp(s);
-            if (!scaffold.empty()) scaffold.append(pending_gap, 'N');
+            if (!scaffold.empty())
+                scaffold.append(static_cast<size_t>(pending_gap), 'N');
+            const size_t segment_start = scaffold.size();
             scaffold += s;
+            std::fprintf(paths.get(),
+                         "scaffold_%zu\t%zu\t%s\t%c\t%" PRId64
+                         "\t%u\t%" PRIu64 "\t%" PRIu64 "\t%zu\t%zu\n",
+                         n_scaf, path_order++, supernodes[cur].name.c_str(),
+                         strand, pending_gap, pending_support,
+                         pending_from_anchor, pending_to_anchor, segment_start,
+                         scaffold.size());
             // next unvisited bridge neighbor
             const binc *nxt = nullptr;
             for (const auto &b : badj[cur])
@@ -1676,11 +2027,15 @@ inline void write_thread_bridge_fasta(const supernode_vec &supernodes,
             if (!nxt) break;
             char next_strand = (strand == nxt->xo) ? nxt->oo : flip(nxt->oo);
             pending_gap = nxt->gap;
+            pending_support = nxt->support;
+            pending_from_anchor = nxt->from_anchor;
+            pending_to_anchor = nxt->to_anchor;
             cur = nxt->other;
             strand = next_strand;
         }
-        std::fprintf(fa, ">scaffold_%zu segments=%zu len=%zu\n%s\n", n_scaf++,
-                     members.size(), scaffold.size(), scaffold.c_str());
+        std::fprintf(fa.get(), ">scaffold_%zu segments=%zu len=%zu\n%s\n",
+                     n_scaf++, members.size(), scaffold.size(),
+                     scaffold.c_str());
     }
 
     // Every remaining live supernode (unbridged, or a member of a rejected
@@ -1689,16 +2044,17 @@ inline void write_thread_bridge_fasta(const supernode_vec &supernodes,
         if (supernodes[s].name.empty() || done.contains(s)) continue;
         std::string seq = ascii_of(s);
         if (seq.empty()) continue;
-        std::fprintf(fa, ">%s len=%zu\n%s\n", supernodes[s].name.c_str(),
+        std::fprintf(fa.get(), ">%s len=%zu\n%s\n", supernodes[s].name.c_str(),
                      seq.size(), seq.c_str());
     }
-    std::fclose(fa);
     std::fprintf(stderr, "thread-bridge: scaffold FASTA (%zu scaffolds) -> %s\n",
-                 n_scaf, path.c_str());
+                  n_scaf, path.c_str());
+    return {};
 }
 
 template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
+inline std::expected<void, std::string> emit_ultra_merged_graph(
+    AssemblerT &as, dbg_index &dbg, FILE *out) {
     INIT_TIMERS(LayoutEmit);
     auto [recig, layouts] = as.fold_dbg_graph(dbg);
     TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
@@ -1790,12 +2146,12 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     // Added after cleaning so cleaning cannot cut them; endpoints are re-checked
     // against the cleaned supernode set inside the injector.
     if (!as.confirmed_bridges.empty()) {
-        size_t added = inject_thread_bridge_edges(
+        const bridge_injection_result injected = inject_thread_bridge_edges(
             as.confirmed_bridges, supernodes, node_to_super, nodes_in_layouts,
             node_layout_ori, node_boundary_mask, merged_edges);
         TIME_CHECKPOINT(LayoutEmit, stderr,
                         "Thread-bridge edges injected (%zu of %zu confirmed)",
-                        added, as.confirmed_bridges.size());
+                        injected.added, as.confirmed_bridges.size());
     }
 
     // ── Phase 6: format supernode S-lines (parallel) + write GFA ────────
@@ -1804,15 +2160,19 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
 
     // ── Phase 7: opt-in scaffold FASTA materialized from bridge edges ───
     if (!as.thread_bridge.fasta_path.empty()) {
-        write_thread_bridge_fasta(supernodes, merged_edges,
-                                  as.thread_bridge.fasta_path);
+        if (auto result = write_thread_bridge_fasta(
+                supernodes, merged_edges, as.thread_bridge.fasta_path);
+            !result)
+            return result;
         TIME_CHECKPOINT(LayoutEmit, stderr, "Scaffold FASTA");
     }
+    return {};
 }
 
 template <class AssemblerT>
-inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg) {
-    emit_ultra_merged_graph(as, dbg, stdout);
+inline std::expected<void, std::string> emit_ultra_merged_graph(
+    AssemblerT &as, dbg_index &dbg) {
+    return emit_ultra_merged_graph(as, dbg, stdout);
 }
 
 }  // namespace layout_graph_emit

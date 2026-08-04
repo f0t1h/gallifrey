@@ -14,11 +14,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <gtl/btree.hpp>
 #include <gtl/phmap.hpp>
 #include <gtl/phmap_fwd_decl.hpp>
 #include <gtl/vector.hpp>
 #include <iostream>
+#include <map>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -85,6 +87,101 @@ struct CountingBloom {
     }
 };
 
+// Stable 64-bit identity of a read qname (FNV-1a). Used for distinct-read bridge
+// voting so retained walks never store the qname string — retained-walk memory is
+// the dominant cost at whole-genome scale (~100GB reads), so per-walk heap strings
+// are not affordable.
+static inline u64 hash_qname(const char *s) {
+    u64 h = 1469598103934665603ULL;
+    for (; *s; ++s) {
+        h ^= static_cast<unsigned char>(*s);
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+// A retained branch-crossing read walk, stored structure-of-arrays for density:
+// `nodes[k]` is the raw DBG id of emitted fragment k (0 = dropped node), and the
+// fragment spans the half-open query interval [query_pos[k], query_pos[k+1]).
+// Fragments are contiguous, so one boundary per step (+1 trailing) replaces the
+// old start/end pair. No qname string is kept — only its hash.
+struct retained_read {
+    u64 qname_hash = 0;
+    gtl::vector<u64> nodes;
+    gtl::vector<uint32_t> query_pos;  // size == nodes.size() + 1
+};
+
+struct thread_bridge_read_observation {
+    u64 qname = 0;  // qname hash (read identity)
+    u64 u = 0;
+    u64 v = 0;
+    int64_t gap = 0;
+};
+
+struct thread_anchor_run {
+    u64 anchor = 0;
+    uint32_t query_start = 0;
+    uint32_t query_end = 0;
+};
+
+template <class ResolveAnchor>
+static void append_thread_bridge_observations(
+    const retained_read &read, ResolveAnchor resolve_anchor,
+    gtl::vector<thread_bridge_read_observation> &observations) {
+    gtl::vector<thread_anchor_run> runs;
+    bool previous_was_anchor = false;
+    for (size_t k = 0; k < read.nodes.size(); ++k) {
+        const u64 anchor = resolve_anchor(read.nodes[k]);
+        if (anchor == 0) {
+            previous_was_anchor = false;
+            continue;
+        }
+        const uint32_t query_start = read.query_pos[k];
+        const uint32_t query_end = read.query_pos[k + 1];
+        if (previous_was_anchor && !runs.empty() &&
+            runs.back().anchor == anchor) {
+            runs.back().query_end = query_end;
+        } else {
+            runs.push_back({anchor, query_start, query_end});
+        }
+        previous_was_anchor = true;
+    }
+    for (size_t i = 1; i < runs.size(); ++i) {
+        const auto &source = runs[i - 1];
+        const auto &destination = runs[i];
+        if (source.anchor == destination.anchor) continue;
+        // Fragment intervals are half-open. GL is this anchor-run separation:
+        // the destination run's first unrepresented base minus the source
+        // run's last represented base. It is not corrected by a guessed
+        // supernode-boundary offset; FASTA uses it only after conservative
+        // uncertainty gates, so exact boundary-offset correction remains a
+        // limitation. Zero-id spans still contribute to this coordinate.
+        const int64_t gap = static_cast<int64_t>(destination.query_start) -
+                            static_cast<int64_t>(source.query_end);
+        observations.push_back(
+            {read.qname_hash, source.anchor, destination.anchor, gap});
+    }
+}
+
+// Collapse repeated occurrences of one directed bridge on one qname to one
+// read vote. Revisited anchors can produce several separations; their lower
+// empirical median is the single observation retained for that read/pair.
+static gtl::vector<thread_bridge_read_observation>
+deduplicate_thread_bridge_observations(
+    gtl::vector<thread_bridge_read_observation> observations) {
+    // Within a (qname,u,v) group all fields but gap are equal, so retaining the
+    // lower-median element is the same as rebuilding it with the median gap.
+    return layout_graph_emit::collapse_runs_lower_median(
+        std::move(observations),
+        [](const auto &a, const auto &b) {
+            return std::tie(a.qname, a.u, a.v, a.gap) <
+                   std::tie(b.qname, b.u, b.v, b.gap);
+        },
+        [](const auto &a, const auto &b) {
+            return a.qname == b.qname && a.u == b.u && a.v == b.v;
+        });
+}
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -104,9 +201,9 @@ struct assembler {
     bool parallel_file_reading;
     std::string dump_insert_types_path;
     decltype(asm_config::thread_bridge) thread_bridge;
-    // --thread-bridge: streaming-retained read walks (raw node ids, 0=gap) kept
-    // during construction; consumed by run_thread_bridge after cleaning.
-    std::vector<gtl::vector<u64>> kept_walks;
+    // --thread-bridge: compact retained reads. Every raw lcmer (including id 0)
+    // carries its emitted-fragment query interval; no read sequence is retained.
+    gtl::vector<retained_read> kept_walks;
     // Confirmed read-threaded bridges (u->v DBG unitig reps + support). Filled by
     // run_thread_bridge; consumed at emit to add scaffold edges to the GFA.
     gtl::vector<layout_graph_emit::bridge_edge> confirmed_bridges;
@@ -406,10 +503,18 @@ struct assembler {
     // classify-path successor tracker)? Reflects reads processed so far.
     template <class BFT>
     static bool tb_is_branch(dbg_index_base<BFT> &dbgi, u64 node) {
-        auto it = dbgi.dbg.find(node);
-        if (it != dbgi.dbg.end() && it->second.prev.size() >= 2) return true;
-        auto st = dbgi.succ_track.find(node);
-        return st != dbgi.succ_track.end() && st->second.size() >= 2;
+        bool is_branch = false;
+        // The vectors are mutated by other construction workers. Read their
+        // sizes only inside phmap's shard-locked callback; a locked find alone
+        // would not keep the returned iterator/value protected.
+        dbgi.dbg.modify_if(node, [&](auto &entry) {
+            is_branch = entry.second.prev.size() >= 2;
+        });
+        if (is_branch) return true;
+        dbgi.succ_track.modify_if(node, [&](auto &entry) {
+            is_branch = entry.second.size() >= 2;
+        });
+        return is_branch;
     }
 
     // --thread-bridge walk capture: identical DBG mutation as process_cores
@@ -420,7 +525,8 @@ struct assembler {
     static void process_cores_thread(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
                                      int thread_id, uint64_t &lcmer_index,
                                      int lcmer_l,
-                                     gtl::vector<gtl::vector<u64>> &walk_sink,
+                                     const char *qname,
+                                     gtl::vector<retained_read> &walk_sink,
                                      CountingBloom *bloom, int cap) {
         LCmer l{lr.cores.begin() + 1, lcmer_l};
         gtl::vector<uint64_t> ll(1, 0);
@@ -467,7 +573,25 @@ struct assembler {
             const u64 key = a * 0x9E3779B97F4A7C15ULL ^ (b + 0x632BE59BD9B4E019ULL);
             if (bloom->bump(key) >= static_cast<uint8_t>(cap)) return;  // over cap
         }
-        walk_sink.emplace_back(ll.begin(), ll.end());
+        retained_read retained;
+        retained.qname_hash = hash_qname(qname);
+        retained.nodes.reserve(ll.size() - 2);
+        retained.query_pos.reserve(ll.size() - 1);
+        for (size_t i = 1; i + 1 < ll.size(); ++i) {
+            // The sequence represented by ll[i] is the post-lcmer fragment
+            // [pos[i+l-1].second, pos[i+l].second), matching the fragment
+            // inserted above. Retain it even when ll[i] is zero so missing DBG
+            // nodes still contribute their exact base span to a bridge gap.
+            // Fragments are contiguous (each end == the next start), so we store
+            // only the start here and append the final end after the loop.
+            retained.nodes.push_back(ll[i]);
+            retained.query_pos.push_back(
+                lr.pos[i + static_cast<size_t>(lcmer_l) - 1].second);
+        }
+        // Trailing boundary = query_end of the last retained fragment.
+        retained.query_pos.push_back(
+            lr.pos[(ll.size() - 2) + static_cast<size_t>(lcmer_l)].second);
+        walk_sink.push_back(std::move(retained));
     }
 
     // Chase a raw (pre-cleaning) node id to its post-cleaning unitig
@@ -484,38 +608,35 @@ struct assembler {
         return 0;
     }
 
-    // Post-cleaning read-threading bridge pass: contract each retained walk to
-    // its substantial-unitig sequence, vote directed unitig adjacencies across
-    // the tangles, and confirm the unambiguous, well-supported ones. Writes the
-    // confirmed bridges to <out>.threads.tsv and stores them in confirmed_bridges
-    // for the emit step (inject_thread_bridge_edges).
-    void run_thread_bridge(dbg_index &dbg, const std::string &out_path) {
+    // Post-cleaning read-threading bridge pass: contract each retained read to
+    // anchor runs, vote directed anchor adjacencies once per qname, and confirm
+    // the unambiguous, well-supported ones.
+    std::expected<void, std::string> run_thread_bridge(
+        dbg_index &dbg, const std::string &out_path) {
+        using layout_graph_emit::bridge_edge;
+        using layout_graph_emit::bridge_realization;
+        using layout_graph_emit::bridge_realization_label;
+        using layout_graph_emit::classify_bridge_realization;
+        using layout_graph_emit::signed_gap_summary;
+        using layout_graph_emit::summarize_signed_gaps;
         const int min_anchor = thread_bridge.min_anchor;
         // Single-copy depth baseline: median avg_core_count of long, non-branching
         // unitigs. Bridge anchors must be UNIQUE (in/out deg <=1) AND single-copy
         // (avg_core_count <= 1.5x baseline) so bridges cannot route through
         // collapsed-repeat unitigs (the false-join source).
         gtl::vector<double> depths;
-        // Mean bases per lcmer step (core), estimated from the same long unitigs:
-        // total base length / total cores. Used to turn a gap measured in tangle
-        // core-steps into a gap in bases (Tier-1 scaffold-gap sizing).
-        uint64_t bp_bases = 0, bp_cores = 0;
         for (auto &kv : dbg.dbg) {
             auto &n = kv.second;
             if (n.redirected() || n.seq.empty()) continue;
             if (n.seq.size() >= 100 && n.prev.size() <= 1 &&
                 n.forward_edge_count <= 1) {
                 depths.push_back(n.avg_core_count());
-                for (const auto &q : n.seq) bp_bases += q.len;
-                bp_cores += n.seq.size();
             }
         }
         std::sort(depths.begin(), depths.end());
         const double baseline =
             depths.empty() ? 0.0 : depths[depths.size() / 2];
         const double cn_cap = baseline > 0 ? baseline * 1.5 : 1e18;
-        const double bases_per_step =
-            bp_cores ? static_cast<double>(bp_bases) / bp_cores : 1.0;
         auto substantial = [&](u64 rep) -> bool {
             auto it = dbg.dbg.find(rep);
             if (it == dbg.dbg.end() || it->second.redirected() ||
@@ -525,72 +646,299 @@ struct assembler {
             return n.prev.size() <= 1 && n.forward_edge_count <= 1 &&
                    n.avg_core_count() <= cn_cap;  // unique & single-copy
         };
-        gtl::flat_hash_map<u64, gtl::flat_hash_map<u64, uint32_t>> adj;
-        gtl::flat_hash_map<u64, uint32_t> out_tot, in_tot;
-        // Per directed pair, the tangle-gap (in bases) each supporting walk saw.
-        gtl::flat_hash_map<u64, gtl::flat_hash_map<u64, gtl::vector<uint32_t>>>
-            gap_smp;
-        gtl::vector<u64> thread;    // contracted substantial-unitig reps
-        gtl::vector<uint32_t> tgap; // tgap[i] = tangle core-steps before thread[i]
-        for (const auto &walk : kept_walks) {
-            thread.clear();
-            tgap.clear();
-            uint32_t tangle_steps = 0;  // non-anchor steps since the last anchor
-            for (u64 raw : walk) {
-                if (raw == 0) continue;
-                const u64 rep = rep_of(dbg, raw);
-                if (rep == 0 || !substantial(rep)) {
-                    ++tangle_steps;  // dropped/tangle node = one gap core-step
-                    continue;
-                }
-                if (thread.empty() || thread.back() != rep) {
-                    thread.push_back(rep);
-                    tgap.push_back(tangle_steps);
-                }
-                tangle_steps = 0;  // entered/continuing an anchor: reset the gap
-            }
-            for (size_t i = 1; i < thread.size(); ++i) {
-                const u64 a = thread[i - 1], b = thread[i];
-                if (a == b) continue;
-                adj[a][b]++;
-                out_tot[a]++;
-                in_tot[b]++;
-                gap_smp[a][b].push_back(static_cast<uint32_t>(
-                    tgap[i] * bases_per_step));
-            }
+        gtl::vector<thread_bridge_read_observation> observations;
+        for (const auto &read : kept_walks) {
+            append_thread_bridge_observations(
+                read,
+                [&](u64 raw_node) {
+                    const u64 rep = rep_of(dbg, raw_node);
+                    return rep != 0 && substantial(rep) ? rep : u64{0};
+                },
+                observations);
         }
+        auto distinct =
+            deduplicate_thread_bridge_observations(std::move(observations));
+
+        using pair_key = std::pair<u64, u64>;
+        gtl::btree_map<pair_key, gtl::vector<thread_bridge_read_observation>>
+            by_pair;
+        gtl::btree_map<u64, gtl::btree_map<u64, uint32_t>> outgoing, incoming;
+        gtl::btree_map<u64, uint32_t> out_tot, in_tot;
+        for (const auto &observation : distinct) {
+            by_pair[{observation.u, observation.v}].push_back(observation);
+            ++outgoing[observation.u][observation.v];
+            ++incoming[observation.v][observation.u];
+            ++out_tot[observation.u];
+            ++in_tot[observation.v];
+        }
+
+        const std::string reads_path = out_path + ".reads.tsv";
+        const std::string diagnostics_path = out_path + ".diagnostics.tsv";
         FILE *tf = fopen(out_path.c_str(), "w");
-        if (!tf) {
-            fprintf(stderr, "Cannot open thread-bridge output: %s\n",
-                    out_path.c_str());
-            return;
+        if (!tf)
+            return std::unexpected("Cannot open thread-bridge output: " +
+                                   out_path);
+        FILE *rf = fopen(reads_path.c_str(), "w");
+        if (!rf) {
+            fclose(tf);
+            return std::unexpected("Cannot open thread-bridge reads sidecar: " +
+                                   reads_path);
         }
-        // Median of a pair's per-walk gap samples (robust to error outliers).
-        auto median_gap = [](gtl::vector<uint32_t> &v) -> uint32_t {
-            if (v.empty()) return 0;
-            std::sort(v.begin(), v.end());
-            return v[v.size() / 2];
+        FILE *df = fopen(diagnostics_path.c_str(), "w");
+        if (!df) {
+            fclose(rf);
+            fclose(tf);
+            return std::unexpected(
+                "Cannot open thread-bridge diagnostics sidecar: " +
+                diagnostics_path);
+        }
+
+        auto runner_up = [](const gtl::btree_map<u64, uint32_t> &votes,
+                            u64 winner) {
+            uint32_t second = 0;
+            for (const auto &[candidate, count] : votes)
+                if (candidate != winner) second = std::max(second, count);
+            return second;
         };
-        fprintf(tf, "u\tv\tsupport\tgap\n");
-        u64 confirmed = 0;
-        for (const auto &[a, succs] : adj) {
-            for (const auto &[b, s] : succs) {
-                if (s < static_cast<uint32_t>(thread_bridge.min_support)) continue;
-                // full dominance: a's votes go only to b, and b's only from a.
-                if (s != out_tot[a] || s != in_tot[b]) continue;
-                const uint32_t gap = median_gap(gap_smp[a][b]);
-                fprintf(tf, "%" PRIu64 "\t%" PRIu64 "\t%u\t%u\n", a, b, s, gap);
-                confirmed_bridges.push_back({a, b, s, gap});
-                ++confirmed;
+        struct anchor_diagnostics {
+            size_t length_cores = 0;
+            size_t length_bases = 0;
+            double depth = 0;
+            size_t in_degree = 0;
+            size_t out_degree = 0;
+            double copy_number = 0;
+        };
+        auto anchor_info = [&](u64 id) {
+            anchor_diagnostics info;
+            auto it = dbg.dbg.find(id);
+            if (it == dbg.dbg.end() || it->second.redirected() ||
+                it->second.seq.empty())
+                return info;
+            info.length_cores = it->second.seq.size();
+            for (const auto &sequence : it->second.seq)
+                info.length_bases += sequence.len;
+            info.depth = it->second.avg_core_count();
+            info.in_degree = it->second.prev.size();
+            info.out_degree = it->second.forward_edge_count;
+            info.copy_number = baseline > 0 ? info.depth / baseline : 0.0;
+            return info;
+        };
+
+        fprintf(tf,
+                "u\tv\tsupport\tgap\tcount\tp10\tp90\tmad\trealization\n");
+        fprintf(rf, "u\tv\tqname_hash\tgap\n");
+        fprintf(df,
+                "u\tv\tu_length_cores\tu_length_bases\tu_depth\tu_in_degree\t"
+                "u_out_degree\tu_cn\tv_length_cores\tv_length_bases\tv_depth\t"
+                "v_in_degree\tv_out_degree\tv_cn\t"
+                "support\tu_out_total\tu_out_runner_up\tv_in_total\t"
+                "v_in_runner_up\tgap_count\tgap_median\tgap_p10\tgap_p90\t"
+                "gap_mad\tconfirmed\trealization\n");
+
+        confirmed_bridges.clear();
+        for (auto &[pair, pair_observations] : by_pair) {
+            const auto [a, b] = pair;
+            gtl::vector<int64_t> gaps;
+            gaps.reserve(pair_observations.size());
+            for (const auto &observation : pair_observations)
+                gaps.push_back(observation.gap);
+            const signed_gap_summary gap_summary = summarize_signed_gaps(gaps);
+            const uint32_t support = gap_summary.count;
+            const uint32_t out_second = runner_up(outgoing[a], b);
+            const uint32_t in_second = runner_up(incoming[b], a);
+            const bool confirmed =
+                support >= static_cast<uint32_t>(thread_bridge.min_support) &&
+                support == out_tot[a] && support == in_tot[b];
+            const bridge_realization realization =
+                classify_bridge_realization(gap_summary);
+            if (confirmed) {
+                fprintf(tf,
+                        "%" PRIu64 "\t%" PRIu64 "\t%u\t%" PRId64
+                        "\t%u\t%" PRId64 "\t%" PRId64 "\t%" PRId64
+                        "\t%s\n",
+                        a, b, support, gap_summary.median, gap_summary.count,
+                        gap_summary.p10, gap_summary.p90, gap_summary.mad,
+                        bridge_realization_label(realization));
+                gtl::vector<layout_graph_emit::bridge_read_gap_observation>
+                    read_gaps;
+                read_gaps.reserve(pair_observations.size());
+                for (const auto &observation : pair_observations)
+                    read_gaps.push_back(
+                        {observation.qname, observation.gap});
+                confirmed_bridges.push_back(
+                    {a, b, support, gap_summary.median, gap_summary,
+                     realization, std::move(read_gaps)});
+                for (const auto &observation : pair_observations)
+                    fprintf(rf,
+                            "%" PRIu64 "\t%" PRIu64 "\t%016" PRIx64 "\t%" PRId64
+                            "\n",
+                            a, b, observation.qname, observation.gap);
             }
+            const anchor_diagnostics ai = anchor_info(a);
+            const anchor_diagnostics bi = anchor_info(b);
+            const char *diagnostic_status =
+                confirmed
+                    ? bridge_realization_label(realization)
+                    : (support < static_cast<uint32_t>(thread_bridge.min_support)
+                           ? "not_confirmed_support"
+                           : "not_confirmed_dominance");
+            fprintf(df,
+                    "%" PRIu64 "\t%" PRIu64
+                    "\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f"
+                    "\t%zu\t%zu\t%.6f\t%zu\t%zu\t%.6f"
+                    "\t%u\t%u\t%u\t%u\t%u"
+                    "\t%u\t%" PRId64 "\t%" PRId64 "\t%" PRId64
+                    "\t%" PRId64 "\t%s\t%s\n",
+                    a, b, ai.length_cores, ai.length_bases, ai.depth,
+                    ai.in_degree, ai.out_degree, ai.copy_number,
+                    bi.length_cores, bi.length_bases, bi.depth, bi.in_degree,
+                    bi.out_degree, bi.copy_number, support, out_tot[a],
+                    out_second, in_tot[b], in_second, gap_summary.count,
+                    gap_summary.median, gap_summary.p10, gap_summary.p90,
+                    gap_summary.mad, confirmed ? "yes" : "no",
+                    diagnostic_status);
         }
+        fclose(df);
+        fclose(rf);
         fclose(tf);
 
+        capture_representative_gap_paths(dbg);
+
         fprintf(stderr,
-                "thread-bridge: %zu retained walks -> %" PRIu64
-                " confirmed bridges (support>=%d, full dominance) -> %s\n",
-                kept_walks.size(), confirmed, thread_bridge.min_support,
-                out_path.c_str());
+                "thread-bridge: %zu retained reads -> %zu distinct read votes "
+                "-> %zu confirmed bridges (support>=%d, full dominance) -> %s\n",
+                kept_walks.size(), distinct.size(), confirmed_bridges.size(),
+                thread_bridge.min_support, out_path.c_str());
+        return {};
+    }
+
+    // Tier-2 capture: for each confirmed bridge, pick the supporting walk whose
+    // tangle gap is closest to the confirmed median gap (ties broken
+    // deterministically) and record the cleaned-unitig reps it crossed, with the
+    // raw entry/exit node of each. Emit later reconstructs the real gap sequence
+    // from these; walks are only re-scanned for confirmed bridges, so no
+    // per-observation path storage is needed.
+    void capture_representative_gap_paths(dbg_index &dbg) {
+        using layout_graph_emit::tangle_segment;
+        if (confirmed_bridges.empty()) return;
+        const int min_anchor = thread_bridge.min_anchor;
+        gtl::vector<double> depths;
+        for (auto &kv : dbg.dbg) {
+            auto &n = kv.second;
+            if (n.redirected() || n.seq.empty()) continue;
+            if (n.seq.size() >= 100 && n.prev.size() <= 1 &&
+                n.forward_edge_count <= 1)
+                depths.push_back(n.avg_core_count());
+        }
+        std::sort(depths.begin(), depths.end());
+        const double cn_cap =
+            depths.empty() ? 1e18 : depths[depths.size() / 2] * 1.5;
+        auto substantial = [&](u64 rep) -> bool {
+            auto it = dbg.dbg.find(rep);
+            if (it == dbg.dbg.end() || it->second.redirected() ||
+                it->second.seq.size() < static_cast<size_t>(min_anchor))
+                return false;
+            const auto &n = it->second;
+            return n.prev.size() <= 1 && n.forward_edge_count <= 1 &&
+                   n.avg_core_count() <= cn_cap;
+        };
+        auto resolve = [&](u64 raw) -> u64 {
+            const u64 rep = rep_of(dbg, raw);
+            return rep != 0 && substantial(rep) ? rep : u64{0};
+        };
+
+        using pair_key = std::pair<u64, u64>;
+        gtl::btree_map<pair_key, size_t> confirmed_index;
+        for (size_t i = 0; i < confirmed_bridges.size(); ++i)
+            confirmed_index[{confirmed_bridges[i].u, confirmed_bridges[i].v}] = i;
+        struct sel_key {
+            int64_t dist;
+            u64 entry;
+            u64 qname;
+        };
+        gtl::btree_map<pair_key, sel_key> best;
+
+        struct anchor_run {
+            u64 anchor;
+            size_t first_idx;
+            size_t last_idx;
+            uint32_t query_start;
+            uint32_t query_end;
+        };
+        gtl::vector<anchor_run> runs;
+        for (const auto &read : kept_walks) {
+            runs.clear();
+            bool previous_was_anchor = false;
+            for (size_t k = 0; k < read.nodes.size(); ++k) {
+                const u64 anchor = resolve(read.nodes[k]);
+                if (anchor == 0) {
+                    previous_was_anchor = false;
+                    continue;
+                }
+                const uint32_t query_start = read.query_pos[k];
+                const uint32_t query_end = read.query_pos[k + 1];
+                if (previous_was_anchor && !runs.empty() &&
+                    runs.back().anchor == anchor) {
+                    runs.back().last_idx = k;
+                    runs.back().query_end = query_end;
+                } else {
+                    runs.push_back({anchor, k, k, query_start, query_end});
+                }
+                previous_was_anchor = true;
+            }
+            for (size_t i = 1; i < runs.size(); ++i) {
+                const u64 a = runs[i - 1].anchor, b = runs[i].anchor;
+                if (a == b) continue;
+                auto ci = confirmed_index.find({a, b});
+                if (ci == confirmed_index.end()) continue;
+                const int64_t gap = static_cast<int64_t>(runs[i].query_start) -
+                                    static_cast<int64_t>(runs[i - 1].query_end);
+                const int64_t median = confirmed_bridges[ci->second].gap;
+                const int64_t dist = gap >= median ? gap - median : median - gap;
+                // Reps strictly between the two anchor runs, consecutive
+                // same-rep steps collapsed into one segment.
+                gtl::vector<tangle_segment> segments;
+                for (size_t k = runs[i - 1].last_idx + 1;
+                     k < runs[i].first_idx; ++k) {
+                    const u64 rep = rep_of(dbg, read.nodes[k]);
+                    if (rep == 0) continue;
+                    if (!segments.empty() && segments.back().rep == rep)
+                        segments.back().exit_raw = read.nodes[k];
+                    else
+                        segments.push_back({rep, read.nodes[k], read.nodes[k]});
+                }
+                const u64 first_entry =
+                    segments.empty() ? 0 : segments.front().entry_raw;
+                const sel_key key{dist, first_entry, read.qname_hash};
+                auto bit = best.find({a, b});
+                if (bit == best.end() ||
+                    std::tie(key.dist, key.entry, key.qname) <
+                        std::tie(bit->second.dist, bit->second.entry,
+                                 bit->second.qname)) {
+                    best[{a, b}] = key;
+                    confirmed_bridges[ci->second].gap_path = std::move(segments);
+                }
+            }
+        }
+
+        size_t with_path = 0, empty_path = 0, single_rep = 0, seg_total = 0,
+               seg_max = 0;
+        for (const auto &b : confirmed_bridges) {
+            if (b.gap_path.empty()) {
+                ++empty_path;
+                continue;
+            }
+            ++with_path;
+            if (b.gap_path.size() == 1) ++single_rep;
+            seg_total += b.gap_path.size();
+            seg_max = std::max(seg_max, b.gap_path.size());
+        }
+        fprintf(stderr,
+                "thread-bridge: gap-path captured for %zu/%zu confirmed "
+                "(%zu empty, %zu single-rep; avg %.2f reps, max %zu)\n",
+                with_path, confirmed_bridges.size(), empty_path, single_rep,
+                with_path ? static_cast<double>(seg_total) / with_path : 0.0,
+                seg_max);
     }
 
     static void process_cores_for_basespace(
@@ -644,7 +992,7 @@ struct assembler {
         int &all_reads, auto Process_Func, SyncmerType syncmer_functor,
         int lcmer_l,
         gtl::vector<std::pair<std::string, insert_tally>> *insert_sink = nullptr,
-        gtl::vector<gtl::vector<u64>> *walk_sink = nullptr,
+        gtl::vector<retained_read> *walk_sink = nullptr,
         CountingBloom *tb_bloom = nullptr, int tb_cap = 0) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
@@ -673,6 +1021,7 @@ struct assembler {
                 if (walk_sink) {
                     process_cores_thread<DefaultBF>(lr, dbgi, thread_id,
                                                     lcmer_index, lcmer_l,
+                                                    bam_get_qname(data_p),
                                                     *walk_sink, tb_bloom, tb_cap);
                 } else if (insert_sink) {
                     insert_tally tally;
@@ -750,7 +1099,7 @@ struct assembler {
             insert_sinks(classify_inserts ? threads.work : 0);
         // --thread-bridge: one walk sink per worker, merged into kept_walks; a
         // shared counting bloom caps retained reads per bridge.
-        std::vector<gtl::vector<gtl::vector<u64>>>
+        gtl::vector<gtl::vector<retained_read>>
             walk_sinks(thread_bridge.enable ? threads.work : 0);
         std::unique_ptr<CountingBloom> tb_bloom;
         if (thread_bridge.enable) tb_bloom = std::make_unique<CountingBloom>(22);
@@ -1437,7 +1786,11 @@ int run_assembly(const asm_config &cfg) {
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
     if (cfg.thread_bridge.enable) {
-        as.run_thread_bridge(dbg, cfg.output + ".threads.tsv");
+        if (auto r = as.run_thread_bridge(dbg, cfg.output + ".threads.tsv");
+            !r) {
+            fprintf(stderr, "%s\n", r.error().c_str());
+            return 1;
+        }
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Thread-bridge");
     }
 
@@ -1461,8 +1814,13 @@ int run_assembly(const asm_config &cfg) {
             return 1;
         }
         // print_dbg_seqs(out, dbg);
-        layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
+        auto emit_result =
+            layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
         fclose(out);
+        if (!emit_result) {
+            fprintf(stderr, "%s\n", emit_result.error().c_str());
+            return 1;
+        }
     }
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Merged/Printed");
@@ -2060,7 +2418,7 @@ TEST_CASE(
 
     edge_map edges;
     CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori, mask,
-                                        edges),
+                                        edges).added,
              1u);
     REQUIRE_EQ(edges.size(), 1u);
     [[maybe_unused]] const auto &e = edges.begin()->second;
@@ -2070,13 +2428,14 @@ TEST_CASE(
     CHECK_EQ(e.dst_super, 1u);
     CHECK_EQ(e.src_side, SIDE_END);
     CHECK_EQ(e.dst_side, SIDE_START);
+    CHECK_FALSE(thread_bridge_is_fasta_safe(e));
 
     // Anchor not on the needed boundary side -> dropped (no valid contig end).
     gtl::flat_hash_map<u64, uint8_t> mask_mid{{100, SIDE_START},
                                               {200, SIDE_START}};
     edge_map edges2;
     CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori,
-                                        mask_mid, edges2),
+                                        mask_mid, edges2).added,
              0u);
 
     // Ambiguous: two bridges share the M0-END endpoint -> neither injected.
@@ -2092,7 +2451,7 @@ TEST_CASE(
     gtl::vector<bridge_edge> bridges3{{100, 200, 7}, {100, 300, 7}};
     edge_map edges3;
     CHECK_EQ(inject_thread_bridge_edges(bridges3, sn3, n2s3, inl3, ori3, mask3,
-                                        edges3),
+                                        edges3).added,
              0u);
 
     // A layout edge already connecting the pair -> bridge not duplicated.
@@ -2102,8 +2461,279 @@ TEST_CASE(
     edges4[existing].dst_super = 1;
     edges4[existing].count = 1;
     CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori, mask,
-                                        edges4),
+                                        edges4).added,
              0u);
+}
+
+TEST_CASE("thread-bridge branch queries read vectors through locked callbacks") {
+    dbg_index_light dbgi(0.001, 16, 42);
+    constexpr u64 in_branch = 10;
+    constexpr u64 out_branch = 20;
+    constexpr u64 linear = 30;
+    dbgi.dbg.emplace(in_branch,
+                     dbg_index_light::bidbg_val{1u, 1u});
+    dbgi.dbg.emplace(out_branch, dbg_index_light::bidbg_val{1u});
+    dbgi.dbg.emplace(linear, dbg_index_light::bidbg_val{1u, 1u});
+    dbgi.succ_track.emplace(out_branch, gtl::vector<u64>{2u, 3u});
+    dbgi.succ_track.emplace(linear, gtl::vector<u64>{2u});
+    dbgi.dbg.modify_if(in_branch, [](auto &entry) {
+        entry.second.emplace_prev(2u);
+    });
+
+    CHECK(assembler::tb_is_branch(dbgi, in_branch));
+    CHECK(assembler::tb_is_branch(dbgi, out_branch));
+    CHECK_FALSE(assembler::tb_is_branch(dbgi, linear));
+    CHECK_FALSE(assembler::tb_is_branch(dbgi, 999u));
+}
+
+TEST_CASE("thread-bridge observations deduplicate read votes and summarize signed gaps") {
+    using namespace layout_graph_emit;
+    retained_read read{
+        /*qname_hash=*/42u,
+        /*nodes=*/{1u, 2u, 0u, 3u},
+        /*query_pos=*/{0u, 20u, 30u, 90u, 130u}};
+    gtl::vector<thread_bridge_read_observation> coordinate_observations;
+    append_thread_bridge_observations(
+        read,
+        [](u64 raw) {
+            if (raw == 1 || raw == 2) return u64{10};
+            return raw == 3 ? u64{20} : u64{0};
+        },
+        coordinate_observations);
+    REQUIRE_EQ(coordinate_observations.size(), 1u);
+    CHECK_EQ(coordinate_observations[0].gap, 60);
+
+    constexpr u64 read1 = 1u, read2 = 2u;
+    gtl::vector<thread_bridge_read_observation> raw{
+        {read2, 10, 20, 90}, {read1, 10, 20, 50},
+        {read1, 10, 20, -10}, {read1, 10, 20, 30},
+        {read1, 20, 10, 7}};
+    auto distinct = deduplicate_thread_bridge_observations(std::move(raw));
+    REQUIRE_EQ(distinct.size(), 3u);
+    auto vote = std::find_if(distinct.begin(), distinct.end(), [](const auto &o) {
+        return o.qname == read1 && o.u == 10 && o.v == 20;
+    });
+    REQUIRE(vote != distinct.end());
+    CHECK_EQ(vote->gap, 30);
+
+    gtl::vector<int64_t> gaps{-20, 100, 110, 120, 130};
+    [[maybe_unused]] const signed_gap_summary summary =
+        summarize_signed_gaps(gaps);
+    CHECK_EQ(summary.count, 5u);
+    CHECK_EQ(summary.median, 110);
+    CHECK_EQ(summary.p10, -20);
+    CHECK_EQ(summary.p90, 120);
+    CHECK_EQ(summary.mad, 10);
+    CHECK_EQ(classify_bridge_realization(summary), bridge_realization::gap_safe);
+
+    gtl::vector<int64_t> conflicting_tail{
+        127, 128, 128, 128, 128, 129, 129, 129, 129, 1392, 1463, 2423, 4961};
+    CHECK_EQ(classify_bridge_realization(summarize_signed_gaps(conflicting_tail)),
+             bridge_realization::gap_uncertain);
+
+    gtl::vector<int64_t> overlap{-50, -20, -10, 20, 30};
+    CHECK_EQ(classify_bridge_realization(summarize_signed_gaps(overlap)),
+             bridge_realization::overlap_unresolved);
+    gtl::vector<int64_t> insufficient{100, 110, 120, 130};
+    CHECK_EQ(classify_bridge_realization(summarize_signed_gaps(insufficient)),
+             bridge_realization::gap_uncertain);
+
+    edge_agg edge;
+    edge.thread_bridge = true;
+    edge.tb_gap = 110;
+    edge.tb_realization = bridge_realization::gap_safe;
+    CHECK(thread_bridge_is_fasta_safe(edge));
+    edge.tb_realization = bridge_realization::gap_uncertain;
+    CHECK_FALSE(thread_bridge_is_fasta_safe(edge));
+    edge.tb_realization = bridge_realization::overlap_unresolved;
+    CHECK_FALSE(thread_bridge_is_fasta_safe(edge));
+}
+
+TEST_CASE("thread-bridge injector aggregates reciprocal projections and rejects conflicts") {
+    using namespace layout_graph_emit;
+    supernode_vec sn(5);
+    for (size_t i = 0; i < sn.size(); ++i) {
+        sn[i].name = (i < 3 ? "M" : "C") + std::to_string(i);
+        sn[i].is_layout = i < 3;
+        sn[i].aux_id = i;
+    }
+    // 100(+ source) and 101(- destination) both project to M0-END;
+    // 200(+ destination) and 201(- source) both project to M1-START.
+    gtl::flat_hash_map<u64, u64> n2s{{100, 0}, {101, 0}, {200, 1},
+                                     {201, 1}, {300, 2}, {400, 3},
+                                     {500, 4}};
+    gtl::flat_hash_set<u64> in_layouts{100, 101, 200, 201, 300};
+    gtl::flat_hash_map<u64, bool> ori{{100, true},  {101, false},
+                                      {200, true},  {201, false},
+                                      {300, true}};
+    gtl::flat_hash_map<u64, uint8_t> mask{{100, SIDE_END}, {101, SIDE_END},
+                                          {200, SIDE_START}, {201, SIDE_START},
+                                          {300, SIDE_END}};
+    auto with_reads = [](u64 u, u64 v,
+                         std::initializer_list<bridge_read_gap_observation>
+                             observations) {
+        bridge_edge bridge{u, v, static_cast<uint32_t>(observations.size())};
+        bridge.read_gap_observations.assign(observations.begin(),
+                                            observations.end());
+        return bridge;
+    };
+
+    SUBCASE("equivalent reciprocal records aggregate") {
+        gtl::vector<bridge_edge> bridges{{100, 200, 7, 100},
+                                         {201, 101, 5, 120}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 1u);
+        CHECK_EQ(result.aggregated_records, 1u);
+        REQUIRE_EQ(edges.size(), 1u);
+        CHECK_EQ(edges.begin()->second.tb_support, 12u);
+    }
+
+    SUBCASE("projected support deduplicates qname across anchor pairs") {
+        gtl::vector<bridge_edge> bridges;
+        constexpr u64 read_shared = 77u;
+        bridges.push_back(
+            with_reads(100, 200, {{read_shared, 100}}));
+        bridges.push_back(
+            with_reads(201, 101, {{read_shared, 120}}));
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 1u);
+        REQUIRE_EQ(edges.size(), 1u);
+        [[maybe_unused]] const auto &edge = edges.begin()->second;
+        CHECK_EQ(edge.tb_support, 1u);
+        CHECK_EQ(edge.count, 1u);
+        CHECK_EQ(edge.tb_gap_summary.count, 1u);
+        // The duplicate qname contributes the lower median min(100, 120).
+        CHECK_EQ(edge.tb_gap, 100);
+        CHECK_EQ(edge.tb_realization, bridge_realization::gap_uncertain);
+    }
+
+    SUBCASE("reciprocal M-C evidence treats C orientation as a wildcard") {
+        gtl::vector<bridge_edge> bridges{{100, 400, 5, 100},
+                                         {400, 101, 5, 120}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 1u);
+        CHECK_EQ(result.aggregated_records, 1u);
+        REQUIRE_EQ(edges.size(), 1u);
+        CHECK_EQ(edges.begin()->second.tb_support, 10u);
+        CHECK(edges.begin()->second.tb_c_orientation_unresolved);
+    }
+
+    SUBCASE("reciprocal C-C evidence aggregates with both orientations unknown") {
+        gtl::vector<bridge_edge> bridges{{400, 500, 5, 100},
+                                         {500, 400, 5, 120}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 1u);
+        CHECK_EQ(result.aggregated_records, 1u);
+        REQUIRE_EQ(edges.size(), 1u);
+        CHECK_EQ(edges.begin()->second.tb_support, 10u);
+        CHECK(edges.begin()->second.tb_c_orientation_unresolved);
+        CHECK_FALSE(thread_bridge_is_fasta_safe(edges.begin()->second));
+    }
+
+    SUBCASE("reciprocal side conflict rejects the join") {
+        gtl::vector<bridge_edge> bridges{{100, 200, 7, 100},
+                                         {200, 100, 7, 100}};
+        // Both masks are widened so the conflicting START/END projection gets
+        // through endpoint resolution and is rejected as a projection conflict.
+        auto both_sides = mask;
+        both_sides[100] = SIDE_START | SIDE_END;
+        both_sides[200] = SIDE_START | SIDE_END;
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, both_sides, edges);
+        CHECK_EQ(result.added, 0u);
+        CHECK_EQ(result.projection_conflict, 1u);
+    }
+
+    SUBCASE("one physical side reused as source and destination rejects both") {
+        // 100->200 consumes M0-END as source. 300->101 consumes M0-END as
+        // destination; direction is deliberately swapped relative to its reuse.
+        gtl::vector<bridge_edge> bridges{{100, 200, 7, 100},
+                                         {300, 101, 7, 100}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 0u);
+        CHECK_EQ(result.endpoint_reuse, 2u);
+        CHECK(edges.empty());
+    }
+
+    SUBCASE("standalone C orientation keeps GFA edge but blocks FASTA") {
+        gtl::vector<bridge_edge> bridges{{400, 200, 7, 100}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 1u);
+        REQUIRE_EQ(edges.size(), 1u);
+        CHECK_EQ(edges.begin()->second.tb_realization,
+                 bridge_realization::gap_safe);
+        CHECK(edges.begin()->second.tb_c_orientation_unresolved);
+        CHECK_FALSE(thread_bridge_is_fasta_safe(edges.begin()->second));
+    }
+
+    SUBCASE("unknown C side does not create a false physical-end conflict") {
+        gtl::vector<bridge_edge> bridges{{100, 400, 7, 100},
+                                         {400, 200, 7, 100}};
+        edge_map edges;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 2u);
+        CHECK_EQ(result.endpoint_reuse, 0u);
+        REQUIRE_EQ(edges.size(), 2u);
+        for (const auto &entry : edges) {
+            [[maybe_unused]] const auto &edge = entry.second;
+            CHECK(edge.tb_c_orientation_unresolved);
+            CHECK_FALSE(thread_bridge_is_fasta_safe(edge));
+        }
+    }
+
+    SUBCASE("equivalent reciprocal existing edge is not duplicated") {
+        gtl::vector<bridge_edge> bridges{{100, 200, 7, 100}};
+        edge_map edges;
+        edge_agg existing;
+        existing.src_super = 1;
+        existing.dst_super = 0;
+        existing.src_ori = '-';
+        existing.dst_ori = '-';
+        existing.src_side = SIDE_START;
+        existing.dst_side = SIDE_END;
+        edges[{1, 0, '-', '-', SIDE_START, SIDE_END}] = existing;
+        [[maybe_unused]] const auto result = inject_thread_bridge_edges(
+            bridges, sn, n2s, in_layouts, ori, mask, edges);
+        CHECK_EQ(result.added, 0u);
+        CHECK_EQ(result.existing_edge, 1u);
+        CHECK_EQ(edges.size(), 1u);
+    }
+}
+
+TEST_CASE("thread-bridge FASTA requires its paths sidecar") {
+    using namespace layout_graph_emit;
+    const auto unique = std::to_string(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    const std::filesystem::path temp_root =
+        std::filesystem::temp_directory_path() /
+        ("lasm-thread-bridge-fasta-" + unique);
+    const std::filesystem::path fasta_path = temp_root / "bridges.fa";
+    std::error_code error;
+    REQUIRE(std::filesystem::create_directories(
+        std::filesystem::path{fasta_path.string() + ".paths.tsv"}, error));
+    REQUIRE_FALSE(error);
+
+    const auto result = write_thread_bridge_fasta(
+        supernode_vec{}, edge_map{}, fasta_path.string());
+    REQUIRE_FALSE(result.has_value());
+    REQUIRE(result.error().find("path sidecar") != std::string::npos);
+
+    std::filesystem::remove_all(temp_root, error);
+    CHECK_FALSE(error);
 }
 
 TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "
