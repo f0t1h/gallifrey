@@ -200,6 +200,27 @@ struct asm_config {
     bool print_precleanup_graph = false;
     bool print_prelayout_graph = false;
     bool silent = false;
+    // When non-empty, DBG construction classifies each read's lcmer insertions
+    // (novel/coverage/branch-open/branch-join) and writes a per-read TSV here.
+    // Opt-in analysis only; empty leaves the construction path byte-identical.
+    std::string dump_insert_types_path;
+
+    // --thread-bridge: read-threading bridge pass. During construction it retains
+    // (streaming) the walks of reads that cross a repeat, capping redundancy per
+    // bridge via a counting bloom; after cleaning it votes read-supported unitig
+    // adjacencies across tangles and confirms unambiguous, well-supported bridges.
+    // Opt-in; off leaves the pipeline byte-identical.
+    struct {
+        bool enable = false;
+        int cap = 8;          // max retained reads per bridge key (counting bloom)
+        int min_support = 5;  // reads needed to confirm a bridge adjacency
+        int min_anchor = 10;  // min unitig length (cores) to be a bridge anchor
+        // When non-empty, also materialize a scaffold FASTA at this path: the
+        // bridge edges are walked (orientation-aware) to concatenate the joined
+        // supernode sequences (N-gap between); unbridged supernodes are emitted
+        // as-is. Opt-in; the GFA output is unaffected.
+        std::string fasta_path;
+    } thread_bridge;
     struct {
         uint64_t projected_count = 100'000'000;
         double false_positive_rate = 0.001;

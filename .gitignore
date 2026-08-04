@@ -17,3 +17,6 @@ target_compile_features.cmake
 build*/*
 *.idx
 .DS_STORE
+# pixi environments
+.pixi/*
+!.pixi/config.toml

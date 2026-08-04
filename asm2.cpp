@@ -61,6 +61,30 @@ enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 #define OLC_NONRECIPROCAL 0
 #endif
 
+// Saturating atomic counting bloom for --thread-bridge read-walk dedup: caps how
+// many reads are retained per bridge key so kept walks are bounded by
+// O(distinct bridges x cap), independent of sequencing depth. Collisions only
+// over-count (retain slightly fewer) which is safe.
+struct CountingBloom {
+    std::vector<std::atomic<uint8_t>> cells;
+    uint64_t mask;
+    explicit CountingBloom(unsigned log2 = 22)
+        : cells(size_t(1) << log2), mask((uint64_t(1) << log2) - 1) {}
+    // Increment key's counter (saturating); return the count BEFORE increment.
+    uint8_t bump(uint64_t key) {
+        key ^= key >> 33;
+        key *= 0xff51afd7ed558ccdULL;
+        key ^= key >> 33;
+        std::atomic<uint8_t> &c = cells[key & mask];
+        uint8_t v = c.load(std::memory_order_relaxed);
+        while (v < 255 &&
+               !c.compare_exchange_weak(v, uint8_t(v + 1),
+                                        std::memory_order_relaxed)) {
+        }
+        return v;
+    }
+};
+
 struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -78,6 +102,14 @@ struct assembler {
     int dbg_lcmer_l;
     int olc_lcmer_l;
     bool parallel_file_reading;
+    std::string dump_insert_types_path;
+    decltype(asm_config::thread_bridge) thread_bridge;
+    // --thread-bridge: streaming-retained read walks (raw node ids, 0=gap) kept
+    // during construction; consumed by run_thread_bridge after cleaning.
+    std::vector<gtl::vector<u64>> kept_walks;
+    // Confirmed read-threaded bridges (u->v DBG unitig reps + support). Filled by
+    // run_thread_bridge; consumed at emit to add scaffold edges to the GFA.
+    gtl::vector<layout_graph_emit::bridge_edge> confirmed_bridges;
 
     assembler(const asm_config &cfg)
         : inputs{},
@@ -93,7 +125,9 @@ struct assembler {
           syncmer_functor{syncmer_params, static_cast<unsigned int>(seed)},
           dbg_lcmer_l{cfg.dbg_lcmer_l},
           olc_lcmer_l{cfg.olc_lcmer_l},
-          parallel_file_reading{cfg.parallel_file_reading} {
+          parallel_file_reading{cfg.parallel_file_reading},
+          dump_insert_types_path{cfg.dump_insert_types_path},
+          thread_bridge{cfg.thread_bridge} {
         inputs.assign(cfg.inputs.begin(), cfg.inputs.end());
         // Overlap detection (fold_dbg_graph → find_lcmer_ranges) queries the
         // DBG, which is keyed by length-`dbg_lcmer_l` lcmers. The litecmer hash
@@ -159,6 +193,97 @@ struct assembler {
             }
         }
     }
+    // Per-read tally of DBG insertion events (see insert_lcmer_helper_classify).
+    // novel/coverage are mutually exclusive per step; branch_open/branch_join
+    // are independent flags of the same new-edge event and can co-occur (with
+    // each other and with novel), so they are counted separately.
+    struct insert_tally {
+        uint32_t steps = 0;        // classified insertion positions
+        uint32_t novel = 0;        // node newly constructed
+        uint32_t coverage = 0;     // existing node, edge already present
+        uint32_t branch_open = 0;  // predecessor gained a 2nd+ distinct successor
+        uint32_t branch_join = 0;  // current node gained a 2nd+ distinct predecessor
+        // The read's coverage-gated node-id walk (0 = lcmer dropped by the
+        // coverage>=2 gate). Consecutive non-zero ids are DBG edges; the whole
+        // adjacency + node degrees are reconstructable from all reads' walks,
+        // so this alone supports the path-level (component-spanning) analysis.
+        gtl::vector<uint64_t> walk;
+    };
+
+    // Classifying twin of insert_lcmer_helper: performs the IDENTICAL graph
+    // mutation (so the built DBG is unchanged) while recording what each
+    // insertion did. Only invoked on the --dump-insert-types path. `succ_track`
+    // gives the out-edge view needed for branch-open (the DBG stores only prev).
+    template <class BFT>
+    static inline bool insert_lcmer_helper_classify(
+        const gtl::vector<uint64_t> &ll, const uint32_t &i,
+        dbg_index_base<BFT> &dbgi, insert_tally &tally) {
+        using index_type = dbg_index_base<BFT>;
+        const u64 cur = ll[i];
+        if (cur == 0) return false;
+        const u64 prevn = ll[i - 1];
+        const u64 nextn = ll[i + 1];
+        const bool has_prev = (prevn != 0);
+        const bool has_next = (nextn != 0);
+        if (!has_prev && !has_next) return false;  // isolated (matches base)
+
+        tally.steps++;
+        bool constructed = false;
+        bool edge_added = false;
+        size_t prev_size_before = 0;
+        dbgi.dbg.lazy_emplace_l(
+            cur,
+            [&](typename index_type::dbg_map_t::value_type &val) {
+                if (has_prev) {
+                    prev_size_before = val.second.prev.size();
+                    val.second.emplace_prev(prevn);  // no-op if already present
+                    edge_added = (val.second.prev.size() != prev_size_before);
+                }
+                if (has_next) val.second.counts.core_count++;
+            },
+            [&](const typename index_type::dbg_map_t::constructor &ctr) {
+                constructed = true;
+                const unsigned cc = has_next ? 1U : 0U;
+                if (has_prev) {
+                    ctr(cur, typename index_type::bidbg_val{cc, prevn});
+                    edge_added = true;  // the constructed node's prev is a new edge
+                } else {
+                    ctr(cur, typename index_type::bidbg_val{cc});
+                }
+            });
+
+        if (constructed) {
+            tally.novel++;
+        } else if (!edge_added) {
+            // Existing node, no new in-edge (edge already present, or no prev).
+            tally.coverage++;
+        }
+        if (edge_added && !constructed && prev_size_before >= 1) {
+            tally.branch_join++;  // in-degree grew to >= 2
+        }
+        // Branch-open: did prevn gain a NEW successor, and did it already have one?
+        if (edge_added && has_prev) {
+            size_t succ_before = 0;
+            bool succ_added = false;
+            dbgi.succ_track.lazy_emplace_l(
+                prevn,
+                [&](auto &val) {
+                    succ_before = val.second.size();
+                    if (std::find(val.second.begin(), val.second.end(), cur) ==
+                        val.second.end()) {
+                        val.second.push_back(cur);
+                        succ_added = true;
+                    }
+                },
+                [&](const auto &ctr) {
+                    ctr(prevn, gtl::vector<u64>{cur});
+                    succ_added = true;
+                });
+            if (succ_added && succ_before >= 1) tally.branch_open++;
+        }
+        return constructed;  // drives sequence attachment (as in the base helper)
+    }
+
     static gtl::vector<uint64_t> find_lcmers(const lcp_read &lr,
                                              const dbg_index &dbgi,
                                              int lcmer_l) {
@@ -244,6 +369,230 @@ struct assembler {
             }
         }
     }
+    // Identical to process_cores (same emplace/insert/seq mutations) but
+    // classifies each insertion into `tally`. Used only on --dump-insert-types.
+    template <class BFT>
+    static void process_cores_classify(const lcp_read &lr,
+                                       dbg_index_base<BFT> &dbgi, int thread_id,
+                                       uint64_t &lcmer_index, int lcmer_l,
+                                       insert_tally &tally) {
+        LCmer l{lr.cores.begin() + 1, lcmer_l};  // Skip first core;
+        gtl::vector<uint64_t> ll(1, 0);
+        ll.reserve(lr.cores.size() - lcmer_l + 3);
+        ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            uint32_t in_core = lr.cores[i];
+            l.update_lcmer(in_core, lr.cores[i - lcmer_l], lcmer_l);
+            ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
+        }
+        ll.push_back(0);
+        tally.walk.assign(ll.begin(), ll.end());
+
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            if (insert_lcmer_helper_classify(ll, i, dbgi, tally)) {
+                dbgi.dbg.modify_if(
+                    ll[i],
+                    [&lr, i,
+                     lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
+                        val.second.seq.emplace_back(
+                            lr.data, lr.pos[i + lcmer_l - 1].second,
+                            lr.pos[i + lcmer_l].second, val.first);
+                    });
+            }
+        }
+    }
+    // Is `node` currently a branch (in-deg>=2 from prev, or out-deg>=2 from the
+    // classify-path successor tracker)? Reflects reads processed so far.
+    template <class BFT>
+    static bool tb_is_branch(dbg_index_base<BFT> &dbgi, u64 node) {
+        auto it = dbgi.dbg.find(node);
+        if (it != dbgi.dbg.end() && it->second.prev.size() >= 2) return true;
+        auto st = dbgi.succ_track.find(node);
+        return st != dbgi.succ_track.end() && st->second.size() >= 2;
+    }
+
+    // --thread-bridge walk capture: identical DBG mutation as process_cores
+    // (uses the classify helper only to maintain the successor tracker + branch
+    // info), then STREAMING retention: keep the walk only if it crosses a branch
+    // (spans a repeat), and cap retained reads per bridge via the counting bloom.
+    template <class BFT>
+    static void process_cores_thread(const lcp_read &lr, dbg_index_base<BFT> &dbgi,
+                                     int thread_id, uint64_t &lcmer_index,
+                                     int lcmer_l,
+                                     gtl::vector<gtl::vector<u64>> &walk_sink,
+                                     CountingBloom *bloom, int cap) {
+        LCmer l{lr.cores.begin() + 1, lcmer_l};
+        gtl::vector<uint64_t> ll(1, 0);
+        ll.reserve(lr.cores.size() - lcmer_l + 3);
+        ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
+        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+             i < lr.cores.size() - 1; ++i) {
+            l.update_lcmer(lr.cores[i], lr.cores[i - lcmer_l], lcmer_l);
+            ll.push_back(dbgi.emplace(l, lcmer_index, thread_id));
+        }
+        ll.push_back(0);
+        insert_tally tally;  // drives succ_track maintenance; counts unused here
+        for (size_t i = 1; i < ll.size() - 1; ++i) {
+            if (insert_lcmer_helper_classify(ll, i, dbgi, tally)) {
+                dbgi.dbg.modify_if(
+                    ll[i],
+                    [&lr, i,
+                     lcmer_l](dbg_index_base<BFT>::dbg_map_t::value_type &val) {
+                        val.second.seq.emplace_back(
+                            lr.data, lr.pos[i + lcmer_l - 1].second,
+                            lr.pos[i + lcmer_l].second, val.first);
+                    });
+            }
+        }
+
+        // Streaming keep decision: does the walk cross a branch (a repeat)?
+        long first_br = -1, last_br = -1;
+        for (size_t i = 1; i + 1 < ll.size(); ++i) {
+            if (ll[i] && tb_is_branch(dbgi, ll[i])) {
+                if (first_br < 0) first_br = static_cast<long>(i);
+                last_br = static_cast<long>(i);
+            }
+        }
+        if (first_br < 0) return;  // no branch crossed -> not a bridge candidate
+
+        // Dedup key = the (entry-branch, exit-branch) node pair the walk crosses.
+        // These are DBG node ids shared by reads spanning the same tangle, so the
+        // cap binds per bridge -> retained reads ~ O(distinct bridges x cap),
+        // independent of sequencing depth (unlike flank anchors, which shift with
+        // each tiling read).
+        if (bloom) {
+            const u64 x = ll[first_br], y = ll[last_br];
+            const u64 a = std::min(x, y), b = std::max(x, y);
+            const u64 key = a * 0x9E3779B97F4A7C15ULL ^ (b + 0x632BE59BD9B4E019ULL);
+            if (bloom->bump(key) >= static_cast<uint8_t>(cap)) return;  // over cap
+        }
+        walk_sink.emplace_back(ll.begin(), ll.end());
+    }
+
+    // Chase a raw (pre-cleaning) node id to its post-cleaning unitig
+    // representative (mirrors dbg_index::get but from an id). 0 = dropped.
+    static u64 rep_of(const dbg_index &dbg, u64 id) {
+        for (int hop = 0; hop < 128 && id != 0; ++hop) {
+            auto it = dbg.dbg.find(id);
+            if (it == dbg.dbg.end()) return 0;
+            if (!it->second.redirected()) return id;
+            const u64 nxt = it->second.redirect_to;
+            if (nxt == 0 || nxt == id) return 0;
+            id = nxt;
+        }
+        return 0;
+    }
+
+    // Post-cleaning read-threading bridge pass: contract each retained walk to
+    // its substantial-unitig sequence, vote directed unitig adjacencies across
+    // the tangles, and confirm the unambiguous, well-supported ones. Writes the
+    // confirmed bridges to <out>.threads.tsv and stores them in confirmed_bridges
+    // for the emit step (inject_thread_bridge_edges).
+    void run_thread_bridge(dbg_index &dbg, const std::string &out_path) {
+        const int min_anchor = thread_bridge.min_anchor;
+        // Single-copy depth baseline: median avg_core_count of long, non-branching
+        // unitigs. Bridge anchors must be UNIQUE (in/out deg <=1) AND single-copy
+        // (avg_core_count <= 1.5x baseline) so bridges cannot route through
+        // collapsed-repeat unitigs (the false-join source).
+        gtl::vector<double> depths;
+        // Mean bases per lcmer step (core), estimated from the same long unitigs:
+        // total base length / total cores. Used to turn a gap measured in tangle
+        // core-steps into a gap in bases (Tier-1 scaffold-gap sizing).
+        uint64_t bp_bases = 0, bp_cores = 0;
+        for (auto &kv : dbg.dbg) {
+            auto &n = kv.second;
+            if (n.redirected() || n.seq.empty()) continue;
+            if (n.seq.size() >= 100 && n.prev.size() <= 1 &&
+                n.forward_edge_count <= 1) {
+                depths.push_back(n.avg_core_count());
+                for (const auto &q : n.seq) bp_bases += q.len;
+                bp_cores += n.seq.size();
+            }
+        }
+        std::sort(depths.begin(), depths.end());
+        const double baseline =
+            depths.empty() ? 0.0 : depths[depths.size() / 2];
+        const double cn_cap = baseline > 0 ? baseline * 1.5 : 1e18;
+        const double bases_per_step =
+            bp_cores ? static_cast<double>(bp_bases) / bp_cores : 1.0;
+        auto substantial = [&](u64 rep) -> bool {
+            auto it = dbg.dbg.find(rep);
+            if (it == dbg.dbg.end() || it->second.redirected() ||
+                it->second.seq.size() < static_cast<size_t>(min_anchor))
+                return false;
+            const auto &n = it->second;
+            return n.prev.size() <= 1 && n.forward_edge_count <= 1 &&
+                   n.avg_core_count() <= cn_cap;  // unique & single-copy
+        };
+        gtl::flat_hash_map<u64, gtl::flat_hash_map<u64, uint32_t>> adj;
+        gtl::flat_hash_map<u64, uint32_t> out_tot, in_tot;
+        // Per directed pair, the tangle-gap (in bases) each supporting walk saw.
+        gtl::flat_hash_map<u64, gtl::flat_hash_map<u64, gtl::vector<uint32_t>>>
+            gap_smp;
+        gtl::vector<u64> thread;    // contracted substantial-unitig reps
+        gtl::vector<uint32_t> tgap; // tgap[i] = tangle core-steps before thread[i]
+        for (const auto &walk : kept_walks) {
+            thread.clear();
+            tgap.clear();
+            uint32_t tangle_steps = 0;  // non-anchor steps since the last anchor
+            for (u64 raw : walk) {
+                if (raw == 0) continue;
+                const u64 rep = rep_of(dbg, raw);
+                if (rep == 0 || !substantial(rep)) {
+                    ++tangle_steps;  // dropped/tangle node = one gap core-step
+                    continue;
+                }
+                if (thread.empty() || thread.back() != rep) {
+                    thread.push_back(rep);
+                    tgap.push_back(tangle_steps);
+                }
+                tangle_steps = 0;  // entered/continuing an anchor: reset the gap
+            }
+            for (size_t i = 1; i < thread.size(); ++i) {
+                const u64 a = thread[i - 1], b = thread[i];
+                if (a == b) continue;
+                adj[a][b]++;
+                out_tot[a]++;
+                in_tot[b]++;
+                gap_smp[a][b].push_back(static_cast<uint32_t>(
+                    tgap[i] * bases_per_step));
+            }
+        }
+        FILE *tf = fopen(out_path.c_str(), "w");
+        if (!tf) {
+            fprintf(stderr, "Cannot open thread-bridge output: %s\n",
+                    out_path.c_str());
+            return;
+        }
+        // Median of a pair's per-walk gap samples (robust to error outliers).
+        auto median_gap = [](gtl::vector<uint32_t> &v) -> uint32_t {
+            if (v.empty()) return 0;
+            std::sort(v.begin(), v.end());
+            return v[v.size() / 2];
+        };
+        fprintf(tf, "u\tv\tsupport\tgap\n");
+        u64 confirmed = 0;
+        for (const auto &[a, succs] : adj) {
+            for (const auto &[b, s] : succs) {
+                if (s < static_cast<uint32_t>(thread_bridge.min_support)) continue;
+                // full dominance: a's votes go only to b, and b's only from a.
+                if (s != out_tot[a] || s != in_tot[b]) continue;
+                const uint32_t gap = median_gap(gap_smp[a][b]);
+                fprintf(tf, "%" PRIu64 "\t%" PRIu64 "\t%u\t%u\n", a, b, s, gap);
+                confirmed_bridges.push_back({a, b, s, gap});
+                ++confirmed;
+            }
+        }
+        fclose(tf);
+
+        fprintf(stderr,
+                "thread-bridge: %zu retained walks -> %" PRIu64
+                " confirmed bridges (support>=%d, full dominance) -> %s\n",
+                kept_walks.size(), confirmed, thread_bridge.min_support,
+                out_path.c_str());
+    }
+
     static void process_cores_for_basespace(
         const lcp_read &lr, dbg_index &dbgi, [[maybe_unused]] int thread_id,
         [[maybe_unused]] uint64_t &lcmer_index, int lcmer_l) {
@@ -289,11 +638,14 @@ struct assembler {
         return {8, threads - 8};
     }
 
-    static auto process_data(int thread_id, int lcp_level, dqt &data_queue,
-                             dqt &recycle_queue, dbg_index &dbgi,
-                             std::atomic<bool> &done, int &processed_read_count,
-                             int &all_reads, auto Process_Func,
-                             SyncmerType syncmer_functor, int lcmer_l) {
+    static auto process_data(
+        int thread_id, int lcp_level, dqt &data_queue, dqt &recycle_queue,
+        dbg_index &dbgi, std::atomic<bool> &done, int &processed_read_count,
+        int &all_reads, auto Process_Func, SyncmerType syncmer_functor,
+        int lcmer_l,
+        gtl::vector<std::pair<std::string, insert_tally>> *insert_sink = nullptr,
+        gtl::vector<gtl::vector<u64>> *walk_sink = nullptr,
+        CountingBloom *tb_bloom = nullptr, int tb_cap = 0) {
         uint64_t lcmer_index = 0;
         bam1_t *data_p = NULL;
         lps str = {0, 0, 0, 0};
@@ -318,7 +670,19 @@ struct assembler {
             // recycled afterwards.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
-                Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
+                if (walk_sink) {
+                    process_cores_thread<DefaultBF>(lr, dbgi, thread_id,
+                                                    lcmer_index, lcmer_l,
+                                                    *walk_sink, tb_bloom, tb_cap);
+                } else if (insert_sink) {
+                    insert_tally tally;
+                    process_cores_classify<DefaultBF>(lr, dbgi, thread_id,
+                                                      lcmer_index, lcmer_l,
+                                                      tally);
+                    insert_sink->emplace_back(bam_get_qname(data_p), tally);
+                } else {
+                    Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
+                }
             }
             if (!recycle_queue.try_enqueue(data_p)) {
                 bam_destroy1(data_p);
@@ -379,12 +743,27 @@ struct assembler {
         gtl::vector<int> valid_read_counts(threads.work, 0);
         gtl::vector<int> all_read_counts(threads.work, 0);
 
+        // --dump-insert-types: one sink per worker (avoids cross-thread
+        // contention); merged and written after join. nullptr => normal path.
+        const bool classify_inserts = !dump_insert_types_path.empty();
+        std::vector<gtl::vector<std::pair<std::string, insert_tally>>>
+            insert_sinks(classify_inserts ? threads.work : 0);
+        // --thread-bridge: one walk sink per worker, merged into kept_walks; a
+        // shared counting bloom caps retained reads per bridge.
+        std::vector<gtl::vector<gtl::vector<u64>>>
+            walk_sinks(thread_bridge.enable ? threads.work : 0);
+        std::unique_ptr<CountingBloom> tb_bloom;
+        if (thread_bridge.enable) tb_bloom = std::make_unique<CountingBloom>(22);
+
         for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back([&, tid]() {
                 process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
                              done, valid_read_counts[tid - 1],
                              all_read_counts[tid - 1], process_cores<DefaultBF>,
-                             syncmer_functor, dbg_lcmer_l);
+                             syncmer_functor, dbg_lcmer_l,
+                             classify_inserts ? &insert_sinks[tid - 1] : nullptr,
+                             thread_bridge.enable ? &walk_sinks[tid - 1] : nullptr,
+                             tb_bloom.get(), thread_bridge.cap);
             });
         }
 
@@ -436,6 +815,57 @@ struct assembler {
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
+
+        if (thread_bridge.enable) {
+            size_t total = 0;
+            for (const auto &s : walk_sinks) total += s.size();
+            kept_walks.reserve(total);
+            for (auto &s : walk_sinks)
+                for (auto &w : s) kept_walks.emplace_back(std::move(w));
+            fprintf(stderr, "thread-bridge: retained %zu read walks\n",
+                    kept_walks.size());
+        }
+
+        if (classify_inserts) {
+            FILE *ito = fopen(dump_insert_types_path.c_str(), "w");
+            if (!ito) {
+                return std::unexpected("Cannot open --dump-insert-types file: " +
+                                       dump_insert_types_path);
+            }
+            fprintf(ito,
+                    "read_name\tsteps\tnovel\tcoverage\tbranch_open\tbranch_join\n");
+            u64 rows = 0;
+            for (const auto &sink : insert_sinks) {
+                for (const auto &[name, t] : sink) {
+                    fprintf(ito, "%s\t%u\t%u\t%u\t%u\t%u\n", name.c_str(),
+                            t.steps, t.novel, t.coverage, t.branch_open,
+                            t.branch_join);
+                    ++rows;
+                }
+            }
+            fclose(ito);
+            fprintf(stderr, "insert-type classification written for %" PRIu64
+                            " reads to %s\n",
+                    rows, dump_insert_types_path.c_str());
+
+            // Sidecar: per-read node-id walk (0 = coverage-gate drop). Supports
+            // the path-level component-spanning analysis in Python.
+            const std::string walks_path = dump_insert_types_path + ".walks";
+            FILE *wto = fopen(walks_path.c_str(), "w");
+            if (!wto) {
+                return std::unexpected("Cannot open read-walks file: " +
+                                       walks_path);
+            }
+            for (const auto &sink : insert_sinks) {
+                for (const auto &[name, t] : sink) {
+                    fputs(name.c_str(), wto);
+                    for (const u64 id : t.walk) fprintf(wto, "\t%" PRIu64, id);
+                    fputc('\n', wto);
+                }
+            }
+            fclose(wto);
+            fprintf(stderr, "read walks written to %s\n", walks_path.c_str());
+        }
         return {};
     }
 
@@ -1005,6 +1435,11 @@ int run_assembly(const asm_config &cfg) {
     GraphCleaning::run(dbg, cfg);
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
+
+    if (cfg.thread_bridge.enable) {
+        as.run_thread_bridge(dbg, cfg.output + ".threads.tsv");
+        IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Thread-bridge");
+    }
 
 
     // Dump pre-layout (bidirected) unitig graph, gated on --print-bi-dbg.
@@ -1605,6 +2040,70 @@ TEST_CASE("layout_graph_emit::PostLayoutCleaning::cut_tips peels short tips") {
     REQUIRE_EQ(edges.size(), 1u);
     CHECK_EQ(edges.begin()->second.src_super, 0u);
     CHECK_EQ(edges.begin()->second.dst_super, 4u);
+}
+
+TEST_CASE(
+    "layout_graph_emit::inject_thread_bridge_edges adds 1:1 scaffold edges") {
+    using namespace layout_graph_emit;
+    // Two layout supernodes; DBG node 100 sits at M0's END boundary, node 200 at
+    // M1's START boundary. Bridge 100->200 must add exactly one TP:Z:bridge
+    // superedge M0(end)->M1(start) carrying the support.
+    supernode_vec sn(2);
+    sn[0].name = "M0"; sn[0].is_layout = true; sn[0].aux_id = 0;
+    sn[1].name = "M1"; sn[1].is_layout = true; sn[1].aux_id = 0;
+    gtl::flat_hash_map<u64, u64> n2s{{100, 0}, {200, 1}};
+    gtl::flat_hash_set<u64> in_layouts{100, 200};
+    gtl::flat_hash_map<u64, bool> ori{{100, true}, {200, true}};
+    // ori=true => src side END, dst side START; masks must include those sides.
+    gtl::flat_hash_map<u64, uint8_t> mask{{100, SIDE_END}, {200, SIDE_START}};
+    gtl::vector<bridge_edge> bridges{{100, 200, 7}};
+
+    edge_map edges;
+    CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori, mask,
+                                        edges),
+             1u);
+    REQUIRE_EQ(edges.size(), 1u);
+    [[maybe_unused]] const auto &e = edges.begin()->second;
+    CHECK(e.thread_bridge);
+    CHECK_EQ(e.tb_support, 7u);
+    CHECK_EQ(e.src_super, 0u);
+    CHECK_EQ(e.dst_super, 1u);
+    CHECK_EQ(e.src_side, SIDE_END);
+    CHECK_EQ(e.dst_side, SIDE_START);
+
+    // Anchor not on the needed boundary side -> dropped (no valid contig end).
+    gtl::flat_hash_map<u64, uint8_t> mask_mid{{100, SIDE_START},
+                                              {200, SIDE_START}};
+    edge_map edges2;
+    CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori,
+                                        mask_mid, edges2),
+             0u);
+
+    // Ambiguous: two bridges share the M0-END endpoint -> neither injected.
+    supernode_vec sn3(3);
+    sn3[0].name = "M0"; sn3[0].is_layout = true; sn3[0].aux_id = 0;
+    sn3[1].name = "M1"; sn3[1].is_layout = true; sn3[1].aux_id = 0;
+    sn3[2].name = "M2"; sn3[2].is_layout = true; sn3[2].aux_id = 0;
+    gtl::flat_hash_map<u64, u64> n2s3{{100, 0}, {200, 1}, {300, 2}};
+    gtl::flat_hash_set<u64> inl3{100, 200, 300};
+    gtl::flat_hash_map<u64, bool> ori3{{100, true}, {200, true}, {300, true}};
+    gtl::flat_hash_map<u64, uint8_t> mask3{
+        {100, SIDE_END}, {200, SIDE_START}, {300, SIDE_START}};
+    gtl::vector<bridge_edge> bridges3{{100, 200, 7}, {100, 300, 7}};
+    edge_map edges3;
+    CHECK_EQ(inject_thread_bridge_edges(bridges3, sn3, n2s3, inl3, ori3, mask3,
+                                        edges3),
+             0u);
+
+    // A layout edge already connecting the pair -> bridge not duplicated.
+    edge_map edges4;
+    edge_key existing{0, 1, '+', '+', SIDE_END, SIDE_START};
+    edges4[existing].src_super = 0;
+    edges4[existing].dst_super = 1;
+    edges4[existing].count = 1;
+    CHECK_EQ(inject_thread_bridge_edges(bridges, sn, n2s, in_layouts, ori, mask,
+                                        edges4),
+             0u);
 }
 
 TEST_CASE("layout_graph_emit::find_heaviest_paths emits only the connected "

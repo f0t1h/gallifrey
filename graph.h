@@ -147,6 +147,13 @@ struct dbg_index_base {
     dbg_map_t dbg;
     gtl::btree_set<u64> active_set;
 
+    // Side successor tracker, populated ONLY on the insert-classification path
+    // (--dump-insert-types); untouched on normal runs. The DBG stores only
+    // `prev` (in-edges), so detecting branch-OPEN events (a node gaining a
+    // second distinct successor) needs an out-edge view. Maps node id -> the
+    // successor ids seen so far during construction.
+    gtl::parallel_flat_hash_map<u64, gtl::vector<u64>> succ_track;
+
     // merge_info_map_t merge_map;
     BloomFilterType bf;
 
