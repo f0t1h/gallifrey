@@ -211,24 +211,6 @@ struct asm_config {
         double min_bubble_depth_difference_percentage = 2;
         bool enable_loop_opening = false;
     } graph_cleaning;
-    struct {
-        // M-contig bridging through C nodes (see
-        // docs/contiguity-and-spaced-seed-plan.md, Task 1). 0 = off,
-        // 1 = thread (topology: unique through-path only),
-        // 2 = reads (topology + spanning-read evidence).
-        int mode = 0;
-        // Minimum EC (supporting DBG edges) on each bridge superedge.
-        size_t min_edge_support = 1;
-        // Max total superedges on the C node: exact 2 in mode 1; looser cap
-        // in mode 2 where read evidence arbitrates the tangle.
-        int max_c_degree = 2;
-        int max_c_degree_reads = 6;
-        // Reads that must span both junction anchors (mode 2).
-        int min_read_support = 2;
-        // Chaining iterations (M-C-M-C-... merges become possible after a
-        // merge rewires the supernode graph).
-        int max_passes = 4;
-    } bridge;
 
     void print_cfg(FILE *f) const {
         if (!inputs.empty()) {

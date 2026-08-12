@@ -62,6 +62,7 @@ if(PGO_USE)
 endif()
 # # Remove problematic flags in debug mode
 # if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+
 #     # Remove optimization that can interfere with debugging
 #     string(REPLACE "-Wno-interference-size" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
 # endif()
@@ -72,6 +73,16 @@ set(SOURCE_FILES lasm.cpp asm2.cpp lcmer.cpp dump_cores.cpp)
 
 add_executable(${PROJECT_NAME} ${SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PRIVATE ./ext)
+
+# Compile-time OLC end-skip tuning (asm2.cpp OLC_SKIP_LAST macro; default
+# l/2). Plain-value macro because CMake cannot pass function-like defines on
+# the compiler command line (and CMAKE_CXX_FLAGS leaks -D into the ld64 link
+# step). asm2.cpp bridges LASM_OLC_SKIP_LAST_VALUE -> OLC_SKIP_LAST(l).
+set(LASM_OLC_SKIP_LAST "" CACHE STRING "Override OLC_SKIP_LAST(l) (default l/2)")
+if(NOT LASM_OLC_SKIP_LAST STREQUAL "")
+    target_compile_definitions(${PROJECT_NAME}
+                               PRIVATE LASM_OLC_SKIP_LAST_VALUE=${LASM_OLC_SKIP_LAST})
+endif()
 
 # External dependencies
 include(FetchContent)

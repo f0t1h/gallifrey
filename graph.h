@@ -737,8 +737,9 @@ struct GraphCleaning {
 
     // Bubble depth delta calculation
     ///
-    static void pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
-                            auto &active_set) {
+    static size_t pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
+                              auto &active_set) {
+        size_t popped = 0;
         for (u64 node : active_set) {
             auto current = dbg.find(node);
             if (current == dbg.end() || current->second.redirected()) {
@@ -760,6 +761,7 @@ struct GraphCleaning {
                                 bubble_depth_epsilon) {
                                 // Remove p2
                                 dbg.erase(p2);  // MARK
+                                ++popped;
                                 current->second.prev.erase(
                                     std::next(current->second.prev.begin()));
                                 auto nn = dbg.find(p1->second.prev[0]);
@@ -772,6 +774,7 @@ struct GraphCleaning {
                                        bubble_depth_epsilon) {
                                 // Remove p1
                                 dbg.erase(p1);  // MARK
+                                ++popped;
                                 current->second.prev[0] =
                                     current->second.prev[1];
                                 current->second.prev.erase(
@@ -788,6 +791,7 @@ struct GraphCleaning {
                 }
             }
         }
+        return popped;
     }
     static void cut_low_support_edges(dbg_map_t &dbg, auto &active_set) {
         // Death by thousand cuts
@@ -942,12 +946,17 @@ struct GraphCleaning {
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
                 fix_edges(dbgi.dbg, active_set);
-
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
-                // TODO FIX pop_bubbles sequence problem fix
-                // pop_bubbles(dbgi.dbg, dbgi.lci,
-                //             cfg.min_bubble_depth_difference_percentage,
-                //             active_set);
+                // KNOWN-BROKEN: pop_bubbles' implementation (single-node
+                // convergent-bubble shape only) is not correct; disabled until
+                // the algorithm is revised. See misassembly investigation.
+                // const size_t popped = pop_bubbles(
+                //     dbgi.dbg, cfg.min_bubble_depth_difference_percentage,
+                //     active_set);
+                // if (popped > 0)
+                //     std::fprintf(stderr,
+                //                  "[graph-clean] popped %zu bubbles\n",
+                //                  popped);
                 if (cfg.enable_loop_opening) {
                     open_simple_loopsv2(dbgi.dbg, active_set,
                                         initial_depth_stats);

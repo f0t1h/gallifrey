@@ -46,6 +46,11 @@ enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
 // into singletons; the (1, l/2) default drops singleton contigs 87.0%->84.5%
 // and lifts N50 +13% with no extra misassemblies. A node needs
 // (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l)) cores to anchor any overlap.
+// CMake knob bridge: LASM_OLC_SKIP_LAST_VALUE (plain value macro; function-like
+// defines cannot cross the compiler command line) -> OLC_SKIP_LAST(l).
+#ifdef LASM_OLC_SKIP_LAST_VALUE
+#define OLC_SKIP_LAST(l) (LASM_OLC_SKIP_LAST_VALUE)
+#endif
 #ifndef OLC_SKIP_FIRST
 #define OLC_SKIP_FIRST(l) (1)
 #endif
@@ -179,12 +184,14 @@ struct assembler {
         return ll;
     }
     static auto find_lcmer_ranges(const lcp_read &lr, const dbg_index &dbgi,
-                                  int lcmer_l) {
+                                  int lcmer_l, long skip_first = -1,
+                                  long skip_last = -1) {
         // Cores skipped at each node end before overlap-anchoring (see the
         // OLC_SKIP_* macros). Node ends are boundary-noisy, so a small skip
-        // avoids false anchors.
-        long skip_first = OLC_SKIP_FIRST(lcmer_l);
-        long skip_last = OLC_SKIP_LAST(lcmer_l);
+        // avoids false anchors. Callers may override (e.g. 0/0 for the relaxed
+        // reverse lookup of short partners).
+        if (skip_first < 0) skip_first = OLC_SKIP_FIRST(lcmer_l);
+        if (skip_last < 0) skip_last = OLC_SKIP_LAST(lcmer_l);
         // Need enough cores to form at least one valid lcmer after skipping
         if (lr.cores.size() <
             static_cast<size_t>(lcmer_l + skip_first + skip_last)) {
@@ -758,8 +765,11 @@ struct assembler {
     auto fold_dbg_graph(dbg_index &dbgi) {
         fprintf(stderr, "dbg_size: %zu\n", dbgi.dbg.size());
 
-        // Discard a reciprocal match that spans less than this fraction (1/N) of
-        // the query node's cores — too short to be a reliable overlap.
+        // Discard a match whose overlap spans less than this fraction (1/N) of
+        // the SHORTER node's cores — too short to be a reliable overlap. The
+        // gate is enforced at the reciprocity stage where both nodes' spans and
+        // totals are known; the old query-relative form made containment
+        // overlaps (short node inside long node) structurally impossible.
         constexpr size_t MIN_OVERLAP_CORE_FRACTION_DIV = 20;
 
         std::atomic<int> all_n{0};
@@ -768,7 +778,7 @@ struct assembler {
         // Phase-0 matching diagnostics: why do good nodes fail to match?
         std::atomic<int> too_short{0};   // < 4*olc_lcmer_l cores → no ranges (#4)
         std::atomic<int> no_ranges{0};   // long enough but 0 lcmer hits
-        std::atomic<int> frac_drop{0};   // overlap < 5% of cores, filtered (#6)
+        std::atomic<int> frac_drop{0};   // reciprocal but < 5% of shorter node
         gtl::parallel_flat_hash_map_d<u64, gtl::vector<SelfMatch>, HT_SHARD_BC,
                                       std::mutex>
             matched;
@@ -825,11 +835,6 @@ struct assembler {
                 for (const auto &[id, from_core, to_core, from_lcmer,
                                   to_lcmer] : found_ranges) {
                     if (id != 0) {
-                        if (to_core - from_core <
-                            lr.pos.size() / MIN_OVERLAP_CORE_FRACTION_DIV) {
-                            frac_drop.fetch_add(1);
-                            continue;
-                        }
                         any_hit = true;
                         hits.fetch_add(1);
 
@@ -872,7 +877,41 @@ struct assembler {
             threads.work);
 
         gtl::btree_multimap<u64, Overlap> reciprocal;
-        int non_recip = 0, recip_kept = 0;
+        int non_recip = 0, recip_kept = 0, relaxed_kept = 0;
+        // Absolute overlap-span floor in cores: half an lcmer window. Below
+        // this, an "overlap" rests on less than one anchor's worth of
+        // progression and is treated as noise (see the fraction gate).
+        const u64 span_floor = std::max<u64>(2, (u64)olc_lcmer_l / 2);
+        // rc-cores against the DBG with skips disabled, its total core count).
+        // Filled lazily only for partners of one-directional matches.
+        struct relaxed_info {
+            gtl::vector<std::tuple<u64, u64, u64>> ranges;
+            u64 total_cores = 0;
+        };
+        gtl::flat_hash_map<u64, relaxed_info> relaxed_cache;
+        auto relaxed_ranges_for = [&](u64 nid) -> relaxed_info & {
+            auto [it, inserted] = relaxed_cache.try_emplace(nid);
+            if (!inserted) return it->second;
+            auto nit = dbgi.dbg.find(nid);
+            if (nit == dbgi.dbg.end() || nit->second.redirected() ||
+                nit->second.seq.empty()) {
+                return it->second;
+            }
+            lps rstr = {0, 0, 0, 0};
+            lcp_read b_lr =
+                build_rev_lr_cores(nit->second.seq, syncmer_functor, lcp_level,
+                                   rstr);
+            it->second.total_cores = static_cast<u64>(
+                (b_lr.cores.size() > 0) ? b_lr.cores.size() - 1 : 0);
+            if (b_lr.cores.size() >= static_cast<size_t>(olc_lcmer_l + 1)) {
+                auto rr = find_lcmer_ranges(b_lr, dbgi, olc_lcmer_l, 0, 0);
+                for (const auto &[rid, fr, to, fl, tl] : rr) {
+                    if (rid != 0) it->second.ranges.emplace_back(rid, fr, to);
+                }
+            }
+            free_lps(&rstr);
+            return it->second;
+        };
         for (const auto &[k, v] : matched) {
             for (const auto &match : v) {
                 // Keep the overlap only if the partner records the reverse one
@@ -888,34 +927,131 @@ struct assembler {
                                              })
                               : gtl::vector<SelfMatch>::const_iterator{};
                 if (it != matched.end() && ff != it->second.end()) {
+                    // Span-symmetric fraction gate: the overlap extent must be
+                    // >= 1/MIN_OVERLAP_CORE_FRACTION_DIV of the SHORTER node's
+                    // total cores, and >= span_floor cores in ABSOLUTE terms.
+                    // The absolute floor matters at deeper LCP levels: cores
+                    // are sparser, so 5% of a short node can be 1-2 cores —
+                    // shorter than one anchor window and pure noise.
+                    const u64 span_a = match.self.to - match.self.from;
+                    const u64 span_b = ff->self.to - ff->self.from;
+                    const u64 shorter_total =
+                        std::min(match.self.len, ff->self.len);
+                    if (std::min(span_a, span_b) <
+                        std::max(shorter_total / MIN_OVERLAP_CORE_FRACTION_DIV,
+                                 span_floor)) {
+                        frac_drop.fetch_add(1);
+                        continue;
+                    }
+                    // NOTE: a full-full rejection (both spans >= 95% of their
+                    // nodes) was measured and REVERTED: it dropped 20 pairs,
+                    // misassemblies 41->40 (noise), dup ratio worse
+                    // (1.062->1.104). Near-identical SD copies are
+                    // indistinguishable at the lcmer-key level; separating
+                    // them needs read flank-association (future work).
                     reciprocal.emplace(k,
                                        Overlap{match.other, match.self, ff->self});
                     ++recip_kept;
                 } else {
-                    ++non_recip;  // one-directional match (#7)
-#if OLC_NONRECIPROCAL
-                    // Prototype: keep it anyway. We only know k's span
-                    // (match.self); approximate the partner's span as the same
-                    // shape (self-symmetric) so connected_comp_plus_layout can
-                    // still position the partner. Coarse — it measures whether
-                    // wiring these extra nodes in helps before we compute the
-                    // partner's real overlap interval.
-                    reciprocal.emplace(
-                        k, Overlap{match.other, match.self, match.self});
-#endif
+                    // Relaxed reverse lookup: A→B was stored but B→A was not.
+                    // B may have been too short for the standard skip gates, or
+                    // its end noise hid A. Re-run B's match with skips
+                    // disabled; if A appears, keep the overlap with B's REAL
+                    // span under the same symmetric fraction gate. (The old
+                    // OLC_NONRECIPROCAL prototype faked B's span
+                    // self-symmetrically instead.)
+                    relaxed_info &rinfo = relaxed_ranges_for(match.other);
+                    const auto best = std::max_element(
+                        rinfo.ranges.begin(), rinfo.ranges.end(),
+                        [](const auto &a, const auto &b) {
+                            return std::get<2>(a) - std::get<1>(a) <
+                                   std::get<2>(b) - std::get<1>(b);
+                        });
+                    if (best != rinfo.ranges.end() &&
+                        std::get<0>(*best) == k) {
+                        const u64 span_a = match.self.to - match.self.from;
+                        const u64 span_b = std::get<2>(*best) - std::get<1>(*best);
+                        const u64 shorter_total =
+                            std::min(match.self.len, rinfo.total_cores);
+                        if (std::min(span_a, span_b) >=
+                            std::max(shorter_total / MIN_OVERLAP_CORE_FRACTION_DIV,
+                                     span_floor)) {
+                            reciprocal.emplace(
+                                k,
+                                Overlap{match.other, match.self,
+                                        CoreSpan{std::get<1>(*best),
+                                                 std::get<2>(*best),
+                                                 rinfo.total_cores}});
+                        } else {
+                            ++non_recip;
+                        }
+                    } else {
+                        ++non_recip;
+                    }
                 }
+            }
+        }
+        if (getenv("LASM_DUMP_MATCHMULT")) {
+            // Distinct reciprocal partners per node: the tangle-vs-unique
+            // discriminator for repeat-boundary breaking.
+            gtl::flat_hash_map<u64, gtl::flat_hash_set<u64>> partners;
+            for (const auto &[k, ov] : reciprocal) {
+                partners[k].insert(ov.target);
+            }
+            size_t h1 = 0, h2 = 0, h3 = 0, h5 = 0, h10 = 0, hbig = 0;
+            for (const auto &[k, v] : partners) {
+                const size_t n = v.size();
+                if (n <= 1) ++h1;
+                else if (n <= 2) ++h2;
+                else if (n <= 3) ++h3;
+                else if (n <= 5) ++h5;
+                else if (n <= 10) ++h10;
+                else ++hbig;
+            }
+            fprintf(stderr,
+                    "[match-mult] nodes by distinct-partners: 1:%zu 2:%zu "
+                    "3:%zu 4-5:%zu 6-10:%zu >10:%zu\n",
+                    h1, h2, h3, h5, h10, hbig);
+        }
+        if (getenv("LASM_DUMP_SPANCOV")) {
+            // Per-(query, other): run_count, span_sum, max_run, query_cores.
+            // Same-locus overlaps are one near-total run; divergent-copy
+            // overlaps fragment into many short runs.
+            const std::string sc_path = output + ".spancov.tsv";
+            FILE *sc = fopen(sc_path.c_str(), "w");
+            if (sc) {
+                fprintf(sc, "query\tother\truns\tspan_sum\tmax_run\tquery_cores\n");
+                for (const auto &[k, v] : matched) {
+                    gtl::flat_hash_map<u64, gtl::vector<u64>> per_other;
+                    u64 qcores = 0;
+                    for (const auto &m : v) {
+                        per_other[m.other].push_back(m.self.to - m.self.from);
+                        qcores = std::max(qcores, m.self.len);
+                    }
+                    for (const auto &[o, spans] : per_other) {
+                        u64 sum = 0, mx = 0;
+                        for (u64 s : spans) {
+                            sum += s;
+                            mx = std::max(mx, s);
+                        }
+                        fprintf(sc,
+                                "%" PRIu64 "\t%" PRIu64 "\t%zu\t%" PRIu64
+                                "\t%" PRIu64 "\t%" PRIu64 "\n",
+                                k, o, spans.size(), sum, mx, qcores);
+                    }
+                }
+                fclose(sc);
             }
         }
         fprintf(stderr, "all:%d\ngood: %d nodes\nhits: %d\n", all_n.load(),
                 all_n.load() - bad.load(), hits.load());
         fprintf(stderr,
                 "[match-diag] too_short:%d no_ranges:%d frac_drop:%d "
-                "recip_kept:%d non_recip:%d\n",
-                too_short.load(), no_ranges.load(), frac_drop.load(), recip_kept,
-                non_recip);
+                "recip_kept:%d relaxed_kept:%d non_recip:%d\n",
+                too_short.load(), no_ranges.load(), frac_drop.load(),
+                recip_kept, relaxed_kept, non_recip);
         auto layouts =
             layout_graph_algo::connected_comp_plus_layout(reciprocal);
-
         return std::make_pair(reciprocal, layouts);
     }
 };
@@ -973,9 +1109,6 @@ int run_assembly(const asm_config &cfg) {
     INIT_TIMERS(HIFI_ASSEMBLY);
 
     assembler as(cfg);
-    // The DBG index lives for the whole program; it is held in stack-resident
-    // inline storage and its (expensive) destructor is intentionally skipped at
-    // exit. See no_destructor.h.
     NoDestructor<dbg_index> dbg_storage(cfg.bloom.false_positive_rate,
                                         cfg.bloom.projected_count, cfg.seed);
     dbg_index &dbg = *dbg_storage;
@@ -1006,17 +1139,31 @@ int run_assembly(const asm_config &cfg) {
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
-
-    // Dump pre-layout (bidirected) unitig graph, gated on --print-bi-dbg.
-    if (cfg.print_prelayout_graph) {
-        const std::string pre_path = cfg.output + ".bi.gfa";
-        FILE *pre = fopen(pre_path.c_str(), "w");
-        if (!pre) {
-            fprintf(stderr, "Cannot open output: %s\n", pre_path.c_str());
-            return 1;
+    // Diagnostic dump (LASM_DUMP_NODEDEPTH=1): per-node stats for repeat-
+    // boundary calibration — avg_core_count, seq bases, fragment count, in/out
+    // degree. Fragments-per-base scales with collapsed copy number even though
+    // avg_core_count (core_count/frags) stays flat under collapse.
+    if (getenv("LASM_DUMP_NODEDEPTH")) {
+        const std::string nd_path = cfg.output + ".nodedepth.tsv";
+        FILE *nd = fopen(nd_path.c_str(), "w");
+        if (nd) {
+            fprintf(nd, "id\tavg_core\tseq_bases\tfrags\tprev\tfec\n");
+            for (u64 node : dbg.active_set) {
+                auto it = dbg.dbg.find(node);
+                if (it == dbg.dbg.end() || it->second.redirected() ||
+                    it->second.seq.empty()) {
+                    continue;
+                }
+                size_t bases = 0;
+                for (const auto &s : it->second.seq) bases += s.len;
+                fprintf(nd,
+                        "%" PRIu64 "\t%.2f\t%zu\t%zu\t%zu\t%u\n", node,
+                        it->second.avg_core_count(), bases,
+                        it->second.seq.size(), it->second.prev.size(),
+                        it->second.forward_edge_count);
+            }
+            fclose(nd);
         }
-        print_dbg_seqs(pre, dbg);
-        fclose(pre);
     }
 
     {
@@ -1025,7 +1172,6 @@ int run_assembly(const asm_config &cfg) {
             fprintf(stderr, "Cannot open output: %s\n", cfg.output.c_str());
             return 1;
         }
-        // print_dbg_seqs(out, dbg);
         layout_graph_emit::emit_ultra_merged_graph(as, dbg, out);
         fclose(out);
     }
