@@ -8,10 +8,11 @@
 #include <blockingconcurrentqueue.h>
 
 #include <atomic>
-#include <cassert>
-#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cassert>
+#include <cmath>
+#include <cstdlib>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
 #include <limits>
@@ -735,61 +736,140 @@ struct GraphCleaning {
         }
     }
 
-    // Bubble depth delta calculation
-    ///
+    // Bubble popping (strict fork-2 -> merge-2 bubbles).
+    // A bubble is two node-disjoint simple paths S -> ... -> T between a
+    // 2-successor fork S and a 2-predecessor merge T (S != T). Post-simplify
+    // arms are single nodes, but arms are walked explicitly so nested-branch
+    // candidates are rejected instead of misread. The shallower arm (minimum
+    // avg_core_count along the arm) is popped when it is at least
+    // bubble_depth_epsilon times shallower than the other and the two arm
+    // lengths (submer counts) are within bubble_length_bound of each other.
+    // Strict 2/2 topology is required: among 3+ parallel copies (SD/rDNA
+    // tangles) nothing is popped -- deleting one of many real copies is a
     static size_t pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
+                              double bubble_length_bound,
+                              size_t max_popped_arm_len, bool dump_pops,
                               auto &active_set) {
-        size_t popped = 0;
-        for (u64 node : active_set) {
-            auto current = dbg.find(node);
-            if (current == dbg.end() || current->second.redirected()) {
-                continue;
-            }
-
-            if (current->second.prev.size() >=
-                2) {  // Simple case with 2 should expand later to many case
-                auto p1 = dbg.find(current->second.prev[0]);
-                auto p2 = dbg.find(current->second.prev[1]);
-                if ((p1 != dbg.end() && !p1->second.redirected()) &&
-                    (p2 != dbg.end() && !p2->second.redirected())) {
-                    if (p1->second.prev.size() == 1 &&
-                        p2->second.prev.size() == 1) {
-                        if (p1->second.prev[0] == p2->second.prev[0]) {
-                            // BUBBLE FOUND
-                            if (p2->second.avg_core_count() /
-                                    p1->second.avg_core_count() <
-                                bubble_depth_epsilon) {
-                                // Remove p2
-                                dbg.erase(p2);  // MARK
-                                ++popped;
-                                current->second.prev.erase(
-                                    std::next(current->second.prev.begin()));
-                                auto nn = dbg.find(p1->second.prev[0]);
-                                if (nn != dbg.end() &&
-                                    !nn->second.redirected()) {
-                                    nn->second.forward_edge_count--;
-                                }
-                            } else if (p1->second.avg_core_count() /
-                                           p2->second.avg_core_count() <
-                                       bubble_depth_epsilon) {
-                                // Remove p1
-                                dbg.erase(p1);  // MARK
-                                ++popped;
-                                current->second.prev[0] =
-                                    current->second.prev[1];
-                                current->second.prev.erase(
-                                    std::next(current->second.prev.begin()));
-
-                                auto nn = dbg.find(p2->second.prev[0]);
-                                if (nn != dbg.end() &&
-                                    !nn->second.redirected()) {
-                                    nn->second.forward_edge_count--;
-                                }
-                            }
-                        }
-                    }
+        // Live forward adjacency (successor lists are not stored on nodes).
+        gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
+        for (const auto &[id, node] : dbg) {
+            if (node.redirected()) continue;
+            for (u64 p : node.prev) {
+                auto pit = dbg.find(p);
+                if (pit != dbg.end() && !pit->second.redirected()) {
+                    fwd[p].push_back(id);
                 }
             }
+        }
+        for (auto &[_, succs] : fwd) {
+            std::sort(succs.begin(), succs.end());
+        }
+
+        auto walk_arm = [&](u64 start, gtl::vector<u64> &path) -> u64 {
+            // Walk a simple forward path until a reconvergence node (>= 2
+            // predecessors) is reached; return it. Abort (0) on non-simple
+            // nodes, divergence, dead/stale edges, cycles, or the node cap.
+            // The path itself is collected, excluding the sink.
+            path.clear();
+            u64 cur = start;
+            constexpr size_t kMaxArmNodes = 64;
+            for (size_t step = 0; step < kMaxArmNodes; ++step) {
+                auto cit = dbg.find(cur);
+                if (cit == dbg.end() || cit->second.redirected()) return 0;
+                if (cit->second.prev.size() != 1) return 0;
+                path.push_back(cur);
+                auto nxt_it = fwd.find(cur);
+                if (nxt_it == fwd.end() || nxt_it->second.empty()) return 0;
+                u64 next = 0;
+                for (u64 cand : nxt_it->second) {
+                    auto nit = dbg.find(cand);
+                    if (nit == dbg.end() || nit->second.redirected()) {
+                        return 0;  // stale edge from an earlier pop
+                    }
+                    if (next != 0) return 0;  // divergence
+                    next = cand;
+                }
+                if (next == start) return 0;  // cycle back onto the arm
+                auto nit = dbg.find(next);
+                if (nit->second.prev.size() >= 2) return next;  // sink
+                cur = next;
+            }
+            return 0;  // cap exceeded
+        };
+
+        auto arm_stats = [&](const gtl::vector<u64> &path)
+            -> std::pair<size_t, double> {
+            size_t len = 0;
+            double min_depth = std::numeric_limits<double>::infinity();
+            for (u64 nid : path) {
+                auto nit = dbg.find(nid);
+                if (nit == dbg.end() || nit->second.redirected()) {
+                    return {0, 0.0};
+                }
+                len += nit->second.seq.size();
+                min_depth =
+                    std::min(min_depth, nit->second.avg_core_count());
+            }
+            return {len, min_depth};
+        };
+
+        size_t popped = 0;
+        for (u64 sid : active_set) {
+            auto sit = dbg.find(sid);
+            if (sit == dbg.end() || sit->second.redirected()) continue;
+            if (sit->second.forward_edge_count < 2) continue;
+            auto ffit = fwd.find(sid);
+            if (ffit == fwd.end() || ffit->second.size() != 2) continue;
+
+            gtl::vector<u64> path0, path1;
+            const u64 t0 = walk_arm(ffit->second[0], path0);
+            if (t0 == 0) continue;
+            const u64 t1 = walk_arm(ffit->second[1], path1);
+            if (t1 == 0 || t1 != t0 || t0 == sid) continue;
+
+            auto tit = dbg.find(t0);
+            if (tit == dbg.end() || tit->second.redirected() ||
+                tit->second.prev.size() != 2) {
+                continue;  // strict 2-merge only
+            }
+
+            auto [len0, d0] = arm_stats(path0);
+            auto [len1, d1] = arm_stats(path1);
+            if (len0 == 0 || len1 == 0) continue;
+            const size_t lmax = std::max(len0, len1);
+            const size_t lmin = std::min(len0, len1);
+            if ((double)lmax > (double)lmin * bubble_length_bound) {
+                continue;  // lengths too divergent
+            }
+            const double dhi = std::max(d0, d1);
+            const double dlo = std::min(d0, d1);
+            if (dhi <= 0.0 || dlo / dhi >= bubble_depth_epsilon) continue;
+
+            const size_t dead_len = (d0 <= d1) ? len0 : len1;
+            if (max_popped_arm_len > 0 &&
+                dead_len > max_popped_arm_len) {
+                continue;  // arm too long to be a sequencing-error bubble
+            }
+            if (dump_pops) {
+                std::fprintf(stderr,
+                             "[pop] S=%llu T=%llu len0=%zu len1=%zu "
+                             "d0=%.3f d1=%.3f\n",
+                             (unsigned long long)sid, (unsigned long long)t0,
+                             len0, len1, d0, d1);
+            }
+
+            // Pop the shallower arm; on a tie, path0 goes (deterministic).
+            const gtl::vector<u64> &dead = (d0 <= d1) ? path0 : path1;
+            for (u64 nid : dead) {
+                dbg.erase(nid);
+                active_set.erase(nid);
+            }
+            auto &tprev = tit->second.prev;
+            const u64 sink_in = dead.back();
+            auto pit = std::find(tprev.begin(), tprev.end(), sink_in);
+            if (pit != tprev.end()) tprev.erase(pit);
+            sit->second.forward_edge_count--;
+            ++popped;
         }
         return popped;
     }
@@ -944,19 +1024,20 @@ struct GraphCleaning {
             //     acfg.output + ".initial_clean_contig_stats.tsv");
             const auto initial_depth_stats =
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
+            const bool dump_pops =
+                std::getenv("LASM_DUMP_POPS") != nullptr;
             for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
                 fix_edges(dbgi.dbg, active_set);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
-                // KNOWN-BROKEN: pop_bubbles' implementation (single-node
-                // convergent-bubble shape only) is not correct; disabled until
-                // the algorithm is revised. See misassembly investigation.
-                // const size_t popped = pop_bubbles(
-                //     dbgi.dbg, cfg.min_bubble_depth_difference_percentage,
-                //     active_set);
-                // if (popped > 0)
-                //     std::fprintf(stderr,
-                //                  "[graph-clean] popped %zu bubbles\n",
-                //                  popped);
+                // Strict fork-2/merge-2 bubble popping (see pop_bubbles).
+                const size_t popped = pop_bubbles(
+                    dbgi.dbg, cfg.min_bubble_depth_difference_percentage,
+                    cfg.min_bubble_length_difference,
+                    cfg.max_bubble_arm_length, dump_pops, active_set);
+                if (popped > 0)
+                    std::fprintf(stderr,
+                                 "[graph-clean] popped %zu bubbles\n",
+                                 popped);
                 if (cfg.enable_loop_opening) {
                     open_simple_loopsv2(dbgi.dbg, active_set,
                                         initial_depth_stats);

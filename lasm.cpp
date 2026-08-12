@@ -132,6 +132,13 @@ public:
                "Minimum difference between the two ends of the bubbles to "
                "pop. if depth(P1) * arg > depth(P2) then pop();")
             ->capture_default_str();
+        gcg->add_option(
+               "--max-bubble-arm-length",
+               cfg.graph_cleaning.max_bubble_arm_length,
+               "Maximum arm length (in submers) of a bubble arm to pop; "
+               "longer arms are treated as real copy divergence and kept.")
+            ->check(CLI::Range(0, 1000000))
+            ->capture_default_str();
         gcg->add_flag(
                "--open-simple-loops", cfg.graph_cleaning.enable_loop_opening,
                "Enable simple loop opening during graph cleaning. Warning: may "
