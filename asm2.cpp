@@ -1302,7 +1302,8 @@ int run_assembly(const asm_config &cfg) {
                        mults[mults.size() / 2]);
             if (mult_median > 0.0) {
                 unit_mult_fn =
-                    [&, lcmer_l = as.dbg_lcmer_l](
+                    [&as, lcmer_mult = std::move(lcmer_mult), mult_median,
+                     lcmer_l = as.dbg_lcmer_l](
                         const gtl::vector<SequenceContainerType> &s_seq,
                         const gtl::vector<SequenceContainerType> &arm_seq)
                     -> double {
@@ -1398,6 +1399,28 @@ void tests_mock_fill_seq(dbg_index &dbgi) {
     for (auto &node : dbgi.dbg) {
         node.second.seq.emplace_back();
     }
+}
+
+TEST_CASE("oracle multiplicity map outlives its construction scope") {
+    // Regression for the WG loops_on segfault: the unroll oracle's
+    // std::function was built with [&] over a scoped map, then invoked after
+    // that scope closed (use-after-free). The capture must own the map.
+    GraphCleaning::unit_mult_fn_t fn;
+    {
+        gtl::flat_hash_map<u64, unsigned> m;
+        m.emplace(42u, 7u);
+        m.emplace(43u, 9u);
+        const double med = 8.0;
+        fn = [m = std::move(m), med](
+                 const gtl::vector<SequenceContainerType> &,
+                 const gtl::vector<SequenceContainerType> &) -> double {
+            (void)med;
+            auto it = m.find(42u);
+            return it == m.end() ? -1.0 : static_cast<double>(it->second);
+        };
+    }
+    const gtl::vector<SequenceContainerType> empty;
+    CHECK_EQ(fn(empty, empty), 7.0);
 }
 
 TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
