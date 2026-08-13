@@ -13,6 +13,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <functional>
 #include <gtl/phmap.hpp>
 #include <gtl/vector.hpp>
 #include <limits>
@@ -270,6 +271,13 @@ struct GraphCleaning {
     using lci_type = dbg_index::lci_type;
     using dbg_map_t = dbg_index::dbg_map_t;
     using redir_map = gtl::parallel_flat_hash_map_d<u64, u64, 4, std::mutex>;
+    // Unit-multiplicity oracle: given the loop unit's sequence parts (fork
+    // node seq, arm seq), return the unit's median internal lcmer multiplicity
+    // relative to the genome-wide median (≈ copy number). nullptr disables
+    // the multiplicity gate. Built by fold_dbg_graph from pre-simplify state.
+    using unit_mult_fn_t =
+        std::function<double(const gtl::vector<SequenceContainerType> &,
+                             const gtl::vector<SequenceContainerType> &)>;
     struct avg_core_count_stats {
         double baseline = 0.0;
     };
@@ -811,10 +819,17 @@ struct GraphCleaning {
     // Copy numbers come from depth ratios against a haploid reference (the
     // exit path's depth or the genome-wide baseline), and unrolling only
     // happens in haploid context (reference close to baseline), so SD/rDNA
-    // pileup loops -- real divergent copies -- are left alone.
+    // pileup loops -- real divergent copies -- are left alone. When a
+    // unit-multiplicity oracle is provided, the unit's internal lcmer
+    // multiplicities (median, relative to the genome-wide median) must also
+    // support the predicted copy number -- this rejects degeneracy-artifact
+    // cycles over low-complexity sequence, whose node depths are inflated
+    // by cycle bookkeeping rather than true copy number.
     static size_t unroll_loops(dbg_map_t &dbg, gtl::btree_set<u64> &active_set,
                                const avg_core_count_stats &depth_stats,
-                               size_t max_loop_arm_len, bool dump_unroll) {
+                               size_t max_loop_arm_len, double fit_tol,
+                               const char *unroll_fasta_path, bool dump_unroll,
+                               const unit_mult_fn_t *unit_mult_fn) {
         const double baseline = depth_stats.baseline;
         if (baseline <= 0.0) return 0;
         constexpr double kHaploidRefMin = 0.5;
@@ -867,6 +882,17 @@ struct GraphCleaning {
                         for (const auto &s : sit->second.seq) {
                             orig.push_back(SequenceContainerType::copy_of(s));
                         }
+                        if (unit_mult_fn) {
+                            const gtl::vector<SequenceContainerType> empty;
+                            const double med_mult =
+                                (*unit_mult_fn)(orig, empty);
+                            const double pred =
+                                static_cast<double>(turns);
+                            if (med_mult < 1.5 ||
+                                std::abs(med_mult - pred) / pred > 0.25) {
+                                continue;  // reads don't support it
+                            }
+                        }
                         for (int k = 1; k < turns; ++k) {
                             for (const auto &s : orig) {
                                 sit->second.seq.push_back(
@@ -916,7 +942,7 @@ struct GraphCleaning {
             const double loop_err = std::abs(dL - t_int * ref2) / ref2;
             const double curr_err =
                 std::abs(s_depth - (t_int + 1) * ref2) / ref2;
-            if (loop_err > 0.25 || curr_err > 0.25) continue;
+            if (loop_err > fit_tol || curr_err > fit_tol) continue;
             const int turns = t_int;
             if (dump_unroll) {
                 std::fprintf(stderr,
@@ -935,6 +961,22 @@ struct GraphCleaning {
                 auto nit = dbg.find(nid);
                 for (const auto &s : nit->second.seq) {
                     arm_seq.push_back(SequenceContainerType::copy_of(s));
+                }
+            }
+            if (unit_mult_fn) {
+                // The unit's internal lcmer multiplicities must support the
+                // predicted copy number: predicted total copies = turns + 1.
+                const double med_mult = (*unit_mult_fn)(s_orig, arm_seq);
+                if (dump_unroll) {
+                    std::fprintf(stderr, "[mult] S=%llu med=%.3f pred=%d\n",
+                                 (unsigned long long)sid, med_mult,
+                                 turns + 1);
+                }
+                const double pred_copies =
+                    static_cast<double>(turns + 1);
+                if (med_mult < 1.5 ||
+                    std::abs(med_mult - pred_copies) / pred_copies > 0.25) {
+                    continue;  // reads don't support the duplication
                 }
             }
             for (int k = 0; k < turns; ++k) {
@@ -956,7 +998,26 @@ struct GraphCleaning {
             }
             auto &spv = sit->second.prev;
             auto pit = std::find(spv.begin(), spv.end(), loop_path.back());
+            if (pit != spv.end()) spv.erase(pit);
             sit->second.forward_edge_count--;
+            if (unroll_fasta_path) {
+                FILE *uf = std::fopen(unroll_fasta_path, "a");
+                if (uf) {
+                    size_t s_bases = 0, arm_bases = 0;
+                    for (const auto &s : s_orig) s_bases += s.len;
+                    for (const auto &s : arm_seq) arm_bases += s.len;
+                    std::fprintf(uf, ">S%llu_t%d_sB%zu_armB%zu\n",
+                                 (unsigned long long)sid, turns, s_bases,
+                                 arm_bases);
+                    for (const auto &s : sit->second.seq) {
+                        std::vector<char> buf(s.len + 1);
+                        s.convert_to_ascii(buf.data());
+                        fwrite(buf.data(), 1, s.len, uf);
+                    }
+                    fputc('\n', uf);
+                    fclose(uf);
+                }
+            }
             ++unrolled;
         }
         for (u64 nid : to_rm) {
@@ -1003,7 +1064,8 @@ struct GraphCleaning {
                        pvec.end());
         }
     }
-    static void run(dbg_index &dbgi, const asm_config &acfg) {
+    static void run(dbg_index &dbgi, const asm_config &acfg,
+                    const unit_mult_fn_t *unit_mult_fn = nullptr) {
         auto cfg = acfg.graph_cleaning;
         INIT_TIMERS(GraphCleaning);
         redir_map redirect_deleted;
@@ -1026,6 +1088,10 @@ struct GraphCleaning {
                 std::getenv("LASM_DUMP_LOOPS") != nullptr;
             const bool dump_unroll =
                 std::getenv("LASM_DUMP_UNROLL") != nullptr;
+            const char *tol_env = std::getenv("LASM_UNROLL_TOL");
+            const double unroll_tol =
+                tol_env ? std::strtod(tol_env, nullptr) : 0.25;
+            const char *unroll_fasta = std::getenv("LASM_UNROLL_FASTA");
             for (int i = 1; i < cfg.iterations; ++i) {
                 fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
@@ -1042,7 +1108,8 @@ struct GraphCleaning {
                 if (cfg.enable_loop_opening) {
                     const size_t unrolled = unroll_loops(
                         dbgi.dbg, active_set, initial_depth_stats,
-                        cfg.max_bubble_arm_length, dump_unroll);
+                        cfg.max_bubble_arm_length, unroll_tol, unroll_fasta,
+                        dump_unroll, unit_mult_fn);
                     if (unrolled > 0)
                         std::fprintf(stderr,
                                      "[graph-clean] unrolled %zu loops\n",

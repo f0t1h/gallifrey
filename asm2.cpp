@@ -1135,7 +1135,76 @@ int run_assembly(const asm_config &cfg) {
         IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "DBG printing");
     }
 
-    GraphCleaning::run(dbg, cfg);
+    GraphCleaning::unit_mult_fn_t unit_mult_fn;
+    if (cfg.graph_cleaning.enable_loop_opening) {
+        // Pre-simplify per-lcmer multiplicity snapshot: the oracle used by
+        // unroll_loops to check that a loop unit's internal lcmers actually
+        // occur at the predicted copy number in the reads (degeneracy-
+        // artifact cycles over low-complexity sequence have inflated node
+        // depths but ~1x internal lcmer multiplicities).
+        gtl::flat_hash_map<u64, unsigned> lcmer_mult;
+        gtl::vector<unsigned> mults;
+        lcmer_mult.reserve(dbg.dbg.size());
+        mults.reserve(dbg.dbg.size());
+        for (const auto &[id, node] : dbg.dbg) {
+            if (node.redirected()) continue;
+            lcmer_mult.emplace(id, node.counts.core_count);
+            mults.push_back(node.counts.core_count);
+        }
+        if (mults.size() >= 2) {
+            std::sort(mults.begin(), mults.end());
+            const double mult_median =
+                0.5 * (mults[(mults.size() - 1) / 2] +
+                       mults[mults.size() / 2]);
+            if (mult_median > 0.0) {
+                unit_mult_fn =
+                    [&, lcmer_l = as.dbg_lcmer_l](
+                        const gtl::vector<SequenceContainerType> &s_seq,
+                        const gtl::vector<SequenceContainerType> &arm_seq)
+                    -> double {
+                    gtl::vector<SequenceContainerType> unit_seqs;
+                    unit_seqs.reserve(s_seq.size() + arm_seq.size());
+                    for (const auto &s : s_seq) {
+                        unit_seqs.push_back(
+                            SequenceContainerType::copy_of(s));
+                    }
+                    for (const auto &s : arm_seq) {
+                        unit_seqs.push_back(
+                            SequenceContainerType::copy_of(s));
+                    }
+                    lps str = {0, 0, 0, 0};
+                    lcp_read lr = assembler::build_lr_cores(
+                        unit_seqs, as.syncmer_functor, as.lcp_level, str);
+                    std::vector<double> vals;
+                    if (lr.cores.size() >
+                        static_cast<size_t>(lcmer_l + 1)) {
+                        LCmer l{lr.cores.begin() + 1, lcmer_l};
+                        auto lookup = [&](const LCmer &lc) {
+                            auto mit = lcmer_mult.find(lc.value());
+                            if (mit != lcmer_mult.end()) {
+                                vals.push_back(
+                                    static_cast<double>(mit->second));
+                            }
+                        };
+                        lookup(l);
+                        for (size_t i = static_cast<size_t>(lcmer_l + 1);
+                             i < lr.cores.size() - 1; ++i) {
+                            l.update_lcmer(lr.cores[i],
+                                           lr.cores[i - lcmer_l], lcmer_l);
+                            lookup(l);
+                        }
+                    }
+                    if (vals.size() < 4) return 1.0;  // too few: no evidence
+                    std::sort(vals.begin(), vals.end());
+                    const double med =
+                        0.5 * (vals[(vals.size() - 1) / 2] +
+                               vals[vals.size() / 2]);
+                    return med / mult_median;
+                };
+            }
+        }
+    }
+    GraphCleaning::run(dbg, cfg, unit_mult_fn ? &unit_mult_fn : nullptr);
 
     IF_TIME_CHECKPOINT(!cfg.silent, HIFI_ASSEMBLY, stderr, "Graph cleaning");
 
