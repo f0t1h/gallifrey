@@ -23,14 +23,18 @@
 #       -- -l4 --syncmer-k 11 --submer-s 3 --submer-t 3
 #
 # Env knobs:
-#   COMBO_ONLY=<name>   run a single combo (resume-safe; see names below)
-#   JOBS=<n>            concurrent lasm runs (default 2)
+#   COMBO_ONLY=<name>   run a single combo (see names in summary)
+#   JOBS=<n>            concurrent lasm runs (default 2; raise on big-RAM
+#                       machines — whole-genome runs are memory-heavy)
 #   LASM=<path>         lasm binary (default ./build/lasm)
 #   THREADS="<flags>"   lasm thread flags (default "-t10 -@8")
 #
-# Output per combo: <name>.gfa/.fa/.log, quast_<name>/, <name>.metrics.
+# The summary includes lasm_s and quast_s wall times per combo, plus a
+# host/input/date header line. Runs are resume-safe: re-running skips combos
+# with an existing .metrics file, so an interrupted whole-genome grid
+# continues where it stopped.
 # Final ranked table: <outdir>/summary.txt (sorted by misassemblies asc,
-# then NGA50 desc). Re-running skips combos that already have .metrics.
+# then NGA50 desc).
 set -euo pipefail
 
 INPUT=${1:?usage: eval_combos.sh <input> <ref> <outdir> [-- extra lasm args...]}
@@ -111,26 +115,32 @@ printf '%s\n' "${COMBOS[@]}" |
         [ -f "$OUT/$name.metrics" ] && { echo "skip $name (done)"; exit 0; }
         echo "run  $name"
         read -ra extra <<< "${EXTRA_STR:-}"
+        t0=$(date +%s)
         # shellcheck disable=SC2086  # envs/extra/THREADS are intentionally word-split
         if ! env $envs "$LASM" hifi "$INPUT" -o "$OUT/$name.gfa" \
                 "${extra[@]}" $args $THREADS > "$OUT/$name.log" 2>&1; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
             exit 0
         fi
+        t1=$(date +%s)
+        lasm_s=$((t1 - t0))
         if [ ! -s "$OUT/$name.gfa" ]; then
-            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
+            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\n" "$name" "$lasm_s" > "$OUT/$name.metrics"
             exit 0
         fi
         gfatools gfa2fa "$OUT/$name.gfa" > "$OUT/$name.fa"
+        t2=$(date +%s)
         quast.py -r "$REF" "$OUT/$name.fa" -o "$OUT/quast_$name" -t 4 \
             --min-contig 500 --no-plots --no-html --no-icarus \
             > "$OUT/$name.quast.log" 2>&1
+        t3=$(date +%s)
+        quast_s=$((t3 - t2))
         tsv="$OUT/quast_$name/report.tsv"
         if [ ! -f "$tsv" ]; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t%s\n" "$name" "$lasm_s" "$quast_s" > "$OUT/$name.metrics"
             exit 0
         fi
-        awk -F"\t" -v n="$name" "
+        awk -F"\t" -v n="$name" -v ls="$lasm_s" -v qs="$quast_s" "
             \$1==\"# contigs\" {c=\$2}
             \$1==\"N50\" {n50=\$2}
             \$1==\"NGA50\" {nga=\$2}
@@ -140,15 +150,14 @@ printf '%s\n' "${COMBOS[@]}" |
             \$1==\"Duplication ratio\" {dr=\$2}
             \$1==\"# mismatches per 100 kbp\" {mm=\$2}
             \$1==\"Largest contig\" {lc=\$2}
-            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
-                        n, c, n50, nga, m, lm, gf, dr, mm, lc }
+            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
+                        n, c, n50, nga, m, lm, gf, dr, mm, lc, ls, qs }
         " "$tsv" > "$OUT/$name.metrics"
     ' _
 
-# Ranked summary: accuracy first (misassemblies asc), then contiguity
-# (NGA50 desc).
 {
-    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\n'
+    printf '# host=%s  input=%s  date=%s\n' "$(hostname)" "$(basename "$INPUT")" "$(date -u +%Y-%m-%dT%H:%MZ)"
+    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\n'
     cat "$OUT"/*.metrics | sort -t$'\t' -k5,5n -k4,4rn
 } | column -t -s$'\t' > "$OUT/summary.txt"
 
