@@ -124,13 +124,14 @@ public:
         gcg->add_option(
                "--min-bubble-depth-difference-ratio",
                cfg.graph_cleaning.min_bubble_depth_difference_percentage,
-               "Minimum bubble length to pop in terms of cores")
+               "Minimum depth ratio between bubble arms to pop the shallower "
+               "arm: pops when min_depth(shallow) * arg < min_depth(deep).")
             ->capture_default_str();
         gcg->add_option(
                "--min-bubble-length-difference",
                cfg.graph_cleaning.min_bubble_length_difference,
-               "Minimum difference between the two ends of the bubbles to "
-               "pop. if depth(P1) * arg > depth(P2) then pop();")
+               "Maximum length ratio between bubble arms to pop: pops when "
+               "longer_arm <= shorter_arm * arg; more divergent arms are kept.")
             ->capture_default_str();
         gcg->add_option(
                "--max-bubble-arm-length",

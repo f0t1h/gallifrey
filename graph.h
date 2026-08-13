@@ -354,31 +354,6 @@ struct GraphCleaning {
         stats.baseline = median_of_sorted(pool);
         return stats;
     }
-    static void dump_initial_clean_contig_stats(
-        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set,
-        const std::string &out_tsv_path) {
-        FILE *out = std::fopen(out_tsv_path.c_str(), "w");
-        if (out == nullptr) {
-            std::fprintf(stderr,
-                         "WARN: failed to write initial clean contig stats to "
-                         "%s\n",
-                         out_tsv_path.c_str());
-            return;
-        }
-        std::fprintf(out, "contig_id\tcontig_len_proxy\tavg_core_count\n");
-        for (u64 node_id : active_set) {
-            auto it = dbg.find(node_id);
-            if (it == dbg.end()) continue;
-            const auto &node = it->second;
-            if (node.redirected() || node.seq.empty()) continue;
-            const size_t len_proxy = node.seq.size();
-            const double avg_cc = node.avg_core_count();
-            std::fprintf(out, "%" PRIu64 "\t%zu\t%.6f\n", node_id, len_proxy,
-                         avg_cc);
-        }
-        std::fclose(out);
-    }
-
     struct loop_copy_estimate {
         double base_cn = 1.0;
         int base_cn_rounded = 1;
@@ -984,8 +959,7 @@ struct GraphCleaning {
             dbg.erase(node);
         }
     }
-    static void fix_edges(dbg_map_t &dbg,
-                          [[maybe_unused]] const auto &active_set) {
+    static void fix_edges(dbg_map_t &dbg) {
         // Fix edges
         for (auto &node : dbg) {
             if (node.second.redirected()) continue;
@@ -1004,8 +978,7 @@ struct GraphCleaning {
                        pvec.end());
         }
     }
-    static void run(dbg_index &dbgi, const asm_config &acfg,
-                    bool once = false) {
+    static void run(dbg_index &dbgi, const asm_config &acfg) {
         auto cfg = acfg.graph_cleaning;
         INIT_TIMERS(GraphCleaning);
         redir_map redirect_deleted;
@@ -1020,15 +993,12 @@ struct GraphCleaning {
             IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                "Initial Simplification");
             cut_low_support_edges(dbgi.dbg, active_set);
-            // dump_initial_clean_contig_stats(
-            //     dbgi.dbg, active_set,
-            //     acfg.output + ".initial_clean_contig_stats.tsv");
             const auto initial_depth_stats =
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             const bool dump_pops =
                 std::getenv("LASM_DUMP_POPS") != nullptr;
-            for (int i = 1; i < (once ? 2 : cfg.iterations); ++i) {
-                fix_edges(dbgi.dbg, active_set);
+            for (int i = 1; i < cfg.iterations; ++i) {
+                fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
                 // Strict fork-2/merge-2 bubble popping (see pop_bubbles).
                 const size_t popped = pop_bubbles(
@@ -1056,7 +1026,7 @@ struct GraphCleaning {
                 IF_TIME_CHECKPOINT(!acfg.silent, GraphCleaning, stderr,
                                    "Iteration %d done.", i);
             }
-            fix_edges(dbgi.dbg, active_set);
+            fix_edges(dbgi.dbg);
         }
     }
 };
