@@ -37,7 +37,8 @@
 # then NGA50 desc).
 set -euo pipefail
 
-INPUT=${1:?usage: eval_combos.sh <input> <ref> <outdir> [-- extra lasm args...]}
+INPUTS=${1:?usage: eval_combos.sh '<input1 [input2 ...]>' <ref> <outdir> [-- extra lasm args...]}
+INPUTS=${INPUTS//\~\//$HOME\/}   # expand ~/ in every path
 REF=${2:?missing reference}
 OUT=${3:?missing outdir}
 shift 3
@@ -106,8 +107,7 @@ extract_metrics() {
 
 # (extract_metrics is also inlined in the xargs runner below; this copy is
 # kept for single-shot manual use.)
-export OUT REF INPUT LASM THREADS EXTRA_STR="${EXTRA[*]}"
-
+export OUT REF INPUTS LASM THREADS EXTRA_STR="${EXTRA[*]-}"
 printf '%s\n' "${COMBOS[@]}" |
     xargs -P "$JOBS" -n1 bash -c '
         spec=$1
@@ -117,7 +117,7 @@ printf '%s\n' "${COMBOS[@]}" |
         read -ra extra <<< "${EXTRA_STR:-}"
         t0=$(date +%s)
         # shellcheck disable=SC2086  # envs/extra/THREADS are intentionally word-split
-        if ! env $envs "$LASM" hifi "$INPUT" -o "$OUT/$name.gfa" \
+        if ! env $envs "$LASM" hifi $INPUTS -o "$OUT/$name.gfa" \
                 "${extra[@]}" $args $THREADS > "$OUT/$name.log" 2>&1; then
             printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
             exit 0
@@ -156,7 +156,8 @@ printf '%s\n' "${COMBOS[@]}" |
     ' _
 
 {
-    printf '# host=%s  input=%s  date=%s\n' "$(hostname)" "$(basename "$INPUT")" "$(date -u +%Y-%m-%dT%H:%MZ)"
+    n_in=$(printf '%s\n' $INPUTS | wc -l | tr -d ' ')
+    if [ "$n_in" = 1 ]; then in_label="$(basename $INPUTS)"; else in_label="$n_in inputs: $(basename ${INPUTS%% *})..."; fi
     printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\n'
     cat "$OUT"/*.metrics | sort -t$'\t' -k5,5n -k4,4rn
 } | column -t -s$'\t' > "$OUT/summary.txt"
