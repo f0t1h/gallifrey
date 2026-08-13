@@ -822,38 +822,51 @@ build_layout_sequence_from_nodes(
         for (size_t i = 0; i + 1 < comp_paths.size();) {
             const i64 gap_lo = comp_paths[i].layout_to;
             const i64 gap_hi = comp_paths[i + 1].layout_from;
-            if (gap_lo >= gap_hi) {
-                ++i;
-                continue;
-            }
-            gtl::vector<const lane_node *> gap_crumbs;
-            for (const auto &c : crumbs) {
-                if (c.from >= gap_lo && c.to <= gap_hi) {
-                    gap_crumbs.push_back(&c);
-                }
-            }
-            if (gap_crumbs.empty()) {
-                ++i;
-                continue;
-            }
-            for (const lane_node *c : gap_crumbs) {
-                if (c->is_forward_lane) {
-                    for (const auto &s : *c->raw_seqs) {
-                        result[i].push_back(
-                            SequenceContainerType::copy_of(s));
+            if (gap_lo < gap_hi) {
+                // Case A: strict gap between the components.
+                gtl::vector<const lane_node *> gap_crumbs;
+                for (const auto &c : crumbs) {
+                    if (c.from >= gap_lo && c.to <= gap_hi) {
+                        gap_crumbs.push_back(&c);
                     }
-                } else {
-                    gtl::vector<SequenceContainerType> rc =
-                        reverse_complement_seqs(*c->raw_seqs);
-                    for (auto &s : rc) result[i].push_back(std::move(s));
                 }
+                if (gap_crumbs.empty()) {
+                    ++i;
+                    continue;
+                }
+                for (const lane_node *c : gap_crumbs) {
+                    if (c->is_forward_lane) {
+                        for (const auto &s : *c->raw_seqs) {
+                            result[i].push_back(
+                                SequenceContainerType::copy_of(s));
+                        }
+                    } else {
+                        gtl::vector<SequenceContainerType> rc =
+                            reverse_complement_seqs(*c->raw_seqs);
+                        for (auto &s : rc) result[i].push_back(std::move(s));
+                    }
+                }
+                for (auto &s : result[i + 1]) {
+                    result[i].push_back(std::move(s));
+                }
+                comp_paths[i].layout_to = comp_paths[i + 1].layout_to;
+                result.erase(result.begin() + i + 1);
+                comp_paths.erase(comp_paths.begin() + i + 1);
+                continue;
             }
-            for (auto &s : result[i + 1]) {
-                result[i].push_back(std::move(s));
+            ++i;
+            continue;
+        }
+        if (getenv("LASM_ADJ_DUMP")) {
+            for (const auto &c : crumbs) {
+                std::fprintf(stderr,
+                             "[crumb-pos] layout=%llu crumb=%llu from=%lld "
+                             "to=%lld fwd=%d\n",
+                             (unsigned long long)layout_idx,
+                             (unsigned long long)c.id,
+                             (long long)c.from, (long long)c.to,
+                             c.is_forward_lane ? 1 : 0);
             }
-            comp_paths[i].layout_to = comp_paths[i + 1].layout_to;
-            result.erase(result.begin() + i + 1);
-            comp_paths.erase(comp_paths.begin() + i + 1);
         }
     }
 
