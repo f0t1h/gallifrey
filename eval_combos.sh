@@ -108,8 +108,8 @@ extract_metrics() {
 # (extract_metrics is also inlined in the xargs runner below; this copy is
 # kept for single-shot manual use.)
 export OUT REF INPUTS LASM THREADS EXTRA_STR="${EXTRA[*]-}"
-printf '%s\n' "${COMBOS[@]}" |
-    xargs -P "$JOBS" -n1 bash -c '
+printf '%s\0' "${COMBOS[@]}" |
+    xargs -0 -P "$JOBS" -n1 bash -c '
         spec=$1
         IFS="|" read -r name args envs <<< "$spec"
         [ -f "$OUT/$name.metrics" ] && { echo "skip $name (done)"; exit 0; }

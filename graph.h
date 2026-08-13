@@ -721,11 +721,11 @@ struct GraphCleaning {
                               bool dump_loops, auto &active_set) {
         auto fwd = build_live_fwd(dbg);
 
+        gtl::vector<u64> to_rm;
         size_t popped = 0;
         for (u64 sid : active_set) {
             auto sit = dbg.find(sid);
             if (sit == dbg.end() || sit->second.redirected()) continue;
-            if (sit->second.forward_edge_count < 2) continue;
             auto ffit = fwd.find(sid);
             if (ffit == fwd.end() || ffit->second.size() != 2) continue;
 
@@ -795,10 +795,12 @@ struct GraphCleaning {
             }
 
             // Pop the shallower arm; on a tie, path0 goes (deterministic).
+            // active_set erases are deferred: erasing mid-iteration corrupts
+            // the btree walk (observed at whole-genome scale).
             const gtl::vector<u64> &dead = (d0 <= d1) ? path0 : path1;
             for (u64 nid : dead) {
                 dbg.erase(nid);
-                active_set.erase(nid);
+                to_rm.push_back(nid);
             }
             auto &tprev = tit->second.prev;
             const u64 sink_in = dead.back();
@@ -806,6 +808,9 @@ struct GraphCleaning {
             if (pit != tprev.end()) tprev.erase(pit);
             sit->second.forward_edge_count--;
             ++popped;
+        }
+        for (u64 nid : to_rm) {
+            active_set.erase(nid);
         }
         return popped;
     }
