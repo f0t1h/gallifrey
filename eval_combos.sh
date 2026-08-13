@@ -158,6 +158,7 @@ printf '%s\n' "${COMBOS[@]}" |
 {
     n_in=$(printf '%s\n' $INPUTS | wc -l | tr -d ' ')
     if [ "$n_in" = 1 ]; then in_label="$(basename $INPUTS)"; else in_label="$n_in inputs: $(basename ${INPUTS%% *})..."; fi
+    printf '# host=%s  input=%s  date=%s\n' "$(hostname)" "$in_label" "$(date -u +%Y-%m-%dT%H:%MZ)"
     printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\n'
     cat "$OUT"/*.metrics | sort -t$'\t' -k5,5n -k4,4rn
 } | column -t -s$'\t' > "$OUT/summary.txt"
