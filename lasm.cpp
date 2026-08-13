@@ -135,7 +135,7 @@ public:
         gcg->add_option(
                "--max-bubble-arm-length",
                cfg.graph_cleaning.max_bubble_arm_length,
-               "Maximum arm length (in submers) of a bubble arm to pop; "
+               "Maximum arm length (in cores) of a bubble arm to pop; "
                "longer arms are treated as real copy divergence and kept.")
             ->check(CLI::Range(0, 1000000))
             ->capture_default_str();

@@ -743,9 +743,10 @@ struct GraphCleaning {
     // candidates are rejected instead of misread. The shallower arm (minimum
     // avg_core_count along the arm) is popped when it is at least
     // bubble_depth_epsilon times shallower than the other and the two arm
-    // lengths (submer counts) are within bubble_length_bound of each other.
+    // lengths (core counts) are within bubble_length_bound of each other.
     // Strict 2/2 topology is required: among 3+ parallel copies (SD/rDNA
     // tangles) nothing is popped -- deleting one of many real copies is a
+    // misassembly, not cleaning.
     static size_t pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
                               double bubble_length_bound,
                               size_t max_popped_arm_len, bool dump_pops,
