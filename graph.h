@@ -354,93 +354,6 @@ struct GraphCleaning {
         stats.baseline = median_of_sorted(pool);
         return stats;
     }
-    struct loop_copy_estimate {
-        double base_cn = 1.0;
-        int base_cn_rounded = 1;
-        int other_cn_rounded = 1;
-        double global_ref_depth = 0.0;
-        double raw_loop_cn = 1.0;
-        double raw_curr_cn = 2.0;
-        int loop_cn_rounded = 1;
-        int curr_cn_rounded = 2;
-        int loop_turns = 1;
-        double turn_event_gain = 0.0;
-        double turn_event_threshold = 0.0;
-        int turn_forced_single = 0;
-        double score = std::numeric_limits<double>::infinity();
-    };
-
-    static loop_copy_estimate infer_loop_copy_numbers(
-        double other_in_depth, double loop_depth, double curr_depth,
-        const avg_core_count_stats &depth_stats) {
-        assert(depth_stats.baseline > 0.0);
-        constexpr int kMaxSearchTurns = 64;
-        constexpr int kMaxSearchBaseCn = 64;
-        constexpr double kBaseCnPriorWeight = 0.35;
-        constexpr double kTurnGainBaseThreshold = 0.25;
-
-        const double baseline = depth_stats.baseline;
-        const double other_base_cn = std::max(1.0, other_in_depth / baseline);
-
-        loop_copy_estimate est;
-        est.global_ref_depth = baseline;
-        est.base_cn = other_base_cn;
-        est.base_cn_rounded =
-            std::max(1, static_cast<int>(std::llround(est.base_cn)));
-        est.other_cn_rounded = est.base_cn_rounded;
-        est.raw_loop_cn = loop_depth / baseline;
-        est.raw_curr_cn = curr_depth / baseline;
-        est.loop_cn_rounded =
-            std::max(1, static_cast<int>(std::llround(est.raw_loop_cn)));
-        est.curr_cn_rounded =
-            std::max(1, static_cast<int>(std::llround(est.raw_curr_cn)));
-
-        double best_err = std::numeric_limits<double>::infinity();
-        int best_t = 1;
-        int best_b = est.base_cn_rounded;
-        double best_err_t1 = std::numeric_limits<double>::infinity();
-        int best_b_t1 = est.base_cn_rounded;
-        const auto fit_err = [&](int b, int t) {
-            const double exp_loop = static_cast<double>(t * b);
-            const double exp_curr = static_cast<double>((t + 1) * b);
-            return std::abs(est.raw_loop_cn - exp_loop) +
-                   std::abs(est.raw_curr_cn - exp_curr) +
-                   kBaseCnPriorWeight *
-                       std::abs(est.base_cn - static_cast<double>(b));
-        };
-        for (int b = 1; b <= kMaxSearchBaseCn; ++b) {
-            for (int t = 1; t <= kMaxSearchTurns; ++t) {
-                const double err = fit_err(b, t);
-                if (err < best_err ||
-                    (err == best_err &&
-                     (t < best_t || (t == best_t && b < best_b)))) {
-                    best_err = err;
-                    best_t = t;
-                    best_b = b;
-                }
-                if (t == 1 && err < best_err_t1) {
-                    best_err_t1 = err;
-                    best_b_t1 = b;
-                }
-            }
-        }
-        const double turn_gain = best_err_t1 - best_err;
-        const double turn_threshold =
-            kTurnGainBaseThreshold * static_cast<double>(est.other_cn_rounded);
-        if (best_t > 1 && turn_gain < turn_threshold) {
-            best_t = 1;
-            best_b = best_b_t1;
-            best_err = best_err_t1;
-            est.turn_forced_single = 1;
-        }
-
-        est.base_cn_rounded = best_b;
-        est.loop_turns = best_t;
-        est.turn_event_gain = turn_gain;
-        est.turn_event_threshold = turn_threshold;
-        est.score = best_err;
-        return est;
-    }
 
     static auto attempt_simplify_one_path_lockless(dbg_map_t &dbg,
                                                    redir_map &redirect_deleted,
@@ -711,6 +624,79 @@ struct GraphCleaning {
         }
     }
 
+    // Live forward adjacency: successor lists derived from prev edges,
+    // sorted per node for deterministic arm walking. Dead/redirected nodes
+    // are excluded.
+    static gtl::flat_hash_map<u64, gtl::vector<u64>> build_live_fwd(
+        const dbg_map_t &dbg) {
+        gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
+        for (const auto &[id, node] : dbg) {
+            if (node.redirected()) continue;
+            for (u64 p : node.prev) {
+                auto pit = dbg.find(p);
+                if (pit != dbg.end() && !pit->second.redirected()) {
+                    fwd[p].push_back(id);
+                }
+            }
+        }
+        for (auto &[_, succs] : fwd) {
+            std::sort(succs.begin(), succs.end());
+        }
+        return fwd;
+    }
+
+    // Walk a simple forward path from `start` until a reconvergence node
+    // (>= 2 predecessors) is reached; return it. Abort (0) on non-simple
+    // nodes, divergence, dead/stale edges, cycles, or the node cap. The path
+    // is collected excluding the sink.
+    static u64 walk_arm_path(
+        const dbg_map_t &dbg,
+        const gtl::flat_hash_map<u64, gtl::vector<u64>> &fwd, u64 start,
+        gtl::vector<u64> &path) {
+        path.clear();
+        u64 cur = start;
+        constexpr size_t kMaxArmNodes = 64;
+        for (size_t step = 0; step < kMaxArmNodes; ++step) {
+            auto cit = dbg.find(cur);
+            if (cit == dbg.end() || cit->second.redirected()) return 0;
+            if (cit->second.prev.size() != 1) return 0;
+            path.push_back(cur);
+            auto nxt_it = fwd.find(cur);
+            if (nxt_it == fwd.end() || nxt_it->second.empty()) return 0;
+            u64 next = 0;
+            for (u64 cand : nxt_it->second) {
+                auto nit = dbg.find(cand);
+                if (nit == dbg.end() || nit->second.redirected()) {
+                    return 0;  // stale edge from an earlier mutation
+                }
+                if (next != 0) return 0;  // divergence
+                next = cand;
+            }
+            if (next == start) return 0;  // cycle back onto the arm start
+            auto nit = dbg.find(next);
+            if (nit->second.prev.size() >= 2) return next;  // sink
+            cur = next;
+        }
+        return 0;  // cap exceeded
+    }
+
+    // Arm stats: core count and minimum avg_core_count along a path. Dead
+    // nodes anywhere on the path abort with {0, 0.0}.
+    static std::pair<size_t, double> arm_depth_len(
+        const dbg_map_t &dbg, const gtl::vector<u64> &path) {
+        size_t len = 0;
+        double min_depth = std::numeric_limits<double>::infinity();
+        for (u64 nid : path) {
+            auto nit = dbg.find(nid);
+            if (nit == dbg.end() || nit->second.redirected()) {
+                return {0, 0.0};
+            }
+            len += nit->second.seq.size();
+            min_depth = std::min(min_depth, nit->second.avg_core_count());
+        }
+        return {len, min_depth};
+    }
+
     // Bubble popping (strict fork-2 -> merge-2 bubbles).
     // A bubble is two node-disjoint simple paths S -> ... -> T between a
     // 2-successor fork S and a 2-predecessor merge T (S != T). Post-simplify
@@ -725,68 +711,7 @@ struct GraphCleaning {
                               double bubble_length_bound,
                               size_t max_popped_arm_len, bool dump_pops,
                               bool dump_loops, auto &active_set) {
-        // Live forward adjacency (successor lists are not stored on nodes).
-        gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
-        for (const auto &[id, node] : dbg) {
-            if (node.redirected()) continue;
-            for (u64 p : node.prev) {
-                auto pit = dbg.find(p);
-                if (pit != dbg.end() && !pit->second.redirected()) {
-                    fwd[p].push_back(id);
-                }
-            }
-        }
-        for (auto &[_, succs] : fwd) {
-            std::sort(succs.begin(), succs.end());
-        }
-
-        auto walk_arm = [&](u64 start, gtl::vector<u64> &path) -> u64 {
-            // Walk a simple forward path until a reconvergence node (>= 2
-            // predecessors) is reached; return it. Abort (0) on non-simple
-            // nodes, divergence, dead/stale edges, cycles, or the node cap.
-            // The path itself is collected, excluding the sink.
-            path.clear();
-            u64 cur = start;
-            constexpr size_t kMaxArmNodes = 64;
-            for (size_t step = 0; step < kMaxArmNodes; ++step) {
-                auto cit = dbg.find(cur);
-                if (cit == dbg.end() || cit->second.redirected()) return 0;
-                if (cit->second.prev.size() != 1) return 0;
-                path.push_back(cur);
-                auto nxt_it = fwd.find(cur);
-                if (nxt_it == fwd.end() || nxt_it->second.empty()) return 0;
-                u64 next = 0;
-                for (u64 cand : nxt_it->second) {
-                    auto nit = dbg.find(cand);
-                    if (nit == dbg.end() || nit->second.redirected()) {
-                        return 0;  // stale edge from an earlier pop
-                    }
-                    if (next != 0) return 0;  // divergence
-                    next = cand;
-                }
-                if (next == start) return 0;  // cycle back onto the arm
-                auto nit = dbg.find(next);
-                if (nit->second.prev.size() >= 2) return next;  // sink
-                cur = next;
-            }
-            return 0;  // cap exceeded
-        };
-
-        auto arm_stats = [&](const gtl::vector<u64> &path)
-            -> std::pair<size_t, double> {
-            size_t len = 0;
-            double min_depth = std::numeric_limits<double>::infinity();
-            for (u64 nid : path) {
-                auto nit = dbg.find(nid);
-                if (nit == dbg.end() || nit->second.redirected()) {
-                    return {0, 0.0};
-                }
-                len += nit->second.seq.size();
-                min_depth =
-                    std::min(min_depth, nit->second.avg_core_count());
-            }
-            return {len, min_depth};
-        };
+        auto fwd = build_live_fwd(dbg);
 
         size_t popped = 0;
         for (u64 sid : active_set) {
@@ -797,9 +722,9 @@ struct GraphCleaning {
             if (ffit == fwd.end() || ffit->second.size() != 2) continue;
 
             gtl::vector<u64> path0, path1;
-            const u64 t0 = walk_arm(ffit->second[0], path0);
+            const u64 t0 = walk_arm_path(dbg, fwd, ffit->second[0], path0);
             if (t0 == 0) continue;
-            const u64 t1 = walk_arm(ffit->second[1], path1);
+            const u64 t1 = walk_arm_path(dbg, fwd, ffit->second[1], path1);
             if (t1 == 0) continue;
 
             // Loop bubble: an arm closes back onto the fork S itself (its
@@ -807,14 +732,14 @@ struct GraphCleaning {
             // Loops are NOT popped: depth-ratio popping was measured and
             // rejected (75 pops -> 28 misassemblies on chr18, 19 on .fa;
             // shallow loop arms are real low-coverage repeat units, not
-            // sequencing error). Real loop handling needs copy-number
-            // inference (open_simple_loopsv2), not arm deletion.
+            // sequencing error). Loops are handled by unroll_loops
+            // (sequence duplication by predicted copy number) instead.
             if (t0 == sid || t1 == sid) {
                 if (dump_loops) {
                     const auto &loop_path = (t0 == sid) ? path0 : path1;
                     const auto &other_path = (t0 == sid) ? path1 : path0;
-                    auto [lenL, dL] = arm_stats(loop_path);
-                    auto [lenO, dO] = arm_stats(other_path);
+                    auto [lenL, dL] = arm_depth_len(dbg, loop_path);
+                    auto [lenO, dO] = arm_depth_len(dbg, other_path);
                     std::fprintf(stderr,
                                  "[loop] S=%llu loop_arm=%d lenL=%zu "
                                  "lenO=%zu dL=%.3f dO=%.3f S_depth=%.3f "
@@ -836,8 +761,8 @@ struct GraphCleaning {
                 continue;  // strict 2-merge only
             }
 
-            auto [len0, d0] = arm_stats(path0);
-            auto [len1, d1] = arm_stats(path1);
+            auto [len0, d0] = arm_depth_len(dbg, path0);
+            auto [len1, d1] = arm_depth_len(dbg, path1);
             if (len0 == 0 || len1 == 0) continue;
             const size_t lmax = std::max(len0, len1);
             const size_t lmin = std::min(len0, len1);
@@ -876,6 +801,170 @@ struct GraphCleaning {
         }
         return popped;
     }
+    // Loop handling is its own mechanism, distinct from fork-join bubble
+    // popping: a loop arm is never deleted. Its sequence is duplicated into
+    // the fork node as many times as the predicted copy number implies,
+    // unrolling the cycle in place. Two shapes are handled:
+    //   A -> B (self-loop) -> C   : B -> B edge; B.seq duplicated.
+    //   A -> (S -> arm -> S) -> D : a walked simple arm closing back at its
+    //                               fork S; (arm_seq + S.seq) duplicated.
+    // Copy numbers come from depth ratios against a haploid reference (the
+    // exit path's depth or the genome-wide baseline), and unrolling only
+    // happens in haploid context (reference close to baseline), so SD/rDNA
+    // pileup loops -- real divergent copies -- are left alone.
+    static size_t unroll_loops(dbg_map_t &dbg, gtl::btree_set<u64> &active_set,
+                               const avg_core_count_stats &depth_stats,
+                               size_t max_loop_arm_len, bool dump_unroll) {
+        const double baseline = depth_stats.baseline;
+        if (baseline <= 0.0) return 0;
+        constexpr double kHaploidRefMin = 0.5;
+        constexpr double kHaploidRefMax = 1.5;
+        constexpr int kMaxTurns = 8;
+        auto fwd = build_live_fwd(dbg);
+        gtl::vector<u64> path0, path1;
+        gtl::vector<u64> to_rm;
+        size_t unrolled = 0;
+
+        for (u64 sid : active_set) {
+            auto sit = dbg.find(sid);
+            if (sit == dbg.end() || sit->second.redirected()) continue;
+            if (sit->second.forward_edge_count < 2) continue;
+            auto ffit = fwd.find(sid);
+
+            // Shape 1: direct self-loop S -> S.
+            bool self_loop = false;
+            double ref = baseline;
+            for (u64 c : ffit->second) {
+                auto cit = dbg.find(c);
+                if (cit == dbg.end() || cit->second.redirected()) continue;
+                if (c == sid) {
+                    self_loop = true;
+                    continue;
+                }
+                const double d = cit->second.avg_core_count();
+                if (d > 0.0) {
+                    ref = d;
+                    break;
+                }
+            }
+            if (self_loop) {
+                const double s_depth = sit->second.avg_core_count();
+                const double ref_ratio = ref / baseline;
+                if (ref_ratio >= kHaploidRefMin &&
+                    ref_ratio <= kHaploidRefMax && s_depth > 0.0) {
+                    const int turns = std::clamp(
+                        static_cast<int>(std::llround(s_depth / ref)), 1,
+                        kMaxTurns);
+                    if (turns >= 2) {
+                        if (dump_unroll) {
+                            std::fprintf(stderr,
+                                         "[unroll-self] S=%llu turns=%d "
+                                         "depth=%.3f ref=%.3f\n",
+                                         (unsigned long long)sid, turns,
+                                         s_depth, ref);
+                        }
+                        gtl::vector<SequenceContainerType> orig;
+                        for (const auto &s : sit->second.seq) {
+                            orig.push_back(SequenceContainerType::copy_of(s));
+                        }
+                        for (int k = 1; k < turns; ++k) {
+                            for (const auto &s : orig) {
+                                sit->second.seq.push_back(
+                                    SequenceContainerType::copy_of(s));
+                            }
+                        }
+                        sit->second.forward_edge_count--;
+                        auto &pv = sit->second.prev;
+                        auto pit = std::find(pv.begin(), pv.end(), sid);
+                        if (pit != pv.end()) pv.erase(pit);
+                        ++unrolled;
+                    }
+                }
+                continue;
+            }
+
+            // Shape 2: strict fork; exactly one arm closes back at S.
+            if (ffit->second.size() != 2) continue;
+            const u64 t0 = walk_arm_path(dbg, fwd, ffit->second[0], path0);
+            if (t0 == 0) continue;
+            const u64 t1 = walk_arm_path(dbg, fwd, ffit->second[1], path1);
+            if (t1 == 0) continue;
+            const bool loop0 = (t0 == sid);
+            const bool loop1 = (t1 == sid);
+            if (loop0 == loop1) continue;  // no loop, or both arms loop
+            const gtl::vector<u64> &loop_path = loop0 ? path0 : path1;
+            const gtl::vector<u64> &exit_path = loop0 ? path1 : path0;
+            auto [lenL, dL] = arm_depth_len(dbg, loop_path);
+            auto [lenE, dE] = arm_depth_len(dbg, exit_path);
+            if (lenL == 0 || lenE == 0) continue;
+            if (max_loop_arm_len > 0 && lenL > max_loop_arm_len) {
+                continue;  // loop unit too large: repeat architecture
+            }
+            const double ref2 = dE > 0.0 ? dE : baseline;
+            const double ref_ratio2 = ref2 / baseline;
+            if (ref_ratio2 < kHaploidRefMin || ref_ratio2 > kHaploidRefMax) {
+                continue;  // not haploid context: pileup copy divergence
+            }
+            // Copy-number prediction: the loop arm must be a clean integer
+            // multiple of the haploid reference (its own traversal count),
+            // and S must match one extra traversal. Depth averages are noisy;
+            // a sloppy fit means the "loop" is a collapsed multi-copy repeat,
+            // not a predictable cycle -- leave it alone.
+            const double s_depth = sit->second.avg_core_count();
+            const int t_int = static_cast<int>(std::llround(dL / ref2));
+            if (t_int < 2 || t_int > kMaxTurns) continue;
+            const double loop_err = std::abs(dL - t_int * ref2) / ref2;
+            const double curr_err =
+                std::abs(s_depth - (t_int + 1) * ref2) / ref2;
+            if (loop_err > 0.25 || curr_err > 0.25) continue;
+            const int turns = t_int;
+            if (dump_unroll) {
+                std::fprintf(stderr,
+                             "[unroll] S=%llu turns=%d arm_len=%zu dL=%.3f "
+                             "ref=%.3f S_depth=%.3f\n",
+                             (unsigned long long)sid, turns, lenL, dL, ref2,
+                             sit->second.avg_core_count());
+            }
+            // Unroll: S.seq += (arm_seq + S.seq) x turns.
+            gtl::vector<SequenceContainerType> s_orig;
+            for (const auto &s : sit->second.seq) {
+                s_orig.push_back(SequenceContainerType::copy_of(s));
+            }
+            gtl::vector<SequenceContainerType> arm_seq;
+            for (u64 nid : loop_path) {
+                auto nit = dbg.find(nid);
+                for (const auto &s : nit->second.seq) {
+                    arm_seq.push_back(SequenceContainerType::copy_of(s));
+                }
+            }
+            for (int k = 0; k < turns; ++k) {
+                for (const auto &s : arm_seq) {
+                    sit->second.seq.push_back(
+                        SequenceContainerType::copy_of(s));
+                }
+                for (const auto &s : s_orig) {
+                    sit->second.seq.push_back(
+                        SequenceContainerType::copy_of(s));
+                }
+            }
+            // Remove the loop arm; rewire S. dbg.erase is safe here (we
+            // iterate active_set, not dbg), but active_set erases are
+            // deferred: erasing mid-iteration corrupts the btree walk.
+            for (u64 nid : loop_path) {
+                dbg.erase(nid);
+                to_rm.push_back(nid);
+            }
+            auto &spv = sit->second.prev;
+            auto pit = std::find(spv.begin(), spv.end(), loop_path.back());
+            sit->second.forward_edge_count--;
+            ++unrolled;
+        }
+        for (u64 nid : to_rm) {
+            active_set.erase(nid);
+        }
+        return unrolled;
+    }
+
     static void cut_low_support_edges(dbg_map_t &dbg, auto &active_set) {
         // Death by thousand cuts
         for (auto &node : active_set) {
@@ -893,97 +982,6 @@ struct GraphCleaning {
                     prev_it->second.forward_edge_count--;
                 dbg.erase(current);
             }
-        }
-    }
-    static void open_simple_loopsv2(dbg_map_t &dbg,
-                                    gtl::btree_set<u64> &active_set,
-                                    const avg_core_count_stats &depth_stats) {
-        gtl::vector<u64> to_rm;
-        for (auto &node : active_set) {
-            auto current = dbg.find(node);
-            if (current == dbg.end() || current->second.redirected()) {
-                continue;
-            }
-            if (current->second.forward_edge_count == 2 &&
-                current->second.prev.size() == 2) {
-                // 2 in 2 out
-                //
-                //      o----->[-Cur-]----->o
-                //             |     ^
-                //             v     |
-                //             [-Pre-]
-                //
-                // for (auto &pnode : current->second.prev) {
-                int merged_node_index_in_prev = [&]() -> int {
-                    for (size_t i = 0; i < current->second.prev.size(); ++i) {
-                        auto pnode = current->second.prev[i];
-                        const auto &pit = dbg.find(pnode);
-                        if (pit == dbg.end() || pit->second.redirected()) {
-                            continue;
-                        }
-                        if (pit->second.forward_edge_count != 1 ||
-                            pit->second.prev.size() != 1) {  // Prev is simple
-                            continue;
-                        }
-                        if (pit->second.prev[0] == node) {  // Loop confirmed.
-                            // Try to find other Since we confirmed 2 node
-                            // exist, we can flip it for other
-                            auto other_prev = current->second.prev[1 - i];
-                            double curr_depth =
-                                current->second.avg_core_count();
-                            double pr_depth = pit->second.avg_core_count();
-                            assert(depth_stats.baseline > 0.0);
-                            double other_depth = depth_stats.baseline;
-                            if (auto other_it = dbg.find(other_prev);
-                                other_it != dbg.end() &&
-                                !other_it->second.redirected()) {
-                                const double d =
-                                    other_it->second.avg_core_count();
-                                if (d > 0.0) other_depth = d;
-                            }
-                            // Lets combine the sequences here.
-                            SequenceContainerType cur_seq{
-                                current->second.seq.begin(),
-                                current->second.seq.end()};
-                            SequenceContainerType pre_seq{
-                                pit->second.seq.begin(), pit->second.seq.end()};
-
-                            const auto copy_est = infer_loop_copy_numbers(
-                                other_depth, pr_depth, curr_depth, depth_stats);
-                            const int extra_turns =
-                                std::max(0, copy_est.loop_turns - 1);
-
-                            for (int turn = 0; turn < extra_turns; ++turn) {
-                                current->second.seq.push_back(
-                                    SequenceContainerType::copy_of(pre_seq));
-                                current->second.seq.push_back(
-                                    SequenceContainerType::copy_of(cur_seq));
-                            }
-                            current->second.seq.push_back(std::move(pre_seq));
-                            current->second.seq.push_back(std::move(cur_seq));
-
-                            // Get rid of the looping node
-                            return i;
-                        }
-                    }
-                    return -1;
-                }();
-                if (merged_node_index_in_prev == -1) {
-                    continue;
-                }
-                to_rm.push_back(
-                    current->second.prev[merged_node_index_in_prev]);
-                // active_set.erase(current->second.prev[merged_node_index_in_prev]);
-                current->second.forward_edge_count = 1;
-                if (merged_node_index_in_prev == 0) {
-                    current->second.prev[0] = current->second.prev[1];
-                }
-                current->second.prev.pop_back();
-            }
-        }
-        for (auto node : to_rm) {
-            active_set.erase(node);
-            dbg.erase(node);
         }
     }
     static void fix_edges(dbg_map_t &dbg) {
@@ -1026,6 +1024,8 @@ struct GraphCleaning {
                 std::getenv("LASM_DUMP_POPS") != nullptr;
             const bool dump_loops =
                 std::getenv("LASM_DUMP_LOOPS") != nullptr;
+            const bool dump_unroll =
+                std::getenv("LASM_DUMP_UNROLL") != nullptr;
             for (int i = 1; i < cfg.iterations; ++i) {
                 fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
@@ -1040,8 +1040,13 @@ struct GraphCleaning {
                                  "[graph-clean] popped %zu bubbles\n",
                                  popped);
                 if (cfg.enable_loop_opening) {
-                    open_simple_loopsv2(dbgi.dbg, active_set,
-                                        initial_depth_stats);
+                    const size_t unrolled = unroll_loops(
+                        dbgi.dbg, active_set, initial_depth_stats,
+                        cfg.max_bubble_arm_length, dump_unroll);
+                    if (unrolled > 0)
+                        std::fprintf(stderr,
+                                     "[graph-clean] unrolled %zu loops\n",
+                                     unrolled);
                 }
                 redirect_deleted.clear();
                 // erase_if(dbgi.lci, [](const auto &node) {  // MARK
