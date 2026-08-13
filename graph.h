@@ -721,11 +721,10 @@ struct GraphCleaning {
     // lengths (core counts) are within bubble_length_bound of each other.
     // Strict 2/2 topology is required: among 3+ parallel copies (SD/rDNA
     // tangles) nothing is popped -- deleting one of many real copies is a
-    // misassembly, not cleaning.
     static size_t pop_bubbles(dbg_map_t &dbg, double bubble_depth_epsilon,
                               double bubble_length_bound,
                               size_t max_popped_arm_len, bool dump_pops,
-                              auto &active_set) {
+                              bool dump_loops, auto &active_set) {
         // Live forward adjacency (successor lists are not stored on nodes).
         gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
         for (const auto &[id, node] : dbg) {
@@ -801,7 +800,35 @@ struct GraphCleaning {
             const u64 t0 = walk_arm(ffit->second[0], path0);
             if (t0 == 0) continue;
             const u64 t1 = walk_arm(ffit->second[1], path1);
-            if (t1 == 0 || t1 != t0 || t0 == sid) continue;
+            if (t1 == 0) continue;
+
+            // Loop bubble: an arm closes back onto the fork S itself (its
+            // walk sinks at S). Fork-join candidates never do (T != S).
+            // Loops are NOT popped: depth-ratio popping was measured and
+            // rejected (75 pops -> 28 misassemblies on chr18, 19 on .fa;
+            // shallow loop arms are real low-coverage repeat units, not
+            // sequencing error). Real loop handling needs copy-number
+            // inference (open_simple_loopsv2), not arm deletion.
+            if (t0 == sid || t1 == sid) {
+                if (dump_loops) {
+                    const auto &loop_path = (t0 == sid) ? path0 : path1;
+                    const auto &other_path = (t0 == sid) ? path1 : path0;
+                    auto [lenL, dL] = arm_stats(loop_path);
+                    auto [lenO, dO] = arm_stats(other_path);
+                    std::fprintf(stderr,
+                                 "[loop] S=%llu loop_arm=%d lenL=%zu "
+                                 "lenO=%zu dL=%.3f dO=%.3f S_depth=%.3f "
+                                 "S_prev=%zu t0=%llu t1=%llu\n",
+                                 (unsigned long long)sid, (t0 == sid) ? 0 : 1,
+                                 lenL, lenO, dL, dO,
+                                 sit->second.avg_core_count(),
+                                 sit->second.prev.size(),
+                                 (unsigned long long)t0,
+                                 (unsigned long long)t1);
+                }
+                continue;
+            }
+            if (t1 != t0) continue;  // fork-join: arms must reconverge
 
             auto tit = dbg.find(t0);
             if (tit == dbg.end() || tit->second.redirected() ||
@@ -997,6 +1024,8 @@ struct GraphCleaning {
                 collect_active_avg_core_count_stats(dbgi.dbg, active_set);
             const bool dump_pops =
                 std::getenv("LASM_DUMP_POPS") != nullptr;
+            const bool dump_loops =
+                std::getenv("LASM_DUMP_LOOPS") != nullptr;
             for (int i = 1; i < cfg.iterations; ++i) {
                 fix_edges(dbgi.dbg);
                 cut_tips(dbgi.dbg, 3, cfg.max_tip_length, active_set);
@@ -1004,7 +1033,8 @@ struct GraphCleaning {
                 const size_t popped = pop_bubbles(
                     dbgi.dbg, cfg.min_bubble_depth_difference_percentage,
                     cfg.min_bubble_length_difference,
-                    cfg.max_bubble_arm_length, dump_pops, active_set);
+                    cfg.max_bubble_arm_length, dump_pops, dump_loops,
+                    active_set);
                 if (popped > 0)
                     std::fprintf(stderr,
                                  "[graph-clean] popped %zu bubbles\n",
