@@ -854,8 +854,83 @@ build_layout_sequence_from_nodes(
                 comp_paths.erase(comp_paths.begin() + i + 1);
                 continue;
             }
+            // Case B: junction splice. A comp's span CONTAINS the crumb band
+            // and the next comp STARTS in that band: the chain crosses the
+            // junction (its seq prefix is the duplicated overlap), and the
+            // next comp's sequence continues from the band. Splice: drop the
+            const i64 band_lo = comp_paths[i + 1].layout_from;
+            gtl::vector<const lane_node *> j_crumbs;
+            i64 band_hi = band_lo;
+            for (const auto &c : crumbs) {
+                if (c.from >= band_lo - 32 && c.to <= band_lo + 64) {
+                    band_hi = std::max(band_hi, c.to);
+                }
+            }
+            if (j_crumbs.empty() || band_lo < comp_paths[i].layout_from ||
+                band_lo > comp_paths[i].layout_to) {
+                ++i;
+                continue;
+            }
+            // Split offset: drop the containing comp's fragments up to the
+            // crumb band END (its chain duplicates the junction region).
+            size_t split = 0;
+            {
+                size_t sofar = 0;
+                bool set = false;
+                for (uint32_t nid : comp_paths[i].path) {
+                    const auto &nc = node_contigs[nid];
+                    if (nc.empty()) continue;
+                    const auto &cs = contig_core_seqs.find(nc[0].first);
+                    if (cs == contig_core_seqs.end()) continue;
+                    if (nc[0].second >= cs->second.size()) continue;
+                    if (nodes[scd[nid].contig_idx].from >= band_hi + 8) {
+                        split = sofar;
+                        set = true;
+                        break;
+                    }
+                    sofar += cs->second[nc[0].second].len;
+                }
+                if (!set) {
+                    ++i;
+                    continue;
+                }
+            }
+            // Build merged = next-comp seq + crumbs + containing-comp tail.
+            gtl::vector<SequenceContainerType> merged;
+            for (const auto &s : result[i + 1]) {
+                merged.push_back(SequenceContainerType::copy_of(s));
+            }
+            for (const lane_node *c : j_crumbs) {
+                if (c->is_forward_lane) {
+                    for (const auto &s : *c->raw_seqs) {
+                        merged.push_back(
+                            SequenceContainerType::copy_of(s));
+                    }
+                } else {
+                    gtl::vector<SequenceContainerType> rc =
+                        reverse_complement_seqs(*c->raw_seqs);
+                    for (auto &s : rc) merged.push_back(std::move(s));
+                }
+            }
+            // Append the tail fragments of result[i] from `split` bases on.
+            {
+                size_t sofar = 0;
+                for (const auto &s : result[i]) {
+                    if (sofar + s.len > split) {
+                        // Fragment straddling the split: append whole (bases
+                        // are small; boundary precision is fragment-scale).
+                        merged.push_back(SequenceContainerType::copy_of(s));
+                    }
+                    sofar += s.len;
+                }
+            }
+            result[i] = std::move(merged);
+            comp_paths[i].layout_to =
+                std::max(comp_paths[i].layout_to,
+                         comp_paths[i + 1].layout_to);
+            result.erase(result.begin() + i + 1);
+            comp_paths.erase(comp_paths.begin() + i + 1);
             ++i;
-            continue;
         }
         if (getenv("LASM_ADJ_DUMP")) {
             for (const auto &c : crumbs) {
