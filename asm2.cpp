@@ -1070,13 +1070,17 @@ struct assembler {
                     if (pileup_cap > 0.0 && q_depth > pileup_cap) {
                         return;  // repeat hub: ambiguous across copies
                     }
-                    const u64 ov_from = qspan >= span ? qspan - span : 0;
+                    // Zero-width tail placement: the crumb abuts the
+                    // partner's end (no overlap). Partner-side span {0,0,q}
+                    // puts the crumb at partner.start + qspan in the BFS;
+                    // crumb-side target span {q,0,q} places the partner at
+                    // crumb.start - qspan in the reverse direction.
                     reciprocal.emplace(
-                        q, Overlap{id, CoreSpan{ov_from, qspan, qspan},
+                        q, Overlap{id, CoreSpan{0, 0, qspan},
                                    CoreSpan{0, span, span}});
                     reciprocal.emplace(
                         id, Overlap{q, CoreSpan{0, span, span},
-                                    CoreSpan{ov_from, qspan, qspan}});
+                                    CoreSpan{qspan, 0, qspan}});
                     ++adj_joins;
                     if (adj_dump) {
                         fprintf(stderr,
