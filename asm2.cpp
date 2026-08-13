@@ -1008,6 +1008,30 @@ struct assembler {
             // bounded by crumb-sized spans.
             const u64 min_cores = static_cast<u64>(olc_lcmer_l + 1);
             size_t adj_joins = 0;
+            const bool adj_dump = getenv("LASM_ADJ_DUMP") != nullptr;
+            const char *adj_fasta = getenv("LASM_ADJ_FASTA");
+            // Pileup guard: attaching a crumb to a collapsed repeat hub
+            // (partner depth far above haploid) joins it across genomic
+            // copies -- the measured chimera source. Median over live nodes.
+            gtl::vector<double> depths;
+            depths.reserve(dbgi.active_set.size());
+            for (u64 nid : dbgi.active_set) {
+                auto nit = dbgi.dbg.find(nid);
+                if (nit == dbgi.dbg.end() || nit->second.redirected() ||
+                    nit->second.seq.empty()) {
+                    continue;
+                }
+                depths.push_back(nit->second.avg_core_count());
+            }
+            double depth_median = 0.0;
+            if (!depths.empty()) {
+                std::sort(depths.begin(), depths.end());
+                depth_median =
+                    0.5 * (depths[(depths.size() - 1) / 2] +
+                           depths[depths.size() / 2]);
+            }
+            const double kPileupMaxMult = 3.0;
+            const double pileup_cap = depth_median * kPileupMaxMult;
             for (const auto &[id, node] : dbgi.dbg) {
                 if (node.redirected()) continue;
                 const u64 span = static_cast<u64>(node.seq.size());
@@ -1024,7 +1048,28 @@ struct assembler {
                     continue;
                 }
                 const u64 pspan = static_cast<u64>(pit->second.seq.size());
-                auto attach = [&](u64 q, u64 qspan) {
+                auto write_seq = [&](FILE *f, const char *tag, u64 nid,
+                                     const auto &seqs) {
+                    std::fprintf(f, ">%s_%llu\n", tag,
+                                 (unsigned long long)nid);
+                    for (const auto &s : seqs) {
+                        std::vector<char> buf(s.len + 1);
+                        s.convert_to_ascii(buf.data());
+                        fwrite(buf.data(), 1, s.len, f);
+                    }
+                    fputc('\n', f);
+                };
+                auto attach = [&](u64 q, u64 qspan, const char *dir) {
+                    auto qit0 = dbgi.dbg.find(q);
+                    if (qit0 == dbgi.dbg.end() ||
+                        qit0->second.redirected() ||
+                        qit0->second.seq.empty()) {
+                        return;
+                    }
+                    const double q_depth = qit0->second.avg_core_count();
+                    if (pileup_cap > 0.0 && q_depth > pileup_cap) {
+                        return;  // repeat hub: ambiguous across copies
+                    }
                     const u64 ov_from = qspan >= span ? qspan - span : 0;
                     reciprocal.emplace(
                         q, Overlap{id, CoreSpan{ov_from, qspan, qspan},
@@ -1033,8 +1078,25 @@ struct assembler {
                         id, Overlap{q, CoreSpan{0, span, span},
                                     CoreSpan{ov_from, qspan, qspan}});
                     ++adj_joins;
+                    if (adj_dump) {
+                        fprintf(stderr,
+                                "[adj] crumb=%llu partner=%llu dir=%s "
+                                "span=%zu pspan=%zu\n",
+                                (unsigned long long)id,
+                                (unsigned long long)q, dir, (size_t)span,
+                                (size_t)qspan);
+                    }
+                    if (adj_fasta) {
+                        FILE *f = std::fopen(adj_fasta, "a");
+                        write_seq(f, "crumb", id, node.seq);
+                        auto qit = dbgi.dbg.find(q);
+                        if (qit != dbgi.dbg.end()) {
+                            write_seq(f, "partner", q, qit->second.seq);
+                        }
+                        fclose(f);
+                    }
                 };
-                attach(p, pspan);
+                attach(p, pspan, "prev");
                 // Forward attachments: the last hop crumb->big lives in the
                 // big node's prev list, invisible from the crumb's own prevs.
                 const auto fwds = GraphCleaning::build_live_fwd(dbgi.dbg);
@@ -1059,7 +1121,8 @@ struct assembler {
                             }
                             attach(
                                 q,
-                                static_cast<u64>(qit->second.seq.size()));
+                                static_cast<u64>(qit->second.seq.size()),
+                                "fwd");
                         }
                     }
                 }
