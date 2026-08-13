@@ -807,6 +807,7 @@ struct assembler {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
                 init_lps_crumbled(&str, rev_seqs, syncmer_functor);
+                const int pre_deepen_size = str.size;
                 lps_deepen(&str, lcp_level);
 
                 for (int i = 0; i < str.size; ++i) {
@@ -814,6 +815,11 @@ struct assembler {
                     lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
                 }
                 if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
+                    if (getenv("LASM_DUMP_COREADMIT")) {
+                        fprintf(stderr, "[coreadmit] %" PRIu64
+                                "\tpre=%d\tpost=%zu\n",
+                                node.first, pre_deepen_size, lr.cores.size());
+                    }
                     bad.fetch_add(1);
                     // good_n.fetch_sub(1);
                     free_lps(&str);
@@ -991,9 +997,77 @@ struct assembler {
                 }
             }
         }
+        if (getenv("LASM_ADJ_JOIN")) {
+            // DBG adjacency as join evidence for OLC-ineligible crumbs: nodes
+            // whose core span is below olc_lcmer_l+1 cannot re-derive enough
+            // cores to form lcmers and are invisible to the overlap stage
+            // (measured: 1086 of 1524 active nodes on chr18). Real reads
+            // traversed the edge, so attach such crumbs to their
+            // OLC-eligible neighbors at the boundary. Two OLC-eligible nodes
+            // never join via adjacency alone -- the tangle misjoin risk is
+            // bounded by crumb-sized spans.
+            const u64 min_cores = static_cast<u64>(olc_lcmer_l + 1);
+            size_t adj_joins = 0;
+            for (const auto &[id, node] : dbgi.dbg) {
+                if (node.redirected()) continue;
+                const u64 span = static_cast<u64>(node.seq.size());
+                if (span >= min_cores) continue;  // OLC-eligible: skip
+                if (span == 0) continue;
+                // Hub guard: a crumb with >=2 big prevs would join two
+                // OLC-eligible nodes through a tiny span (chimera risk in
+                // tangles). Only single-prev crumbs attach along the prev
+                // direction; multi-prev merge points are left to OLC.
+                if (node.prev.size() != 1) continue;
+                const u64 p = node.prev[0];
+                auto pit = dbgi.dbg.find(p);
+                if (pit == dbgi.dbg.end() || pit->second.redirected()) {
+                    continue;
+                }
+                const u64 pspan = static_cast<u64>(pit->second.seq.size());
+                auto attach = [&](u64 q, u64 qspan) {
+                    const u64 ov_from = qspan >= span ? qspan - span : 0;
+                    reciprocal.emplace(
+                        q, Overlap{id, CoreSpan{ov_from, qspan, qspan},
+                                   CoreSpan{0, span, span}});
+                    reciprocal.emplace(
+                        id, Overlap{q, CoreSpan{0, span, span},
+                                    CoreSpan{ov_from, qspan, qspan}});
+                    ++adj_joins;
+                };
+                attach(p, pspan);
+                // Forward attachments: the last hop crumb->big lives in the
+                // big node's prev list, invisible from the crumb's own prevs.
+                const auto fwds = GraphCleaning::build_live_fwd(dbgi.dbg);
+                auto fit = fwds.find(id);
+                if (fit != fwds.end()) {
+                    u64 big_fwds = 0;
+                    for (u64 q : fit->second) {
+                        auto qit = dbgi.dbg.find(q);
+                        if (qit != dbgi.dbg.end() &&
+                            !qit->second.redirected() &&
+                            static_cast<u64>(qit->second.seq.size()) >=
+                                min_cores) {
+                            ++big_fwds;
+                        }
+                    }
+                    if (big_fwds < 2) {
+                        for (u64 q : fit->second) {
+                            auto qit = dbgi.dbg.find(q);
+                            if (qit == dbgi.dbg.end() ||
+                                qit->second.redirected()) {
+                                continue;
+                            }
+                            attach(
+                                q,
+                                static_cast<u64>(qit->second.seq.size()));
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "[adj-join] added %zu crumb joins\n", adj_joins);
+        }
         if (getenv("LASM_DUMP_MATCHMULT")) {
             // Distinct reciprocal partners per node: the tangle-vs-unique
-            // discriminator for repeat-boundary breaking.
             gtl::flat_hash_map<u64, gtl::flat_hash_set<u64>> partners;
             for (const auto &[k, ov] : reciprocal) {
                 partners[k].insert(ov.target);
