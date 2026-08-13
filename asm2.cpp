@@ -1285,8 +1285,11 @@ int run_assembly(const asm_config &cfg) {
         // depths but ~1x internal lcmer multiplicities).
         gtl::flat_hash_map<u64, unsigned> lcmer_mult;
         gtl::vector<unsigned> mults;
-        lcmer_mult.reserve(dbg.dbg.size());
-        mults.reserve(dbg.dbg.size());
+        // The fill skips redirected husks, so the map holds live nodes only;
+        // reserve against active_set (not dbg.size(), which is dominated by
+        // husks and over-allocates gigabytes at whole-genome scale).
+        lcmer_mult.reserve(dbg.active_set.size());
+        mults.reserve(dbg.active_set.size());
         for (const auto &[id, node] : dbg.dbg) {
             if (node.redirected()) continue;
             lcmer_mult.emplace(id, node.counts.core_count);
