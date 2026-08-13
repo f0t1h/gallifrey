@@ -683,31 +683,30 @@ inline gtl::vector<gtl::vector<SequenceContainerType>>
 build_layout_sequence_from_nodes(
     [[maybe_unused]] AssemblerT &as, dbg_index &dbg,
     const gtl::vector<ultra_layout_node_info> &lnodes,
-    [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0) {
+    [[maybe_unused]] int hash_combine_len, u64 layout_idx = 0,
+    const gtl::flat_hash_set<u64> *adj_crumbs = nullptr) {
     if (lnodes.empty()) return {};
 
     // ── Build lane_nodes ────────────────────────────────────────────
     gtl::vector<lane_node> nodes;
+    gtl::vector<lane_node> crumbs;  // adj-joined crumbs (emitted via abutment)
     nodes.reserve(lnodes.size());
     for (const auto &n : lnodes) {
         auto it = dbg.dbg.find(n.id);
         if (it == dbg.dbg.end()) continue;
         if (it->second.seq.empty()) continue;
+        if (adj_crumbs && adj_crumbs->contains(n.id)) {
+            crumbs.push_back({n.id, n.from, n.to, n.ori, &it->second.seq});
+            continue;
+        }
         nodes.push_back({n.id, n.from, n.to, n.ori, &it->second.seq});
     }
-    if (nodes.empty()) return {};
-
-    // Sort by layout position
     gtl::vector<size_t> sorted_idx(nodes.size());
-    for (size_t i = 0; i < nodes.size(); ++i) sorted_idx[i] = i;
-    std::sort(sorted_idx.begin(), sorted_idx.end(), [&](size_t ia, size_t ib) {
-        const auto &a = nodes[ia];
-        const auto &b = nodes[ib];
-        if (a.from != b.from) return a.from < b.from;
-        if (a.to != b.to) return a.to < b.to;
-        return a.id < b.id;
-    });
-
+    for (size_t i = 0; i < sorted_idx.size(); ++i) sorted_idx[i] = i;
+    std::sort(sorted_idx.begin(), sorted_idx.end(),
+              [&](size_t a, size_t b) {
+                  return nodes[a].from < nodes[b].from;
+              });
     // ── Fast path: single contig or 1fw+1rv → return the larger ──
     {
         size_t n_fw = 0, n_rv = 0, fi = SIZE_MAX, ri = SIZE_MAX;
@@ -811,10 +810,56 @@ build_layout_sequence_from_nodes(
     auto result = collect_path_sequences(
         comp_paths, node_contigs, contig_core_seqs, scd.size());
 
+
+    if (getenv("LASM_ADJ_JOIN") && result.size() > 1 && !crumbs.empty()) {
+        // Data-supported abutment: SCD components separated only by
+        // adj-joined crumbs are positionally adjacent; the crumb edges are
+        // read evidence for the join (unlike the fabricated N-gap of R7).
+        std::sort(crumbs.begin(), crumbs.end(),
+                  [](const lane_node &a, const lane_node &b) {
+                      return a.from < b.from;
+                  });
+        for (size_t i = 0; i + 1 < comp_paths.size();) {
+            const i64 gap_lo = comp_paths[i].layout_to;
+            const i64 gap_hi = comp_paths[i + 1].layout_from;
+            if (gap_lo >= gap_hi) {
+                ++i;
+                continue;
+            }
+            gtl::vector<const lane_node *> gap_crumbs;
+            for (const auto &c : crumbs) {
+                if (c.from >= gap_lo && c.to <= gap_hi) {
+                    gap_crumbs.push_back(&c);
+                }
+            }
+            if (gap_crumbs.empty()) {
+                ++i;
+                continue;
+            }
+            for (const lane_node *c : gap_crumbs) {
+                if (c->is_forward_lane) {
+                    for (const auto &s : *c->raw_seqs) {
+                        result[i].push_back(
+                            SequenceContainerType::copy_of(s));
+                    }
+                } else {
+                    gtl::vector<SequenceContainerType> rc =
+                        reverse_complement_seqs(*c->raw_seqs);
+                    for (auto &s : rc) result[i].push_back(std::move(s));
+                }
+            }
+            for (auto &s : result[i + 1]) {
+                result[i].push_back(std::move(s));
+            }
+            comp_paths[i].layout_to = comp_paths[i + 1].layout_to;
+            result.erase(result.begin() + i + 1);
+            comp_paths.erase(comp_paths.begin() + i + 1);
+        }
+    }
+
     free_lps(&lps_buf);
     return result;
 }
-
 // One SCD component's sequences …
 using layout_comp_seqs_t = gtl::vector<SequenceContainerType>;
 // … and all components of one layout (emitted as separate contigs).
@@ -823,7 +868,7 @@ using layout_seq_t = gtl::vector<layout_comp_seqs_t>;
 template <class AssemblerT>
 inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
     AssemblerT &as, dbg_index &dbg, const gtl::vector<ultra_layout_job> &jobs,
-    int hash_combine_len) {
+    int hash_combine_len, const gtl::flat_hash_set<u64> *adj_crumbs = nullptr) {
     gtl::vector<layout_seq_t> out_seqs(jobs.size());
     if (jobs.empty()) return out_seqs;
 
@@ -848,12 +893,12 @@ inline gtl::vector<layout_seq_t> build_layout_sequences_parallel(
                 }
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
                     as, dbg, jobs[job_idx].lnodes, hash_combine_len,
-                    jobs[job_idx].layout_idx);
+                    jobs[job_idx].layout_idx, adj_crumbs);
             }
             while (job_queue.try_dequeue(job_idx)) {
                 out_seqs[job_idx] = build_layout_sequence_from_nodes(
                     as, dbg, jobs[job_idx].lnodes, hash_combine_len,
-                    jobs[job_idx].layout_idx);
+                    jobs[job_idx].layout_idx, adj_crumbs);
             }
         });
     }
@@ -1404,16 +1449,20 @@ inline void write_gfa(const supernode_vec &supernodes,
         if (len >= FLUSH_AT) {
             flush();
             std::fwrite(data, 1, len, out);
-            return;
+        } else {
+            wbuf.append(data, len);
         }
-        if (wbuf.size() + len > FLUSH_AT) flush();
-        wbuf.append(data, len);
+    };
+    auto emit_final = [&]() {
+        flush();
     };
 
     for (size_t i = 0; i < n_super; ++i) {
         if (super_line_strs[i].empty()) continue;  // removed
         emit(super_line_strs[i].data(), super_line_strs[i].size());
     }
+    emit_final();
+
 
     char lbuf[1024];
     for (const auto &[_, edge] : merged_edges) {
@@ -1442,6 +1491,17 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     TIME_CHECKPOINT(LayoutEmit, stderr, "fold_dbg_graph (%zu layouts)",
                     layouts.size());
 
+    // Adj-joined crumbs: reciprocal-map entries whose query span is below
+    // the lcmer threshold (fold_dbg_graph's LASM_ADJ_JOIN block). Emitted by
+    // abutment between SCD components, not as their own contigs.
+    gtl::flat_hash_set<u64> adj_crumbs;
+    if (getenv("LASM_ADJ_JOIN")) {
+        for (const auto &[k, ov] : recig) {
+            if (ov.query.len < static_cast<u64>(as.olc_lcmer_l + 1)) {
+                adj_crumbs.insert(k);
+            }
+        }
+    }
     gtl::vector<supernode_out> supernodes;
     gtl::flat_hash_map<u64, u64> node_to_super;
     gtl::flat_hash_set<u64> nodes_in_layouts;
@@ -1471,7 +1531,8 @@ inline void emit_ultra_merged_graph(AssemblerT &as, dbg_index &dbg, FILE *out) {
     // ── Phase 2: build layout ("M") supernode sequences in parallel ─────
     const int hash_combine_len = as.olc_lcmer_l;
     auto layout_seqs =
-        build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len);
+        build_layout_sequences_parallel(as, dbg, layout_jobs, hash_combine_len,
+                                        &adj_crumbs);
     TIME_CHECKPOINT(LayoutEmit, stderr, "Build layout sequences");
     for (size_t i = 0; i < layout_jobs.size(); ++i) {
         const auto &job = layout_jobs[i];
