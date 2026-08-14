@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # gfa_mc.sh <outdir> — per-combo M/C node and base counts from EXISTING GFA
-# files. Backfill companion to eval_combos.sh: runs against a completed or
+# files. Backfill companion to eval_combos.pl: runs against a completed or
 # in-flight grid without re-running any combo.
 #
 # Only combos whose run completed (a .metrics file exists) are reported:
