@@ -3,7 +3,11 @@
 # files. Backfill companion to eval_combos.sh: runs against a completed or
 # in-flight grid without re-running any combo.
 #
-# Output: <outdir>/mc_report.txt (+ stdout), one row per <name>.gfa found.
+# Only combos whose run completed (a .metrics file exists) are reported:
+# a crashed lasm can leave a truncated GFA behind, which would otherwise
+# be counted partially.
+#
+# Output: <outdir>/mc_report.txt (+ stdout), one row per completed combo.
 set -euo pipefail
 
 OUT=${1:?usage: gfa_mc.sh <outdir>}
@@ -12,6 +16,10 @@ OUT=${1:?usage: gfa_mc.sh <outdir>}
     for gfa in "$OUT"/*.gfa; do
         [ -e "$gfa" ] || continue
         name=$(basename "$gfa" .gfa)
+        [ -f "$OUT/$name.metrics" ] || continue
+        if grep -qE "^${name}	(FAIL|EMPTY)" "$OUT/$name.metrics"; then
+            continue
+        fi
         awk -F'\t' -v n="$name" '
             $1=="S" && $2 ~ /^M/ { mn++; mb += length($3) }
             $1=="S" && $2 ~ /^C/ { cn++; cb += length($3) }
