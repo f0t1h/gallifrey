@@ -633,14 +633,18 @@ struct GraphCleaning {
     }
 
     // Live forward adjacency: successor lists derived from prev edges,
-    // sorted per node for deterministic arm walking. Dead/redirected nodes
-    // are excluded.
+    // sorted per node for deterministic arm walking. Iterates the LIVE set,
+    // not the whole dbg map — the map is dominated by redirected husks
+    // (230x live count on chr18, worse at whole-genome scale) and a full
+    // pass over them dominated the adj-join runtime.
     static gtl::flat_hash_map<u64, gtl::vector<u64>> build_live_fwd(
-        const dbg_map_t &dbg) {
+        const dbg_map_t &dbg, const gtl::btree_set<u64> &active_set) {
         gtl::flat_hash_map<u64, gtl::vector<u64>> fwd;
-        for (const auto &[id, node] : dbg) {
-            if (node.redirected()) continue;
-            for (u64 p : node.prev) {
+        fwd.reserve(active_set.size());
+        for (u64 id : active_set) {
+            auto it = dbg.find(id);
+            if (it == dbg.end() || it->second.redirected()) continue;
+            for (u64 p : it->second.prev) {
                 auto pit = dbg.find(p);
                 if (pit != dbg.end() && !pit->second.redirected()) {
                     fwd[p].push_back(id);
@@ -719,7 +723,7 @@ struct GraphCleaning {
                               double bubble_length_bound,
                               size_t max_popped_arm_len, bool dump_pops,
                               bool dump_loops, auto &active_set) {
-        auto fwd = build_live_fwd(dbg);
+        auto fwd = build_live_fwd(dbg, active_set);
 
         gtl::vector<u64> to_rm;
         size_t popped = 0;
@@ -840,7 +844,7 @@ struct GraphCleaning {
         constexpr double kHaploidRefMin = 0.5;
         constexpr double kHaploidRefMax = 1.5;
         constexpr int kMaxTurns = 8;
-        auto fwd = build_live_fwd(dbg);
+        auto fwd = build_live_fwd(dbg, active_set);
         gtl::vector<u64> path0, path1;
         gtl::vector<u64> to_rm;
         size_t unrolled = 0;

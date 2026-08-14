@@ -1034,9 +1034,11 @@ struct assembler {
             const double pileup_cap = depth_median * kPileupMaxMult;
             // Forward adjacency built ONCE for the whole sweep (was per-crumb:
             // O(crumbs × N) — the 10x whole-genome runtime).
-            const auto adj_fwds = GraphCleaning::build_live_fwd(dbgi.dbg);
-            for (const auto &[id, node] : dbgi.dbg) {
-                if (node.redirected()) continue;
+            const auto adj_fwds = GraphCleaning::build_live_fwd(dbgi.dbg, dbgi.active_set);
+            for (u64 id : dbgi.active_set) {
+                auto it = dbgi.dbg.find(id);
+                if (it == dbgi.dbg.end()) continue;
+                const auto &node = it->second;
                 const u64 span = static_cast<u64>(node.seq.size());
                 if (span >= min_cores) continue;  // OLC-eligible: skip
                 if (span == 0) continue;
@@ -1287,13 +1289,13 @@ int run_assembly(const asm_config &cfg) {
         gtl::vector<unsigned> mults;
         // The fill skips redirected husks, so the map holds live nodes only;
         // reserve against active_set (not dbg.size(), which is dominated by
-        // husks and over-allocates gigabytes at whole-genome scale).
         lcmer_mult.reserve(dbg.active_set.size());
         mults.reserve(dbg.active_set.size());
-        for (const auto &[id, node] : dbg.dbg) {
-            if (node.redirected()) continue;
-            lcmer_mult.emplace(id, node.counts.core_count);
-            mults.push_back(node.counts.core_count);
+        for (u64 id : dbg.active_set) {
+            auto it = dbg.dbg.find(id);
+            if (it == dbg.dbg.end() || it->second.redirected()) continue;
+            lcmer_mult.emplace(id, it->second.counts.core_count);
+            mults.push_back(it->second.counts.core_count);
         }
         if (mults.size() >= 2) {
             std::sort(mults.begin(), mults.end());

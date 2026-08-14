@@ -116,16 +116,42 @@ printf '%s\0' "${COMBOS[@]}" |
         echo "run  $name"
         read -ra extra <<< "${EXTRA_STR:-}"
         t0=$(date +%s)
-        # shellcheck disable=SC2086  # envs/extra/THREADS are intentionally word-split
-        if ! env $envs "$LASM" hifi $INPUTS -o "$OUT/$name.gfa" \
-                "${extra[@]}" $args $THREADS > "$OUT/$name.log" 2>&1; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t0\t0\n" "$name" > "$OUT/$name.metrics"
-            exit 0
+        mem_kb=0
+        # Peak RSS via /usr/bin/time: GNU `-v -o` (Linux) or BSD `-l`
+        # (macOS) — the report lands in $OUT/$name.time either way.
+        if /usr/bin/time -v true >/dev/null 2>&1; then
+            # shellcheck disable=SC2086  # envs/extra/THREADS are intentionally word-split
+            /usr/bin/time -v -o "$OUT/$name.time" env $envs "$LASM" hifi $INPUTS \
+                -o "$OUT/$name.gfa" "${extra[@]}" $args $THREADS \
+                > "$OUT/$name.log" 2>&1
+            rc=$?
+            mem_kb=$(grep -oE "Maximum resident set size \(kbytes\): [0-9]+" \
+                "$OUT/$name.time" | grep -oE "[0-9]+" | head -1)
+        elif /usr/bin/time -l true >/dev/null 2>&1; then
+            /usr/bin/time -l env $envs "$LASM" hifi $INPUTS \
+                -o "$OUT/$name.gfa" "${extra[@]}" $args $THREADS \
+                > "$OUT/$name.log" 2> "$OUT/$name.time"
+            rc=$?
+            mem_kb=$(grep -oE "[0-9]+ +maximum resident set size" \
+                "$OUT/$name.time" | grep -oE "[0-9]+" | head -1)
+            if [ -n "$mem_kb" ]; then mem_kb=$((mem_kb / 1024)); fi
+        else
+            env $envs "$LASM" hifi $INPUTS -o "$OUT/$name.gfa" \
+                "${extra[@]}" $args $THREADS > "$OUT/$name.log" 2>&1
+            rc=$?
         fi
         t1=$(date +%s)
         lasm_s=$((t1 - t0))
+        if [ -z "$mem_kb" ]; then mem_kb=0; fi
+        mem_gb=$(awk -v k="$mem_kb" "BEGIN { printf \"%.1f\", k / 1048576 }")
+        if [ $rc -ne 0 ]; then
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\n" \
+                "$name" "$lasm_s" "$mem_gb" > "$OUT/$name.metrics"
+            exit 0
+        fi
         if [ ! -s "$OUT/$name.gfa" ]; then
-            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\n" "$name" "$lasm_s" > "$OUT/$name.metrics"
+            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\n" \
+                "$name" "$lasm_s" "$mem_gb" > "$OUT/$name.metrics"
             exit 0
         fi
         gfatools gfa2fa "$OUT/$name.gfa" > "$OUT/$name.fa"
@@ -137,10 +163,11 @@ printf '%s\0' "${COMBOS[@]}" |
         quast_s=$((t3 - t2))
         tsv="$OUT/quast_$name/report.tsv"
         if [ ! -f "$tsv" ]; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t%s\n" "$name" "$lasm_s" "$quast_s" > "$OUT/$name.metrics"
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t%s\t%s\n" \
+                "$name" "$lasm_s" "$quast_s" "$mem_gb" > "$OUT/$name.metrics"
             exit 0
         fi
-        awk -F"\t" -v n="$name" -v ls="$lasm_s" -v qs="$quast_s" "
+        awk -F"\t" -v n="$name" -v ls="$lasm_s" -v qs="$quast_s" -v mg="$mem_gb" "
             \$1==\"# contigs\" {c=\$2}
             \$1==\"N50\" {n50=\$2}
             \$1==\"NGA50\" {nga=\$2}
@@ -150,8 +177,8 @@ printf '%s\0' "${COMBOS[@]}" |
             \$1==\"Duplication ratio\" {dr=\$2}
             \$1==\"# mismatches per 100 kbp\" {mm=\$2}
             \$1==\"Largest contig\" {lc=\$2}
-            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
-                        n, c, n50, nga, m, lm, gf, dr, mm, lc, ls, qs }
+            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
+                        n, c, n50, nga, m, lm, gf, dr, mm, lc, ls, qs, mg }
         " "$tsv" > "$OUT/$name.metrics"
     ' _
 
@@ -159,7 +186,7 @@ printf '%s\0' "${COMBOS[@]}" |
     n_in=$(printf '%s\n' $INPUTS | wc -l | tr -d ' ')
     if [ "$n_in" = 1 ]; then in_label="$(basename $INPUTS)"; else in_label="$n_in inputs: $(basename ${INPUTS%% *})..."; fi
     printf '# host=%s  input=%s  date=%s\n' "$(hostname)" "$in_label" "$(date -u +%Y-%m-%dT%H:%MZ)"
-    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\n'
+    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\tmem_gb\n'
     cat "$OUT"/*.metrics | sort -t$'\t' -k5,5n -k4,4rn
 } | column -t -s$'\t' > "$OUT/summary.txt"
 
