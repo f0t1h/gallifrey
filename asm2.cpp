@@ -1032,6 +1032,9 @@ struct assembler {
             }
             const double kPileupMaxMult = 3.0;
             const double pileup_cap = depth_median * kPileupMaxMult;
+            // Forward adjacency built ONCE for the whole sweep (was per-crumb:
+            // O(crumbs × N) — the 10x whole-genome runtime).
+            const auto adj_fwds = GraphCleaning::build_live_fwd(dbgi.dbg);
             for (const auto &[id, node] : dbgi.dbg) {
                 if (node.redirected()) continue;
                 const u64 span = static_cast<u64>(node.seq.size());
@@ -1100,12 +1103,9 @@ struct assembler {
                         fclose(f);
                     }
                 };
-                attach(p, pspan, "prev");
-                // Forward attachments: the last hop crumb->big lives in the
+                auto fit = adj_fwds.find(id);
                 // big node's prev list, invisible from the crumb's own prevs.
-                const auto fwds = GraphCleaning::build_live_fwd(dbgi.dbg);
-                auto fit = fwds.find(id);
-                if (fit != fwds.end()) {
+                if (fit != adj_fwds.end()) {
                     u64 big_fwds = 0;
                     for (u64 q : fit->second) {
                         auto qit = dbgi.dbg.find(q);
