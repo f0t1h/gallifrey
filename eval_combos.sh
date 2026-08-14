@@ -145,15 +145,18 @@ printf '%s\0' "${COMBOS[@]}" |
         if [ -z "$mem_kb" ]; then mem_kb=0; fi
         mem_gb=$(awk -v k="$mem_kb" "BEGIN { printf \"%.1f\", k / 1048576 }")
         if [ $rc -ne 0 ]; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\n" \
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\t0\t0\t0\t0\n" \
                 "$name" "$lasm_s" "$mem_gb" > "$OUT/$name.metrics"
             exit 0
         fi
         if [ ! -s "$OUT/$name.gfa" ]; then
-            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\n" \
+            printf "%s\tEMPTY\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t0\t%s\t0\t0\t0\t0\n" \
                 "$name" "$lasm_s" "$mem_gb" > "$OUT/$name.metrics"
             exit 0
         fi
+        # GFA structure: M/C segment counts and their base totals.
+        gfa_stats=$(awk -F"\t" "\$1==\"S\" && \$2 ~ /^M/ {mn++; mb += length(\$3)} \$1==\"S\" && \$2 ~ /^C/ {cn++; cb += length(\$3)} END {printf \"%d %d %d %d\", mn+0, mb+0, cn+0, cb+0}" "$OUT/$name.gfa")
+        read -r m_nodes m_bases c_nodes c_bases <<< "$gfa_stats"
         gfatools gfa2fa "$OUT/$name.gfa" > "$OUT/$name.fa"
         t2=$(date +%s)
         quast.py -r "$REF" "$OUT/$name.fa" -o "$OUT/quast_$name" -t 4 \
@@ -163,11 +166,11 @@ printf '%s\0' "${COMBOS[@]}" |
         quast_s=$((t3 - t2))
         tsv="$OUT/quast_$name/report.tsv"
         if [ ! -f "$tsv" ]; then
-            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t%s\t%s\n" \
-                "$name" "$lasm_s" "$quast_s" "$mem_gb" > "$OUT/$name.metrics"
+            printf "%s\tFAIL\t0\t0\t0\t0\t0\t0\t0\t0\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+                "$name" "$lasm_s" "$quast_s" "$mem_gb" "$m_nodes" "$m_bases" "$c_nodes" "$c_bases" > "$OUT/$name.metrics"
             exit 0
         fi
-        awk -F"\t" -v n="$name" -v ls="$lasm_s" -v qs="$quast_s" -v mg="$mem_gb" "
+        awk -F"\t" -v n="$name" -v ls="$lasm_s" -v qs="$quast_s" -v mg="$mem_gb" -v mn="$m_nodes" -v mb="$m_bases" -v cn="$c_nodes" -v cb="$c_bases" "
             \$1==\"# contigs\" {c=\$2}
             \$1==\"N50\" {n50=\$2}
             \$1==\"NGA50\" {nga=\$2}
@@ -177,8 +180,8 @@ printf '%s\0' "${COMBOS[@]}" |
             \$1==\"Duplication ratio\" {dr=\$2}
             \$1==\"# mismatches per 100 kbp\" {mm=\$2}
             \$1==\"Largest contig\" {lc=\$2}
-            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
-                        n, c, n50, nga, m, lm, gf, dr, mm, lc, ls, qs, mg }
+            END { printf \"%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n\",
+                        n, c, n50, nga, m, lm, gf, dr, mm, lc, ls, qs, mg, mn, mb, cn, cb }
         " "$tsv" > "$OUT/$name.metrics"
     ' _
 
@@ -186,7 +189,7 @@ printf '%s\0' "${COMBOS[@]}" |
     n_in=$(printf '%s\n' $INPUTS | wc -l | tr -d ' ')
     if [ "$n_in" = 1 ]; then in_label="$(basename $INPUTS)"; else in_label="$n_in inputs: $(basename ${INPUTS%% *})..."; fi
     printf '# host=%s  input=%s  date=%s\n' "$(hostname)" "$in_label" "$(date -u +%Y-%m-%dT%H:%MZ)"
-    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\tmem_gb\n'
+    printf 'name\tcontigs\tN50\tNGA50\tmisasm\tlocals\tgenfrac\tdup\tmism_100kbp\tlargest\tlasm_s\tquast_s\tmem_gb\tM_nodes\tM_bases\tC_nodes\tC_bases\n'
     cat "$OUT"/*.metrics | sort -t$'\t' -k5,5n -k4,4rn
 } | column -t -s$'\t' > "$OUT/summary.txt"
 
