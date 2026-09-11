@@ -1276,5 +1276,4 @@ inline void parse_cores_from_bam_record2(const uint8_t *data, size_t len,
     }
     lr.data = data;
 }
-lcp_read parse_cores_from_kseq(const char *data, size_t len, int lcp_level);
 #endif

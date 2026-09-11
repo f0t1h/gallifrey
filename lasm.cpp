@@ -24,7 +24,11 @@ class AsmProgram {
 public:
     explicit AsmProgram(CLI::App &parent) {
         auto &app = *parent.add_subcommand("hifi", "run hifi assembly");
-        app.add_option("input", cfg.inputs, "Input bam files")->required();
+        app.add_option("input", cfg.inputs,
+                       "Input read files: BAM/CRAM/SAM (via htslib) or "
+                       "FASTA/FASTQ, optionally gzipped (native reader). "
+                       "Format is detected from file content.")
+            ->required();
         app.add_option("-o,--output", cfg.output, "Output gfa file")
             ->required();
         app.add_option("-l,--level", cfg.lcp_level, "LCP level to compute")

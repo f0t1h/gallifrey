@@ -10,6 +10,7 @@
 #include "htslib/hts.h"
 #include "htslib/sam.h"
 #include "nibble2base.hpp"
+#include "fastx.h"
 #include "syncmer.h"
 
 void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
@@ -661,4 +662,151 @@ TEST_CASE("onehot_to_rle correctness") {
         bam_hdr_destroy(hdr);
         sam_close(fp);
     }
+}
+
+// The FASTX path exists only because it is cheaper than htslib; it is correct
+// only if it produces the exact same packed sequence -- and therefore the exact
+// same core stream -- as the BAM path for the same bases.
+TEST_CASE("FASTX reader agrees with the htslib path") {
+    samFile *fp = sam_open(kTestSingleBam, "r");
+    REQUIRE_MESSAGE(fp != NULL, "Failed to open BAM file: ", kTestSingleBam);
+    bam_hdr_t *hdr = sam_hdr_read(fp);
+    bam1_t *rec = bam_init1();
+    REQUIRE(sam_read1(fp, hdr, rec) > 0);
+    const int len = rec->core.l_qseq;
+    const uint8_t *bam_seq = bam_get_seq(rec);
+
+    std::string bases(static_cast<size_t>(len), '\0');
+    for (int i = 0; i < len; ++i) {
+        bases[static_cast<size_t>(i)] = seq_nt16_str[bam_seqi(bam_seq, i)];
+    }
+
+    auto wrap = [&](const std::string &seq, size_t cols, const char *eol) {
+        std::string out;
+        for (size_t i = 0; i < seq.size(); i += cols) {
+            out += seq.substr(i, cols);
+            out += eol;
+        }
+        return out;
+    };
+    auto write_file = [](const std::string &path, const std::string &content) {
+        FILE *f = fopen(path.c_str(), "w");
+        REQUIRE(f != nullptr);
+        [[maybe_unused]] const size_t wrote =
+            fwrite(content.data(), 1, content.size(), f);
+        fclose(f);
+        REQUIRE(wrote == content.size());
+    };
+
+    const std::string dir = "/tmp/";
+    const std::string fa = dir + "lasm_fastx_test.fa";
+    const std::string fa_crlf = dir + "lasm_fastx_test_crlf.fa";
+    const std::string fq = dir + "lasm_fastx_test.fq";
+
+    // Two records per file: the reader must not fuse or drop them.
+    write_file(fa, ">r1 comment\n" + wrap(bases, 60, "\n") + ">r2\n" +
+                       wrap(bases, 60, "\n"));
+    // CRLF + lowercase bases must decode identically.
+    std::string lower = bases;
+    for (char &c : lower) c = static_cast<char>(tolower(c));
+    write_file(fa_crlf, ">r1\r\n" + wrap(lower, 70, "\r\n") + ">r2\r\n" +
+                            wrap(lower, 70, "\r\n"));
+    // Quality line made entirely of '@' -- the classic FASTQ parser trap.
+    const std::string qual(bases.size(), '@');
+    write_file(fq, "@r1\n" + bases + "\n+\n" + qual + "\n@r2\n" + bases +
+                       "\n+r2\n" + qual + "\n");
+
+    auto check_file = [&](const std::string &path, size_t block_size) {
+        INFO("path=", path, " block=", block_size);
+        fastx_reader reader(block_size);
+        [[maybe_unused]] const bool opened = reader.open(path, false, 1);
+        REQUIRE(opened);
+        seq_record sr;
+        for (int r = 0; r < 2; ++r) {
+            INFO("record ", r);
+            REQUIRE(reader.next(sr));
+            CHECK_EQ(sr.len, static_cast<uint32_t>(len));
+            CHECK_EQ(memcmp(sr.nibbles, bam_seq, static_cast<size_t>(len) / 2),
+                     0);
+        }
+        CHECK_FALSE(reader.next(sr));
+        CHECK_FALSE(reader.failed());
+        free(sr.nibbles);
+    };
+
+    // Block sizes far below a record length exercise every state transition
+    // across a buffer boundary.
+    for (size_t block : {size_t(7), size_t(64), size_t(4096), size_t(1) << 20}) {
+        check_file(fa, block);
+        check_file(fa_crlf, block);
+        check_file(fq, block);
+    }
+
+    SUBCASE("non-ACGT bases and mid-window whitespace decode as htslib does") {
+        // Exercises the scalar fallback inside the vectorized packer: N/IUPAC
+        // codes and odd-length lines that push the packer off even offsets.
+        const std::string dirty =
+            "ACGTacgtNNNNRYKM" "ACGTACGTACGTACGTA" "nnnACGT" "W";
+        const std::string path = dir + "lasm_fastx_dirty.fa";
+        write_file(path, ">d\n" + dirty.substr(0, 16) + "\n" +
+                             dirty.substr(16, 17) + "\n" + dirty.substr(33) +
+                             "\n");
+        fastx_reader reader(13);
+        [[maybe_unused]] const bool opened = reader.open(path, false, 1);
+        REQUIRE(opened);
+        seq_record sr;
+        REQUIRE(reader.next(sr));
+        REQUIRE_EQ(sr.len, static_cast<uint32_t>(dirty.size()));
+        for (size_t i = 0; i < dirty.size(); ++i) {
+            INFO("base ", i, " '", dirty[i], "'");
+            CHECK_EQ(bam_seqi(sr.nibbles, i),
+                     seq_nt16_table[static_cast<uint8_t>(dirty[i])]);
+        }
+        CHECK_FALSE(reader.next(sr));
+        free(sr.nibbles);
+        remove(path.c_str());
+    }
+
+    SUBCASE("core streams are identical") {
+        using SYNCMER_HASHER = syncmer::MurMur;
+        using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
+        syncmer_params spara;
+        spara.k = 15;
+        spara.density = 0.05;
+        SyncmerType fnctr(spara, 11);
+
+        fastx_reader reader;
+        [[maybe_unused]] const bool opened = reader.open(fq, false, 1);
+        REQUIRE(opened);
+        seq_record sr;
+        REQUIRE(reader.next(sr));
+
+        lps str1 = {0, 0, 0, nullptr};
+        lps str2 = {0, 0, 0, nullptr};
+        charsi chs1, chs2;
+        pos_scratch pos1, pos2;
+        lcp_read lr_bam, lr_fastx;
+        constexpr int LCP_LEVEL = 3;
+        parse_cores_from_bam_record(bam_seq, static_cast<size_t>(len),
+                                    LCP_LEVEL, &str1, fnctr, chs1, lr_bam,
+                                    pos1);
+        parse_cores_from_bam_record(sr.nibbles, sr.len, LCP_LEVEL, &str2, fnctr,
+                                    chs2, lr_fastx, pos2);
+        REQUIRE(lr_bam.cores.size() > 0);
+        REQUIRE_EQ(lr_fastx.cores.size(), lr_bam.cores.size());
+        CHECK_EQ(memcmp(lr_fastx.cores.data(), lr_bam.cores.data(),
+                        lr_bam.cores.size() * sizeof(uint32_t)),
+                 0);
+        CHECK(lr_fastx.pos == lr_bam.pos);
+        free_lps(&str1);
+        free_lps(&str2);
+        free(sr.nibbles);
+    }
+
+    remove(fa.c_str());
+    remove(fa_crlf.c_str());
+    remove(fq.c_str());
+    bam_destroy1(rec);
+    bam_hdr_destroy(hdr);
+    sam_close(fp);
 }

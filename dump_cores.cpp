@@ -11,53 +11,14 @@
 #include "ext/lcptools/lcptools_ho.h"
 #include "lcmer.h"
 #include "syncmer.h"
+#include "fastx.h"
 
-struct FastaReader {
-    FILE *fp = nullptr;
-    std::string name;
-    std::string seq;
-
-    explicit FastaReader(const char *path) { fp = fopen(path, "r"); }
-    ~FastaReader() {
-        if (fp) fclose(fp);
+static input_format dump_input_format(const std::string &path) {
+    const input_format f = detect_input_format(path);
+    if (f == input_format::fastx_plain || f == input_format::fastx_compressed) {
+        return f;
     }
-    bool next() {
-        if (!fp) return false;
-        name.clear();
-        seq.clear();
-        int c;
-        while ((c = fgetc(fp)) != EOF) {
-            if (c == '>') break;
-        }
-        if (c == EOF) return false;
-        while ((c = fgetc(fp)) != EOF && c != '\n' && c != '\r') {
-            name.push_back(static_cast<char>(c));
-        }
-        while ((c = fgetc(fp)) != EOF) {
-            if (c == '>') {
-                ungetc(c, fp);
-                break;
-            }
-            if (c != '\n' && c != '\r' && c != ' ') {
-                seq.push_back(static_cast<char>(c));
-            }
-        }
-        return !seq.empty();
-    }
-};
-
-static void ascii_to_bam_nibbles(const std::string &seq,
-                                 std::vector<uint8_t> &out) {
-    size_t len = seq.size();
-    out.resize((len + 1) / 2);
-    for (size_t i = 0; i < len; ++i) {
-        uint8_t nibble = seq_nt16_table[static_cast<uint8_t>(seq[i])];
-        if (i & 1) {
-            out[i / 2] |= nibble;
-        } else {
-            out[i / 2] = nibble << 4;
-        }
-    }
+    return input_format::invalid;
 }
 
 static int run_dump_cores(const std::string &input_path,
@@ -80,33 +41,45 @@ static int run_dump_cores(const std::string &input_path,
     }
     fprintf(out, "read_name\tread_len\tcore_idx\tcore_label\tstart\tend\tspan\n");
 
-    FastaReader reader(input_path.c_str());
-    if (!reader.fp) {
+    const input_format fmt = dump_input_format(input_path);
+    if (fmt == input_format::invalid) {
+        fprintf(stderr, "Not a FASTA/FASTQ input: %s\n", input_path.c_str());
+        fclose(out);
+        return 1;
+    }
+    fastx_reader reader;
+    if (!reader.open(input_path, fmt == input_format::fastx_compressed, 1)) {
         fprintf(stderr, "Cannot open input: %s\n", input_path.c_str());
         fclose(out);
         return 1;
     }
 
-    std::vector<uint8_t> nibbles;
+    seq_record rec;
     lps str = {0, 0, 0, nullptr};
     charsi chs;
     pos_scratch pos_buf;
     int read_count = 0;
 
-    while (reader.next()) {
-        size_t len = reader.seq.size();
-        ascii_to_bam_nibbles(reader.seq, nibbles);
-
+    while (reader.next(rec)) {
         lcp_read lr;
-        parse_cores_from_bam_record(nibbles.data(), len, lcp_level, &str,
+        parse_cores_from_bam_record(rec.nibbles, rec.len, lcp_level, &str,
                                     syncmer_functor, chs, lr, pos_buf);
 
         for (size_t i = 0; i < lr.cores.size(); ++i) {
-            fprintf(out, "%s\t%zu\t%zu\t%" PRIu32 "\t%u\t%u\t%u\n",
-                    reader.name.c_str(), len, i, lr.cores[i], lr.pos[i].first,
-                    lr.pos[i].second, lr.pos[i].second - lr.pos[i].first);
+            fprintf(out, "%s\t%u\t%zu\t%" PRIu32 "\t%u\t%u\t%u\n",
+                    reader.name().c_str(), rec.len, i, lr.cores[i],
+                    lr.pos[i].first, lr.pos[i].second,
+                    lr.pos[i].second - lr.pos[i].first);
         }
         ++read_count;
+    }
+    free(rec.nibbles);
+    if (reader.failed()) {
+        fprintf(stderr, "Malformed FASTA/FASTQ input: %s\n",
+                input_path.c_str());
+        free_lps(&str);
+        fclose(out);
+        return 1;
     }
 
     free_lps(&str);

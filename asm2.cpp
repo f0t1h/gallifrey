@@ -30,13 +30,12 @@
 #include "graph.h"
 #include "layout_graph.h"
 #include "lcmer.h"
+#include "fastx.h"
 #include "no_destructor.h"
 #include "lcptools/lcptools_ho.h"
 #include "syncmer.h"
 
 using std::string;
-enum class input_type { SAM, BAM, FASTX, FASTXGZ, FASTXBZ2, UNKNOWN };
-
 // OLC end-skip policy: cores skipped at each end of a DBG node before
 // overlap-anchoring (see find_lcmer_ranges). Function-like macros of the OLC
 // lcmer length `l`. A node needs (l + OLC_SKIP_FIRST(l) + OLC_SKIP_LAST(l))
@@ -52,7 +51,12 @@ struct assembler {
     using SYNCMER_HASHER = syncmer::MurMur;
     using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
 
-    using dqt = moodycamel::BlockingConcurrentQueue<bam1_t *>;
+    template <class Rec>
+    using queue_of = moodycamel::BlockingConcurrentQueue<Rec *>;
+    using bam_queue = queue_of<bam1_t>;
+    using fastx_queue = queue_of<seq_record>;
+    // (path, is_compressed) -- the flag is only meaningful for FASTX inputs.
+    using stage_input = std::pair<string, bool>;
     gtl::vector<string> inputs;
     string output;
     decltype(asm_config::threads) threads;
@@ -268,148 +272,243 @@ struct assembler {
         return {8, threads - 8};
     }
 
-    static auto process_data(int thread_id, int lcp_level, dqt &data_queue,
-                             dqt &recycle_queue, dbg_index &dbgi,
-                             std::atomic<bool> &done, int &processed_read_count,
-                             int &all_reads, auto Process_Func,
-                             SyncmerType syncmer_functor, int lcmer_l) {
+    // Record traits. The worker loop only needs the packed 4-bit sequence and
+    // its base count, so each input path keeps its own record type and the BAM
+    // path stays copy-free.
+    struct bam_record_ops {
+        using record = bam1_t;
+        static record *create() { return bam_init1(); }
+        static void destroy(record *r) { bam_destroy1(r); }
+        static const uint8_t *seq(const record *r) { return bam_get_seq(r); }
+        static size_t len(const record *r) {
+            return static_cast<size_t>(r->core.l_qseq);
+        }
+    };
+    struct fastx_record_ops {
+        using record = seq_record;
+        static record *create() { return seq_record_init(); }
+        static void destroy(record *r) { seq_record_destroy(r); }
+        static const uint8_t *seq(const record *r) { return r->nibbles; }
+        static size_t len(const record *r) { return r->len; }
+    };
+
+    template <class Ops>
+    static auto process_data(int thread_id, int lcp_level,
+                             queue_of<typename Ops::record> &data_queue,
+                             queue_of<typename Ops::record> &recycle_queue,
+                             dbg_index &dbgi, std::atomic<bool> &done,
+                             int &processed_read_count, int &all_reads,
+                             auto Process_Func, SyncmerType syncmer_functor,
+                             int lcmer_l) {
         uint64_t lcmer_index = 0;
-        bam1_t *data_p = NULL;
+        typename Ops::record *data_p = NULL;
         lps str = {0, 0, 0, 0};
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
         while (true) {
             if (!data_queue.wait_dequeue_timed(data_p, WAIT_QUEUE_TIMEOUT)) {
-                // if (!data_queue.try_dequeue(data_p)) {
                 if (done.load()) {
                     break;
                 }
-                // std::this_thread::sleep_for(std::chrono::nanoseconds(100));
                 continue;
             }
             all_reads++;
             lr.clear();
-            parse_cores_from_bam_record(bam_get_seq(data_p),
-                                        data_p->core.l_qseq, lcp_level, &str,
-                                        syncmer_functor, chs, lr, pos_buf);
+            parse_cores_from_bam_record(Ops::seq(data_p), Ops::len(data_p),
+                                        lcp_level, &str, syncmer_functor, chs,
+                                        lr, pos_buf);
             // Skip reads with too few cores; the record is recycled regardless.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
                 Process_Func(lr, dbgi, thread_id, lcmer_index, lcmer_l);
             }
             if (!recycle_queue.try_enqueue(data_p)) {
-                bam_destroy1(data_p);
+                Ops::destroy(data_p);
                 data_p = NULL;
             }
         }
         free_lps(&str);
     }
 
-    [[nodiscard]] auto generate_data(const std::string &input, dqt &data_queue,
-                                     dqt &recycle_queue, int threads) {
-        samFile *fp = sam_open(input.c_str(), "r");
+    // Generic producer: pulls a recycled record (or allocates one), lets
+    // `fill` populate it, and hands it to the workers.
+    template <class Ops, class Fill>
+    [[nodiscard]] static bool pump_records(
+        queue_of<typename Ops::record> &data_queue,
+        queue_of<typename Ops::record> &recycle_queue, Fill &&fill) {
+        typename Ops::record *rec = nullptr;
+        while (true) {
+            if (rec == nullptr && !recycle_queue.try_dequeue(rec)) {
+                rec = Ops::create();
+            }
+            if (!fill(rec)) {
+                Ops::destroy(rec);
+                return true;
+            }
+            while (!data_queue.try_enqueue(rec)) {
+                std::this_thread::sleep_for(std::chrono::nanoseconds(10));
+            }
+            rec = nullptr;
+        }
+    }
 
+    [[nodiscard]] static bool read_bam(const stage_input &input,
+                                       bam_queue &data_queue,
+                                       bam_queue &recycle_queue, int threads) {
+        samFile *fp = sam_open(input.first.c_str(), "r");
         if (!fp) {
-            std::cerr << "Error: Could not open " << input << std::endl;
+            std::cerr << "Error: Could not open " << input.first << std::endl;
             return false;
         }
         hts_set_threads(fp, threads);
-
         bam_hdr_t *hdr = sam_hdr_read(fp);
-        bam1_t *rec = nullptr;
-        while (true) {
-            // Try to get a recycled record object
-            if (rec == nullptr && !recycle_queue.try_dequeue(rec)) {
-                // If the recycle queue is empty, allocate a new one as a
-                // fallback
-                rec = bam_init1();
-            }
-
-            if (sam_read1(fp, hdr, rec) >= 0) {
-                while (!data_queue.try_enqueue(rec)) {
-                    std::this_thread::sleep_for(std::chrono::nanoseconds(10));
-                }
-                rec = nullptr;
-            } else {
-                // End of file or error. Destroy the unused record and exit.
-                bam_destroy1(rec);
-                break;
-            }
-        }
+        const bool ok = pump_records<bam_record_ops>(
+            data_queue, recycle_queue,
+            [&](bam1_t *rec) { return sam_read1(fp, hdr, rec) >= 0; });
         bam_hdr_destroy(hdr);
         sam_close(fp);
-        // if (pool.pool) {
-        //     hts_tpool_destroy(pool.pool);
-        // }
-        return true;
+        return ok;
     }
 
-    // Populates the caller-owned dbgi (storage lives in run_assembly).
-    std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
-        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+    // Native FASTA/FASTQ path: no bam1_t rebuild, no quality array, bases are
+    // packed into the record's nibble buffer during the block scan.
+    [[nodiscard]] static bool read_fastx(const stage_input &input,
+                                         fastx_queue &data_queue,
+                                         fastx_queue &recycle_queue,
+                                         int threads) {
+        fastx_reader reader;
+        if (!reader.open(input.first, input.second, threads)) {
+            std::cerr << "Error: Could not open " << input.first << std::endl;
+            return false;
+        }
+        const bool ok = pump_records<fastx_record_ops>(
+            data_queue, recycle_queue,
+            [&](seq_record *rec) { return reader.next(*rec); });
+        if (reader.failed()) {
+            std::cerr << "Error: malformed FASTA/FASTQ input " << input.first
+                      << std::endl;
+            return false;
+        }
+        return ok;
+    }
+
+    template <class Ops>
+    static void drain_and_destroy(queue_of<typename Ops::record> &q) {
+        typename Ops::record *rec = nullptr;
+        while (q.try_dequeue(rec)) {
+            Ops::destroy(rec);
+        }
+    }
+
+    // One worker pool over one group of same-format inputs. Returns false if
+    // any reader failed. Read counts are accumulated into the caller's sums.
+    template <class Ops, class Reader>
+    bool run_stage(const gtl::vector<stage_input> &stage_inputs, Reader reader,
+                   dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
+                   u64 &all_sum) {
+        using queue_t = queue_of<typename Ops::record>;
+        queue_t data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
+        queue_t recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
         std::atomic<bool> done{false};
 
         gtl::vector<std::thread> workers;
-
         gtl::vector<int> valid_read_counts(threads.work, 0);
         gtl::vector<int> all_read_counts(threads.work, 0);
 
         for (int tid = 1; tid <= threads.work; ++tid) {
             workers.emplace_back([&, tid]() {
-                process_data(tid, lcp_level, data_queue, recycle_queue, dbgi,
-                             done, valid_read_counts[tid - 1],
-                             all_read_counts[tid - 1], process_cores<DefaultBF>,
-                             syncmer_functor, dbg_lcmer_l);
+                process_data<Ops>(tid, lcp_level, data_queue, recycle_queue,
+                                  dbgi, done, valid_read_counts[tid - 1],
+                                  all_read_counts[tid - 1], Process_Func,
+                                  syncmer_functor, dbg_lcmer_l);
             });
         }
 
         std::atomic<bool> read_failed{false};
         if (parallel_file_reading) {
             gtl::vector<std::thread> readers;
-            readers.reserve(inputs.size());
-            for (const auto &input : inputs) {
+            readers.reserve(stage_inputs.size());
+            for (const auto &input : stage_inputs) {
                 readers.emplace_back([&, input]() {
-                    if (!generate_data(input, std::ref(data_queue),
-                                       std::ref(recycle_queue), threads.io)) {
-                        fprintf(stderr, "Failed to read from input %s\n", input.c_str());
+                    if (!reader(input, data_queue, recycle_queue, threads.io)) {
+                        fprintf(stderr, "Failed to read from input %s\n",
+                                input.first.c_str());
                         read_failed.store(true);
                     }
                 });
             }
-            for (auto &reader : readers) {
-                reader.join();
+            for (auto &r : readers) {
+                r.join();
             }
         } else {
-            for (const auto &input : inputs) {
-                if (!generate_data(input, std::ref(data_queue),
-                                   std::ref(recycle_queue), threads.io)) {
-                    fprintf(stderr, "Failed to read from input %s\n", input.c_str());
+            for (const auto &input : stage_inputs) {
+                if (!reader(input, data_queue, recycle_queue, threads.io)) {
+                    fprintf(stderr, "Failed to read from input %s\n",
+                            input.first.c_str());
                     read_failed.store(true);
                     break;
                 }
             }
-        }
-        if (read_failed.load()) {
-            done.store(true);
-            for (auto &worker : workers) {
-                worker.join();
-            }
-            return std::unexpected(
-                "Error in reading data for DBG construction.");
         }
 
         done.store(true);
         for (auto &worker : workers) {
             worker.join();
         }
+        drain_and_destroy<Ops>(data_queue);
+        drain_and_destroy<Ops>(recycle_queue);
 
+        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
+            valid_sum += static_cast<u64>(valid_read_counts[i]);
+            all_sum += static_cast<u64>(all_read_counts[i]);
+        }
+        return !read_failed.load();
+    }
+
+    // Runs `Process_Func` over every input, routing each file to the htslib
+    // reader or the native FASTX reader according to its detected format.
+    bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
+                         u64 &all_sum) {
+        gtl::vector<stage_input> bam_inputs;
+        gtl::vector<stage_input> fastx_inputs;
+        for (const auto &input : inputs) {
+            switch (detect_input_format(input)) {
+                case input_format::htslib:
+                    bam_inputs.emplace_back(input, false);
+                    break;
+                case input_format::fastx_plain:
+                    fastx_inputs.emplace_back(input, false);
+                    break;
+                case input_format::fastx_compressed:
+                    fastx_inputs.emplace_back(input, true);
+                    break;
+                case input_format::invalid:
+                    fprintf(stderr, "Error: cannot open input %s\n",
+                            input.c_str());
+                    return false;
+            }
+        }
+        bool ok = true;
+        if (!bam_inputs.empty()) {
+            ok = run_stage<bam_record_ops>(bam_inputs, read_bam, dbgi,
+                                           Process_Func, valid_sum, all_sum);
+        }
+        if (ok && !fastx_inputs.empty()) {
+            ok = run_stage<fastx_record_ops>(fastx_inputs, read_fastx, dbgi,
+                                             Process_Func, valid_sum, all_sum);
+        }
+        return ok;
+    }
+
+    // Populates the caller-owned dbgi (storage lives in run_assembly).
+    std::expected<void, std::string> construct_dbg(dbg_index &dbgi) {
         u64 valid_sum = 0;
         u64 all_sum = 0;
-        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
-            valid_sum += valid_read_counts[i];
-            all_sum += all_read_counts[i];
+        if (!run_over_inputs(dbgi, process_cores<DefaultBF>, valid_sum,
+                             all_sum)) {
+            return std::unexpected(
+                "Error in reading data for DBG construction.");
         }
         fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
                 valid_sum, all_sum);
@@ -417,68 +516,15 @@ struct assembler {
     }
 
     auto convert2basespace(dbg_index &dbgi) -> int {
-        dqt data_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        dqt recycle_queue{static_cast<size_t>(threads.work) * 1024, 1, 1};
-        std::atomic<bool> done{false};
-
-        gtl::vector<std::thread> workers;
-        gtl::vector<int> valid_read_counts(threads.work, 0);
-        gtl::vector<int> all_read_counts(threads.work, 0);
-
-        for (int tid = 1; tid <= threads.work; ++tid) {
-            workers.emplace_back([&, tid]() {
-                process_data(
-                    tid, lcp_level, data_queue, recycle_queue, dbgi, done,
-                    valid_read_counts[tid - 1], all_read_counts[tid - 1],
-                    process_cores_for_basespace, syncmer_functor, dbg_lcmer_l);
-            });
-        }
-        std::atomic<bool> read_failed{false};
-        if (parallel_file_reading) {
-            gtl::vector<std::thread> readers;
-            readers.reserve(inputs.size());
-            for (const auto &input : inputs) {
-                readers.emplace_back([&, input]() {
-                    if (!generate_data(input, std::ref(data_queue),
-                                       std::ref(recycle_queue), threads.io)) {
-                        read_failed.store(true);
-                    }
-                });
-            }
-            for (auto &reader : readers) {
-                reader.join();
-            }
-        } else {
-            for (const auto &input : inputs) {
-                if (!generate_data(input, std::ref(data_queue),
-                                   std::ref(recycle_queue), threads.io)) {
-                    read_failed.store(true);
-                    break;
-                }
-            }
-        }
-        if (read_failed.load()) {
-            done.store(true);
-            for (auto &worker : workers) {
-                worker.join();
-            }
+        u64 valid_sum = 0;
+        u64 all_sum = 0;
+        if (!run_over_inputs(dbgi, process_cores_for_basespace, valid_sum,
+                             all_sum)) {
             fprintf(stderr, "Error in reading data for basespace conversion\n");
             return -1;
         }
-
-        done.store(true);
-        for (auto &worker : workers) {
-            worker.join();
-        }
-
-        int valid_sum = 0;
-        int all_sum = 0;
-        for (size_t i = 0; i < valid_read_counts.size(); ++i) {
-            valid_sum += valid_read_counts[i];
-            all_sum += all_read_counts[i];
-        }
-
-        fprintf(stderr, "%d processed\n%d total reads\n", valid_sum, all_sum);
+        fprintf(stderr, "%" PRIu64 " processed\n%" PRIu64 " total reads\n",
+                valid_sum, all_sum);
         return 0;
     }
 
@@ -962,29 +1008,6 @@ struct assembler {
         return dropped;
     }
 };
-
-// TODO do not use extensions to identify input type.
-input_type identify_input(const std::string &input) {
-    std::string_view sv(input);
-    if (sv.ends_with(".bam")) {
-        return input_type::BAM;
-    } else if (sv.ends_with(".sam")) {
-        return input_type::SAM;
-    } else if (sv.ends_with(".fastq") || sv.ends_with(".fq") ||
-               sv.ends_with(".fasta") || sv.ends_with(".fa") ||
-               sv.ends_with(".fna")) {
-        return input_type::FASTX;
-    } else if (sv.ends_with(".fastq.gz") || sv.ends_with(".fq.gz") ||
-               sv.ends_with(".fasta.gz") || sv.ends_with(".fa.gz") ||
-               sv.ends_with(".fna.gz")) {
-        return input_type::FASTXGZ;
-    } else if (sv.ends_with(".fastq.bz2") || sv.ends_with(".fq.bz2") ||
-               sv.ends_with(".fasta.bz2") || sv.ends_with(".fa.bz2") ||
-               sv.ends_with(".fna.bz2")) {
-        return input_type::FASTXBZ2;
-    }
-    return input_type::UNKNOWN;
-}
 
 static bool validate_path(const std::string &path) {
     auto slash = path.rfind('/');
