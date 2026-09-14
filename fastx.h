@@ -25,10 +25,10 @@
 // line, a full bam1_t rebuild, and an l_qseq-byte quality array the assembler
 // never looks at. The assembler only needs the packed 4-bit sequence and its
 // length, so this reader scans blocks with memchr and packs bases straight into
-// the record buffer in the *same* bam_get_seq nibble layout (A=1, C=2, G=4,
-// T=8, other=15, high nibble first). Everything downstream -- onehot_to_rle(),
-// CrumbledSubSeq64's from_nibbles ctor -- is therefore byte-identical to the
-// BAM path.
+// the record buffer in the *same* nt16 nibble layout bam_get_seq() uses (A=1,
+// C=2, G=4, T=8, other=15, high nibble first). Everything downstream --
+// onehot_to_rle(), CrumbledSubSeq64's from_nibbles ctor -- is therefore
+// byte-identical to the htslib path.
 
 #ifndef FASTX_BLOCK_SIZE
 #define FASTX_BLOCK_SIZE (1u << 20)
@@ -187,7 +187,7 @@ class fastx_reader {
         uint32_t len = rec.len;
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
         // (c >> 1) & 3 maps A/C/T/G (either case) to 0/1/2/3; the table turns
-        // that into the BAM one-hot nibble.
+        // that into the nt16 one-hot nibble.
         static const uint8_t code2nib[16] = {1, 2, 8, 4, 0, 0, 0, 0,
                                              0, 0, 0, 0, 0, 0, 0, 0};
         const uint8x16_t lut = vld1q_u8(code2nib);
@@ -376,12 +376,31 @@ public:
                     break;
                 }
                 case state::qual: {
-                    // Quality is counted, never scanned for delimiters, so a
-                    // quality line starting with '@' cannot be mistaken for a
-                    // header.
+                    // Quality is never used; only its length matters (it must
+                    // equal the sequence length, which is what makes a quality
+                    // line starting with '@' unambiguous). Skip it in spans:
+                    // one memchr finds the next newline, everything before it
+                    // counts. Single-line quality is one memchr over len
+                    // bytes; multi-line quality still works. '\r' never counts.
                     while (pos_ < end_ && qual_got_ < rec.len) {
-                        const uint8_t c = base[pos_++];
-                        if (c != '\n' && c != '\r') ++qual_got_;
+                        const size_t need = rec.len - qual_got_;
+                        const size_t span =
+                            end_ - pos_ < need ? end_ - pos_ : need;
+                        const uint8_t *p = base + pos_;
+                        const uint8_t *nl =
+                            static_cast<const uint8_t *>(memchr(p, '\n', span));
+                        if (!nl) {
+                            // A '\r' ending the span is a CRLF split across
+                            // blocks (or the need-cut landing on one).
+                            qual_got_ += static_cast<uint32_t>(
+                                p[span - 1] == '\r' ? span - 1 : span);
+                            pos_ += span;
+                            continue;
+                        }
+                        size_t n = static_cast<size_t>(nl - p);
+                        if (n > 0 && nl[-1] == '\r') --n;
+                        qual_got_ += static_cast<uint32_t>(n);
+                        pos_ = static_cast<size_t>(nl - base) + 1;
                     }
                     if (qual_got_ == rec.len) {
                         st_ = state::start;

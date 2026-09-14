@@ -96,7 +96,7 @@ inline int run_sam_read_testing(const std::string &input, int threads, int lcp_l
             return [&, lcp_level](bam1_t *bamdata, lps *str, charsi &chs, pos_scratch &pos_buf) -> int {
                 lcp_read lr;
                 lr.clear();
-                parse_cores_from_bam_record(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr, pos_buf);
+                parse_cores_from_nibbles(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr, pos_buf);
                 // if (lr.cores.size() < LCMER_L + 2) {
                 //     return 0;
                 // }

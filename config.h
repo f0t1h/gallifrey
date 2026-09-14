@@ -1,10 +1,6 @@
 #ifndef _LASM_CONFIG_H_
 #define _LASM_CONFIG_H_
 
-#ifndef BAMREAD_CHUNK_SIZE
-#define BAMREAD_CHUNK_SIZE 256ULL
-#endif
-
 #ifndef WAIT_QUEUE_TIMEOUT_MS
 #define WAIT_QUEUE_TIMEOUT_MS 2
 #endif

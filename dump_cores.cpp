@@ -62,7 +62,7 @@ static int run_dump_cores(const std::string &input_path,
 
     while (reader.next(rec)) {
         lcp_read lr;
-        parse_cores_from_bam_record(rec.nibbles, rec.len, lcp_level, &str,
+        parse_cores_from_nibbles(rec.nibbles, rec.len, lcp_level, &str,
                                     syncmer_functor, chs, lr, pos_buf);
 
         for (size_t i = 0; i < lr.cores.size(); ++i) {

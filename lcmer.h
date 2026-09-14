@@ -441,7 +441,7 @@ struct KmerViewOnCrumbs64 {
         int_type it = move_get_rle(data_words, skip_first_n, cap);
         // k-1 more insertions (k total incl. the initial one), so the first
         // window checked by the caller is runs[0..k-1] — the same window
-        // parse1_bam_syncmers checks first.
+        // parse1_rle_syncmers checks first.
         for (i = 0; i < k - 1 && it < cap; i++) {
             it = move_get_rle(data_words, it, cap);
         }
@@ -551,9 +551,6 @@ struct KmerViewOnBytes {
     constexpr int_type get() const noexcept { return value; }
 };
 
-void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
-                   uint64_t si, uint64_t ei);
-
 template <typename _T, int WIDTH = 2>
 void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
     cr->start = si;
@@ -648,8 +645,9 @@ inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
     return out;
 }
 
-// Fused BAM one-hot decode + RLE compaction in a single pass.
-// Input: raw BAM 4-bit encoded data (2 bases per byte), length in bases.
+// Fused nt16 one-hot decode + RLE compaction in a single pass.
+// Input: packed nt16 nibbles (2 bases per byte, as bam_get_seq() or the FASTX
+// reader produce), length in bases.
 // Output: rle_data/rle_pos filled with RLE-compacted 2-bit bases.
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
@@ -660,7 +658,7 @@ inline int64_t rle_compact(const uint8_t *data, int64_t len, uint8_t *rle_data,
 // uint64 of up to 8 packed bytes each; unpack index (>>4) and value (&0xF),
 // decode one-hot→2-bit, store via NEON.
 static inline int compact16_emit(
-    uint8x16_t data_vec,             // 16 one-hot bytes (BAM nibble values)
+    uint8x16_t data_vec,             // 16 one-hot bytes (nt16 nibble values)
     uint8x16_t neq_vec,              // 0xFF where changed, 0x00 where same
     const uint8x16_t &idx_template,  // precomputed (i<<4) for i=0..15
     const uint8x16_t &decode_tbl,    // one-hot→2-bit decode table (16 entries)
@@ -752,7 +750,7 @@ static inline int compact16_emit(
 // SSE version: movemask to get a bitmask of changed lanes, then a scalar
 // extract loop with table-lookup decode.
 static inline int compact16_emit_sse(
-    __m128i data_vec,           // 16 one-hot bytes (BAM nibble values)
+    __m128i data_vec,           // 16 one-hot bytes (nt16 nibble values)
     __m128i neq_vec,            // 0xFF where changed, 0x00 where same
     const __m128i &decode_tbl,  // one-hot→2-bit decode table (16 entries)
     uint8_t *rle_data,          // output: decoded 2-bit values
@@ -813,7 +811,7 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
     // Each iteration processes 16 input bytes → 32 bases.
     for (; byte_idx + 16 <= len / 2; byte_idx += 16) {
-        // --- Phase 1: Unpack BAM nibbles to one-hot bytes (no decode) ---
+        // --- Phase 1: Unpack nt16 nibbles to one-hot bytes (no decode) ---
         uint8x16_t v = vld1q_u8(data + byte_idx);
         uint8x16_t hi = vshrq_n_u8(v, 4);      // high nibbles as bytes
         uint8x16_t lo = vandq_u8(v, lo_mask);  // low nibbles as bytes
@@ -897,7 +895,7 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
 
     // Each iteration processes 16 input bytes → 32 bases.
     for (; byte_idx + 16 <= len / 2; byte_idx += 16) {
-        // Phase 1: Unpack BAM nibbles to one-hot bytes
+        // Phase 1: Unpack nt16 nibbles to one-hot bytes
         __m128i v =
             _mm_loadu_si128(reinterpret_cast<const __m128i *>(data + byte_idx));
         __m128i hi = _mm_and_si128(_mm_srli_epi16(v, 4), lo_mask);
@@ -1007,7 +1005,7 @@ inline int64_t onehot_to_rle(const uint8_t *data, int64_t len,
     return out;
 }
 
-inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
+inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
                                     const uint32_t *rle_pos, int64_t rle_len,
                                     int64_t seq_len, struct lps *str,
                                     const auto &syncmer_functor) {
@@ -1019,7 +1017,7 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
         struct core *p =
             (struct core *)realloc(str->cores, newcap * sizeof(struct core));
         if (p == nullptr) {
-            fprintf(stderr, "parse1_bam_syncmers: out of memory\n");
+            fprintf(stderr, "parse1_rle_syncmers: out of memory\n");
             abort();
         }
         str->cores = p;
@@ -1052,14 +1050,14 @@ inline uint64_t parse1_bam_syncmers(const uint8_t *rle_data,
     return core_index;
 }
 
-inline uint64_t parse1_bam_syncmers(const uint8_t *data, int64_t len,
+inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
                                     struct lps *str,
                                     const auto &syncmer_functor,
                                     charsi &rle_buf, pos_scratch &pos_buf) {
     rle_buf.require(len);
     pos_buf.require(len);
     int64_t rle_len = rle_compact(data, len, rle_buf.data, pos_buf.data);
-    return parse1_bam_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
+    return parse1_rle_syncmers(rle_buf.data, pos_buf.data, rle_len, len, str,
                                syncmer_functor);
 }
 inline uint64_t parse1_CrumbledSubSeqs_syncmers(
@@ -1070,7 +1068,7 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         return 0;
     }
     // Materialize the RLE stream of the concatenated fragments in original
-    // (l_so_far) coordinates, then window it with the same code as the BAM
+    // (l_so_far) coordinates, then window it with the same code as the read
     // path. A run is NOT restarted when the next fragment begins with the
     // run's base.
     size_t total_len = 0;
@@ -1095,13 +1093,11 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         }
         l_so_far += s.len;
     }
-    return parse1_bam_syncmers(rle_data.data(), rle_pos.data(),
+    return parse1_rle_syncmers(rle_data.data(), rle_pos.data(),
                                static_cast<int64_t>(rle_data.size()),
                                static_cast<int64_t>(total_len), str,
                                syncmer_functor);
 }
-
-uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores);
 
 inline void prepare_lps(lps *lps_ptr, size_t len) {
     lps_ptr->level = 1;
@@ -1127,14 +1123,6 @@ inline void prepare_lps(lps *lps_ptr, size_t len) {
         }
     }
 }
-inline void init_lps_bam(lps *lps_ptr, const uint8_t *data, size_t len,
-                         const auto &syncmer_functor, charsi &rle_buf,
-                         pos_scratch &pos_buf) {
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size = parse1_bam_syncmers(data, len, lps_ptr, syncmer_functor,
-                                        rle_buf, pos_buf);
-}
-
 inline void init_lps_crumbled(lps *lps_ptr,
                               const gtl::vector<SequenceContainerType> &sseqs,
                               const auto &syncmer_functor) {
@@ -1149,7 +1137,7 @@ inline void init_lps_crumbled(lps *lps_ptr,
     assert(lps_ptr->size < lps_ptr->capacity);
 }
 
-inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
+inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
                                         int lcp_level, lps *str,
                                         const auto &syncmer_functor,
                                         charsi &chs, lcp_read &lr,
@@ -1160,114 +1148,13 @@ inline void parse_cores_from_bam_record(const uint8_t *data, size_t len,
     prepare_lps(str, len);
     if (reversed) {
         onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
-        str->size = parse1_bam_syncmers(chs.data, len, str, syncmer_functor,
+        str->size = parse1_2bit_syncmers(chs.data, len, str, syncmer_functor,
                                         chs, pos_buf);
     } else {
         int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
-        str->size = parse1_bam_syncmers(chs.data, pos_buf.data, rle_len, len,
+        str->size = parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len,
                                         str, syncmer_functor);
     }
-    lps_deepen(str, lcp_level);
-
-    for (int i = 0; i < str->size; ++i) {
-        lr.cores.emplace_back(str->cores[i].label);
-        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-    }
-    lr.data = data;
-}
-
-template <int lanes = 4>
-inline std::array<std::pair<uint8_t *, uint8_t *>, lanes> scalar_rlc(charsi &c1,
-                                                                     charsi &c2,
-                                                                     int len) {
-    int lane_len = len / 4;
-
-    uint8_t *rptrs[lanes + 1] = {
-        // TODO alignments
-        c1.data,
-        c1.data + lane_len,
-        c1.data + 2 * lane_len,
-        c1.data + 3 * lane_len,
-        c1.data + 4 * lane_len,
-    };
-    uint8_t *wptrs[lanes + 1] = {
-        c2.data,
-        c2.data + lane_len,
-        c2.data + 2 * lane_len,
-        c2.data + 3 * lane_len,
-        c2.data + 4 * lane_len,
-    };
-    uint8_t *endings[lanes] = {0, 0, 0, 0};
-    for (int l = 0; l < lanes; ++l) {
-        uint8_t *_from = rptrs[l];
-        uint8_t *_to = rptrs[l + 1];
-        uint8_t *writ = wptrs[l];
-        *writ = *_from;
-        for (uint8_t *it = _from + 1; it < _to; ++it) {
-            if (*it != *writ) {
-                ++writ;
-                *writ = *it;
-            }
-        }
-        endings[l] = writ;
-    }
-    return {
-        {wptrs[0], endings[0]},
-        {wptrs[1], endings[1]},
-        {wptrs[2], endings[2]},
-        {wptrs[3], endings[3]},
-    };
-}
-template <int lanes = 4>
-inline uint64_t parse1_bam_syncmer_with_lanes(
-    std::array<std::pair<uint8_t *, uint8_t *>, lanes> data, int64_t len,
-    struct lps *str, const auto &syncmer_functor) {
-    const auto k = syncmer_functor.k();
-
-    if (str->capacity < len * CONSTANT_FACTOR) {
-        str->capacity = 2 * len * CONSTANT_FACTOR;
-        str->cores = (struct core *)realloc(
-            str->cores, (str->capacity) * sizeof(struct core));
-    }
-    auto *cores = str->cores;
-    for (int l = 0; l < lanes; ++l) {
-        int core_index = 0;
-        KmerViewOnInts<uint64_t, 2> kmer_view{k};
-        int64_t it1 = [&data, len, l, k, &kmer_view]() {
-            if (l == 0) {
-                return kmer_view.fill(data[l].first,
-                                      len);  // Fill from beginning
-            } else {
-                return kmer_view.fill(data[l - 1].second - k + 1,
-                                      len);  // Fill from previous ending-K
-            }
-        }();
-        const uint8_t *ending = data[l].second;
-        for (uint8_t *it = data[l].first + it1; it != ending; ++it) {
-            const auto kmer = kmer_view.get();
-            if (syncmer_functor(kmer)) {
-                init_core_kmer<uint32_t>(&(cores[core_index]), kmer, it1,
-                                         it1 + k,
-                                         k);  // TODO fix si, ei
-                core_index++;
-            }
-            it1 = kmer_view.move_get(data, it1, len);
-        }
-    }
-    return 0;
-}
-inline void parse_cores_from_bam_record2(const uint8_t *data, size_t len,
-                                         int lcp_level, lps *str,
-                                         const auto &syncmer_functor,
-                                         charsi &chs, charsi &chs2,
-                                         lcp_read &lr) {
-    chs.require(len);
-    chs2.require(len);
-    onehotto2bitDNA_bivec_chs(data, len, chs);
-    std::array<std::pair<uint8_t *, uint8_t *>, 4> lane_boundary =
-        scalar_rlc<4>(chs, chs2, len);
-    prepare_lps(str, len);
-    parse1_bam_syncmer_with_lanes(lane_boundary, len, str, syncmer_functor);
     lps_deepen(str, lcp_level);
 
     for (int i = 0; i < str->size; ++i) {

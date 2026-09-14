@@ -53,7 +53,7 @@ struct assembler {
 
     template <class Rec>
     using queue_of = moodycamel::BlockingConcurrentQueue<Rec *>;
-    using bam_queue = queue_of<bam1_t>;
+    using hts_queue = queue_of<bam1_t>;
     using fastx_queue = queue_of<seq_record>;
     // (path, is_compressed) -- the flag is only meaningful for FASTX inputs.
     using stage_input = std::pair<string, bool>;
@@ -272,10 +272,10 @@ struct assembler {
         return {8, threads - 8};
     }
 
-    // Record traits. The worker loop only needs the packed 4-bit sequence and
-    // its base count, so each input path keeps its own record type and the BAM
-    // path stays copy-free.
-    struct bam_record_ops {
+    // Record traits. The worker loop only needs the packed nt16 sequence and
+    // its base count, so each input path keeps its own record type and the
+    // htslib (BAM/CRAM/SAM) path stays copy-free.
+    struct hts_record_ops {
         using record = bam1_t;
         static record *create() { return bam_init1(); }
         static void destroy(record *r) { bam_destroy1(r); }
@@ -315,7 +315,7 @@ struct assembler {
             }
             all_reads++;
             lr.clear();
-            parse_cores_from_bam_record(Ops::seq(data_p), Ops::len(data_p),
+            parse_cores_from_nibbles(Ops::seq(data_p), Ops::len(data_p),
                                         lcp_level, &str, syncmer_functor, chs,
                                         lr, pos_buf);
             // Skip reads with too few cores; the record is recycled regardless.
@@ -353,9 +353,10 @@ struct assembler {
         }
     }
 
-    [[nodiscard]] static bool read_bam(const stage_input &input,
-                                       bam_queue &data_queue,
-                                       bam_queue &recycle_queue, int threads) {
+    // htslib path: BAM, CRAM, SAM.
+    [[nodiscard]] static bool read_hts(const stage_input &input,
+                                       hts_queue &data_queue,
+                                       hts_queue &recycle_queue, int threads) {
         samFile *fp = sam_open(input.first.c_str(), "r");
         if (!fp) {
             std::cerr << "Error: Could not open " << input.first << std::endl;
@@ -363,7 +364,7 @@ struct assembler {
         }
         hts_set_threads(fp, threads);
         bam_hdr_t *hdr = sam_hdr_read(fp);
-        const bool ok = pump_records<bam_record_ops>(
+        const bool ok = pump_records<hts_record_ops>(
             data_queue, recycle_queue,
             [&](bam1_t *rec) { return sam_read1(fp, hdr, rec) >= 0; });
         bam_hdr_destroy(hdr);
@@ -470,12 +471,12 @@ struct assembler {
     // reader or the native FASTX reader according to its detected format.
     bool run_over_inputs(dbg_index &dbgi, auto Process_Func, u64 &valid_sum,
                          u64 &all_sum) {
-        gtl::vector<stage_input> bam_inputs;
+        gtl::vector<stage_input> hts_inputs;
         gtl::vector<stage_input> fastx_inputs;
         for (const auto &input : inputs) {
             switch (detect_input_format(input)) {
                 case input_format::htslib:
-                    bam_inputs.emplace_back(input, false);
+                    hts_inputs.emplace_back(input, false);
                     break;
                 case input_format::fastx_plain:
                     fastx_inputs.emplace_back(input, false);
@@ -490,8 +491,8 @@ struct assembler {
             }
         }
         bool ok = true;
-        if (!bam_inputs.empty()) {
-            ok = run_stage<bam_record_ops>(bam_inputs, read_bam, dbgi,
+        if (!hts_inputs.empty()) {
+            ok = run_stage<hts_record_ops>(hts_inputs, read_hts, dbgi,
                                            Process_Func, valid_sum, all_sum);
         }
         if (ok && !fastx_inputs.empty()) {

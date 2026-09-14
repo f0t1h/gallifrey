@@ -13,54 +13,6 @@
 #include "fastx.h"
 #include "syncmer.h"
 
-void init_core1bam(struct core *cr, const uint8_t *data, uint64_t distance,
-                   uint64_t si, uint64_t ei) {
-    cr->start = si;
-    cr->end = ei;
-    cr->label = 0;
-    cr->label |= ((distance - 2) << 12);
-    cr->label |= (bam_seqi(data, si) << 8);
-    cr->label |= (bam_seqi(data, si + distance - 2) << 4);
-    cr->label |= (bam_seqi(data, si + distance - 1));
-    cr->bit_rep = lcp_bit_type{0x8000000000000000, cr->label};
-    cr->bit_size = 2 * distance;
-}
-
-
-uint64_t parse1_bam_lmax(const uint8_t *data, int64_t len, struct core *cores) {
-    int64_t it1 = 0;
-    int64_t it2 = len;
-
-    int core_index = 0;
-    // int64_t last_invalid_char_index = -1;
-
-    // find lcp cores
-    for (; it1 + 2 < len; it1++) {
-        if (bam_seqi(data, it1) == bam_seqi(data, it1 + 1)) {
-            continue;
-        }
-        if (0 == it1) {
-            continue;
-        }
-
-        // check for LMAX
-        if (it1 + 3 < len && bam_seqi(data, it1) < bam_seqi(data, (it1 + 1)) &&
-            bam_seqi(data, (it1 + 1)) > bam_seqi(data, (it1 + 2)) &&
-            bam_seqi(data, (it1 - 1)) <= bam_seqi(data, (it1)) &&
-            bam_seqi(data, (it1 + 2)) >= bam_seqi(data, (it1 + 3))) {
-
-            // create LMAX core
-            it2 = it1 + 3;
-            init_core1bam(&(cores[core_index]), data, it2 - it1, it1, it2);
-            core_index++;
-
-            continue;
-        }
-        // cout << "None\n";
-    }
-    // cout << "CORESSS" << it1 << "\t" << it2 << "\n";
-    return core_index;
-}
 int onehotto2bitDNA2(const uint8_t *data, char *ret) {
     static char table[] = {'A', 'C', 'G', 'T'};
     for (size_t i = 0;; ++i) {
@@ -397,7 +349,7 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         pos_scratch pos_buf;
         lcp_read lr;
         constexpr int LCP_LEVEL = 3;
-        parse_cores_from_bam_record(bam_get_seq(rec), rec->core.l_qseq,
+        parse_cores_from_nibbles(bam_get_seq(rec), rec->core.l_qseq,
                                     LCP_LEVEL, &str1, fnctr, chs, lr, pos_buf);
         gtl::vector<CrumbledSubSeq64> ss;
         ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
@@ -405,7 +357,7 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
 
         lcp_read lr2;
         init_lps_crumbled(&str2, ss, fnctr);
-        // Deepen to the same level as the BAM path (parse_cores_from_bam_record
+        // Deepen to the same level as the read path (parse_cores_from_nibbles
         // deepens internally); comparing different levels is meaningless.
         lps_deepen(&str2, LCP_LEVEL);
         for (int i = 0; i < str2.size; ++i) {
@@ -471,7 +423,7 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
     charsi chs;
     pos_scratch pos_buf;
     lcp_read lr;
-    parse_cores_from_bam_record(nib.data(), len, 1, &str1, fnctr, chs, lr,
+    parse_cores_from_nibbles(nib.data(), len, 1, &str1, fnctr, chs, lr,
                                 pos_buf);
 
     gtl::vector<CrumbledSubSeq64> ss;
@@ -715,6 +667,13 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
     const std::string qual(bases.size(), '@');
     write_file(fq, "@r1\n" + bases + "\n+\n" + qual + "\n@r2\n" + bases +
                        "\n+r2\n" + qual + "\n");
+    // Wrapped FASTQ with CRLF: every quality line starts with '@', and the
+    // quality span crosses many line breaks and block boundaries.
+    const std::string fq_crlf = dir + "lasm_fastx_test_crlf.fq";
+    write_file(fq_crlf, "@r1\r\n" + wrap(bases, 80, "\r\n") + "+\r\n" +
+                            wrap(qual, 80, "\r\n") + "@r2\r\n" +
+                            wrap(bases, 80, "\r\n") + "+\r\n" +
+                            wrap(qual, 80, "\r\n"));
 
     auto check_file = [&](const std::string &path, size_t block_size) {
         INFO("path=", path, " block=", block_size);
@@ -740,6 +699,7 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         check_file(fa, block);
         check_file(fa_crlf, block);
         check_file(fq, block);
+        check_file(fq_crlf, block);
     }
 
     SUBCASE("non-ACGT bases and mid-window whitespace decode as htslib does") {
@@ -787,10 +747,10 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         pos_scratch pos1, pos2;
         lcp_read lr_bam, lr_fastx;
         constexpr int LCP_LEVEL = 3;
-        parse_cores_from_bam_record(bam_seq, static_cast<size_t>(len),
+        parse_cores_from_nibbles(bam_seq, static_cast<size_t>(len),
                                     LCP_LEVEL, &str1, fnctr, chs1, lr_bam,
                                     pos1);
-        parse_cores_from_bam_record(sr.nibbles, sr.len, LCP_LEVEL, &str2, fnctr,
+        parse_cores_from_nibbles(sr.nibbles, sr.len, LCP_LEVEL, &str2, fnctr,
                                     chs2, lr_fastx, pos2);
         REQUIRE(lr_bam.cores.size() > 0);
         REQUIRE_EQ(lr_fastx.cores.size(), lr_bam.cores.size());
@@ -806,6 +766,7 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
     remove(fa.c_str());
     remove(fa_crlf.c_str());
     remove(fq.c_str());
+    remove(fq_crlf.c_str());
     bam_destroy1(rec);
     bam_hdr_destroy(hdr);
     sam_close(fp);
