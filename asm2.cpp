@@ -27,12 +27,12 @@
 #include "asm.h"
 #include "config.h"
 #include "ext/doctest.h"
+#include "fastx.h"
 #include "graph.h"
 #include "layout_graph.h"
 #include "lcmer.h"
-#include "fastx.h"
-#include "no_destructor.h"
 #include "lcptools/lcptools_ho.h"
+#include "no_destructor.h"
 #include "syncmer.h"
 
 using std::string;
@@ -316,8 +316,8 @@ struct assembler {
             all_reads++;
             lr.clear();
             parse_cores_from_nibbles(Ops::seq(data_p), Ops::len(data_p),
-                                        lcp_level, &str, syncmer_functor, chs,
-                                        lr, pos_buf);
+                                     lcp_level, &str, syncmer_functor, chs, lr,
+                                     pos_buf);
             // Skip reads with too few cores; the record is recycled regardless.
             if (lr.cores.size() >= static_cast<size_t>(lcmer_l + 2)) {
                 ++processed_read_count;
@@ -331,12 +331,14 @@ struct assembler {
         free_lps(&str);
     }
 
-    // Generic producer: pulls a recycled record (or allocates one), lets
-    // `fill` populate it, and hands it to the workers.
+    // Producer loop shared by every reader: takes a recycled record (or
+    // allocates one), lets `fill` populate it from the source, and enqueues it
+    // for the workers. Returns when `fill` reports end of input; whether that
+    // end was clean is the caller's to determine from its source.
     template <class Ops, class Fill>
-    [[nodiscard]] static bool pump_records(
-        queue_of<typename Ops::record> &data_queue,
-        queue_of<typename Ops::record> &recycle_queue, Fill &&fill) {
+    static void enqueue_records(queue_of<typename Ops::record> &data_queue,
+                                queue_of<typename Ops::record> &recycle_queue,
+                                Fill &&fill) {
         typename Ops::record *rec = nullptr;
         while (true) {
             if (rec == nullptr && !recycle_queue.try_dequeue(rec)) {
@@ -344,7 +346,7 @@ struct assembler {
             }
             if (!fill(rec)) {
                 Ops::destroy(rec);
-                return true;
+                return;
             }
             while (!data_queue.try_enqueue(rec)) {
                 std::this_thread::sleep_for(std::chrono::nanoseconds(10));
@@ -364,12 +366,28 @@ struct assembler {
         }
         hts_set_threads(fp, threads);
         bam_hdr_t *hdr = sam_hdr_read(fp);
-        const bool ok = pump_records<hts_record_ops>(
-            data_queue, recycle_queue,
-            [&](bam1_t *rec) { return sam_read1(fp, hdr, rec) >= 0; });
+        if (!hdr) {
+            std::cerr << "Error: Could not read header of " << input.first
+                      << std::endl;
+            sam_close(fp);
+            return false;
+        }
+        // sam_read1: >= 0 record, -1 clean EOF, < -1 truncated/corrupt input.
+        // A truncated file must fail the run, not silently assemble a subset.
+        int rc = 0;
+        enqueue_records<hts_record_ops>(data_queue, recycle_queue,
+                                        [&](bam1_t *rec) {
+                                            rc = sam_read1(fp, hdr, rec);
+                                            return rc >= 0;
+                                        });
         bam_hdr_destroy(hdr);
         sam_close(fp);
-        return ok;
+        if (rc < -1) {
+            std::cerr << "Error: truncated or corrupt input " << input.first
+                      << " (sam_read1 rc=" << rc << ")" << std::endl;
+            return false;
+        }
+        return true;
     }
 
     // Native FASTA/FASTQ path: no bam1_t rebuild, no quality array, bases are
@@ -383,15 +401,15 @@ struct assembler {
             std::cerr << "Error: Could not open " << input.first << std::endl;
             return false;
         }
-        const bool ok = pump_records<fastx_record_ops>(
+        enqueue_records<fastx_record_ops>(
             data_queue, recycle_queue,
             [&](seq_record *rec) { return reader.next(*rec); });
         if (reader.failed()) {
-            std::cerr << "Error: malformed FASTA/FASTQ input " << input.first
-                      << std::endl;
+            std::cerr << "Error: malformed or unreadable FASTA/FASTQ input "
+                      << input.first << std::endl;
             return false;
         }
-        return ok;
+        return true;
     }
 
     template <class Ops>

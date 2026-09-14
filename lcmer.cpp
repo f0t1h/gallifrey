@@ -6,11 +6,11 @@
 #include "asm.h"
 #include "ext/doctest.h"
 #include "ext/lcptools/lcptools_ho.h"
+#include "fastx.h"
 #include "gtl/phmap.hpp"
 #include "htslib/hts.h"
 #include "htslib/sam.h"
 #include "nibble2base.hpp"
-#include "fastx.h"
 #include "syncmer.h"
 
 int onehotto2bitDNA2(const uint8_t *data, char *ret) {
@@ -349,8 +349,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         pos_scratch pos_buf;
         lcp_read lr;
         constexpr int LCP_LEVEL = 3;
-        parse_cores_from_nibbles(bam_get_seq(rec), rec->core.l_qseq,
-                                    LCP_LEVEL, &str1, fnctr, chs, lr, pos_buf);
+        parse_cores_from_nibbles(bam_get_seq(rec), rec->core.l_qseq, LCP_LEVEL,
+                                 &str1, fnctr, chs, lr, pos_buf);
         gtl::vector<CrumbledSubSeq64> ss;
         ss.emplace_back(bam_get_seq(rec), 0, rec->core.l_qseq, 0,
                         CrumbledSubSeq64::from_nibbles{});
@@ -424,7 +424,7 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
     pos_scratch pos_buf;
     lcp_read lr;
     parse_cores_from_nibbles(nib.data(), len, 1, &str1, fnctr, chs, lr,
-                                pos_buf);
+                             pos_buf);
 
     gtl::vector<CrumbledSubSeq64> ss;
     ss.emplace_back(bases.c_str(), 0, bases.size(), 0,
@@ -650,7 +650,11 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         REQUIRE(wrote == content.size());
     };
 
-    const std::string dir = "/tmp/";
+    // Private scratch directory so concurrent test runs cannot collide.
+    char dir_template[] = "/tmp/lasm_fastx_test.XXXXXX";
+    [[maybe_unused]] const char *made = mkdtemp(dir_template);
+    REQUIRE(made != nullptr);
+    const std::string dir = std::string(dir_template) + "/";
     const std::string fa = dir + "lasm_fastx_test.fa";
     const std::string fa_crlf = dir + "lasm_fastx_test_crlf.fa";
     const std::string fq = dir + "lasm_fastx_test.fq";
@@ -695,7 +699,8 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
 
     // Block sizes far below a record length exercise every state transition
     // across a buffer boundary.
-    for (size_t block : {size_t(7), size_t(64), size_t(4096), size_t(1) << 20}) {
+    for (size_t block :
+         {size_t(7), size_t(64), size_t(4096), size_t(1) << 20}) {
         check_file(fa, block);
         check_file(fa_crlf, block);
         check_file(fq, block);
@@ -706,7 +711,10 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         // Exercises the scalar fallback inside the vectorized packer: N/IUPAC
         // codes and odd-length lines that push the packer off even offsets.
         const std::string dirty =
-            "ACGTacgtNNNNRYKM" "ACGTACGTACGTACGTA" "nnnACGT" "W";
+            "ACGTacgtNNNNRYKM"
+            "ACGTACGTACGTACGTA"
+            "nnnACGT"
+            "W";
         const std::string path = dir + "lasm_fastx_dirty.fa";
         write_file(path, ">d\n" + dirty.substr(0, 16) + "\n" +
                              dirty.substr(16, 17) + "\n" + dirty.substr(33) +
@@ -729,7 +737,8 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
 
     SUBCASE("core streams are identical") {
         using SYNCMER_HASHER = syncmer::MurMur;
-        using SyncmerType = syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
+        using SyncmerType =
+            syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
         syncmer_params spara;
         spara.k = 15;
         spara.density = 0.05;
@@ -747,11 +756,10 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         pos_scratch pos1, pos2;
         lcp_read lr_bam, lr_fastx;
         constexpr int LCP_LEVEL = 3;
-        parse_cores_from_nibbles(bam_seq, static_cast<size_t>(len),
-                                    LCP_LEVEL, &str1, fnctr, chs1, lr_bam,
-                                    pos1);
+        parse_cores_from_nibbles(bam_seq, static_cast<size_t>(len), LCP_LEVEL,
+                                 &str1, fnctr, chs1, lr_bam, pos1);
         parse_cores_from_nibbles(sr.nibbles, sr.len, LCP_LEVEL, &str2, fnctr,
-                                    chs2, lr_fastx, pos2);
+                                 chs2, lr_fastx, pos2);
         REQUIRE(lr_bam.cores.size() > 0);
         REQUIRE_EQ(lr_fastx.cores.size(), lr_bam.cores.size());
         CHECK_EQ(memcmp(lr_fastx.cores.data(), lr_bam.cores.data(),
@@ -767,6 +775,7 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
     remove(fa_crlf.c_str());
     remove(fq.c_str());
     remove(fq_crlf.c_str());
+    rmdir(dir_template);
     bam_destroy1(rec);
     bam_hdr_destroy(hdr);
     sam_close(fp);

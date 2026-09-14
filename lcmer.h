@@ -1051,9 +1051,9 @@ inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
 }
 
 inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
-                                    struct lps *str,
-                                    const auto &syncmer_functor,
-                                    charsi &rle_buf, pos_scratch &pos_buf) {
+                                     struct lps *str,
+                                     const auto &syncmer_functor,
+                                     charsi &rle_buf, pos_scratch &pos_buf) {
     rle_buf.require(len);
     pos_buf.require(len);
     int64_t rle_len = rle_compact(data, len, rle_buf.data, pos_buf.data);
@@ -1093,10 +1093,9 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         }
         l_so_far += s.len;
     }
-    return parse1_rle_syncmers(rle_data.data(), rle_pos.data(),
-                               static_cast<int64_t>(rle_data.size()),
-                               static_cast<int64_t>(total_len), str,
-                               syncmer_functor);
+    return parse1_rle_syncmers(
+        rle_data.data(), rle_pos.data(), static_cast<int64_t>(rle_data.size()),
+        static_cast<int64_t>(total_len), str, syncmer_functor);
 }
 
 inline void prepare_lps(lps *lps_ptr, size_t len) {
@@ -1138,18 +1137,17 @@ inline void init_lps_crumbled(lps *lps_ptr,
 }
 
 inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
-                                        int lcp_level, lps *str,
-                                        const auto &syncmer_functor,
-                                        charsi &chs, lcp_read &lr,
-                                        pos_scratch &pos_buf,
-                                        bool reversed = false) {
+                                     int lcp_level, lps *str,
+                                     const auto &syncmer_functor, charsi &chs,
+                                     lcp_read &lr, pos_scratch &pos_buf,
+                                     bool reversed = false) {
     chs.require(len);
     pos_buf.require(len);
     prepare_lps(str, len);
     if (reversed) {
         onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
         str->size = parse1_2bit_syncmers(chs.data, len, str, syncmer_functor,
-                                        chs, pos_buf);
+                                         chs, pos_buf);
     } else {
         int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
         str->size = parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len,

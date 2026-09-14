@@ -76,8 +76,9 @@ inline input_format detect_input_format(const std::string &path) {
     const int rc = hts_detect_format(hf, &fmt);
     if (hclose(hf) != 0 || rc < 0) return input_format::invalid;
     if (fmt.format == fasta_format || fmt.format == fastq_format) {
-        return fmt.compression == no_compression ? input_format::fastx_plain
-                                                 : input_format::fastx_compressed;
+        return fmt.compression == no_compression
+                   ? input_format::fastx_plain
+                   : input_format::fastx_compressed;
     }
     return input_format::htslib;
 }
@@ -89,7 +90,7 @@ class fastx_source {
     int fd_ = -1;
     BGZF *bgz_ = nullptr;
 
-public:
+   public:
     fastx_source() = default;
     fastx_source(const fastx_source &) = delete;
     fastx_source &operator=(const fastx_source &) = delete;
@@ -176,85 +177,136 @@ class fastx_reader {
         ++len;
     }
 
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+    using vec_t = uint8x16_t;
+    using half_t = uint8x8_t;
+    static inline vec_t vload(const uint8_t *p) { return vld1q_u8(p); }
+    // 0xFF in every lane holding one of ACGTacgt, 0x00 elsewhere.
+    static inline vec_t acgt_mask(vec_t v) {
+        const vec_t lower = vorrq_u8(v, vdupq_n_u8(0x20));
+        return vorrq_u8(vorrq_u8(vceqq_u8(lower, vdupq_n_u8('a')),
+                                 vceqq_u8(lower, vdupq_n_u8('c'))),
+                        vorrq_u8(vceqq_u8(lower, vdupq_n_u8('g')),
+                                 vceqq_u8(lower, vdupq_n_u8('t'))));
+    }
+    static inline bool all_acgt(vec_t v) {
+        return vminvq_u8(acgt_mask(v)) == 0xFF;
+    }
+    static inline bool all_acgt(vec_t a, vec_t b) {
+        return vminvq_u8(vandq_u8(acgt_mask(a), acgt_mask(b))) == 0xFF;
+    }
+    // 16 ASCII ACGT bases -> 8 packed nt16 bytes. (c >> 1) & 3 maps A/C/T/G
+    // (either case) to 0/1/2/3; the table turns that into the one-hot nibble.
+    static inline half_t pack16(vec_t v) {
+        static const uint8_t code2nib[16] = {1, 2, 8, 4, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0};
+        const vec_t nib = vqtbl1q_u8(vld1q_u8(code2nib),
+                                     vandq_u8(vshrq_n_u8(v, 1), vdupq_n_u8(3)));
+        const vec_t hi = vuzp1q_u8(nib, nib);  // even bases
+        const vec_t lo = vuzp2q_u8(nib, nib);  // odd bases
+        return vget_low_u8(vorrq_u8(vshlq_n_u8(hi, 4), lo));
+    }
+    static inline void store8(uint8_t *dst, half_t v) { vst1_u8(dst, v); }
+    static inline void store16(uint8_t *dst, half_t a, half_t b) {
+        vst1q_u8(dst, vcombine_u8(a, b));
+    }
+#define LASM_FASTX_SIMD 1
+#elif defined(__SSSE3__)
+    using vec_t = __m128i;
+    using half_t = __m128i;  // low 8 bytes significant
+    static inline vec_t vload(const uint8_t *p) {
+        return _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
+    }
+    static inline vec_t acgt_mask(vec_t v) {
+        const vec_t lower = _mm_or_si128(v, _mm_set1_epi8(0x20));
+        return _mm_or_si128(
+            _mm_or_si128(_mm_cmpeq_epi8(lower, _mm_set1_epi8('a')),
+                         _mm_cmpeq_epi8(lower, _mm_set1_epi8('c'))),
+            _mm_or_si128(_mm_cmpeq_epi8(lower, _mm_set1_epi8('g')),
+                         _mm_cmpeq_epi8(lower, _mm_set1_epi8('t'))));
+    }
+    static inline bool all_acgt(vec_t v) {
+        return _mm_movemask_epi8(acgt_mask(v)) == 0xFFFF;
+    }
+    static inline bool all_acgt(vec_t a, vec_t b) {
+        return _mm_movemask_epi8(_mm_and_si128(acgt_mask(a), acgt_mask(b))) ==
+               0xFFFF;
+    }
+    static inline half_t pack16(vec_t v) {
+        static const uint8_t code2nib[16] = {1, 2, 8, 4, 0, 0, 0, 0,
+                                             0, 0, 0, 0, 0, 0, 0, 0};
+        const vec_t lut =
+            _mm_loadu_si128(reinterpret_cast<const __m128i *>(code2nib));
+        // Gather even / odd lanes into the low 8 bytes.
+        const vec_t even_idx = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1, -1,
+                                             -1, -1, -1, -1, -1, -1);
+        const vec_t odd_idx = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1, -1,
+                                            -1, -1, -1, -1, -1, -1);
+        const vec_t nib = _mm_shuffle_epi8(
+            lut, _mm_and_si128(_mm_srli_epi16(v, 1), _mm_set1_epi8(3)));
+        const vec_t hi = _mm_shuffle_epi8(nib, even_idx);
+        const vec_t lo = _mm_shuffle_epi8(nib, odd_idx);
+        // Nibbles are <= 8, so the 16-bit shift cannot carry across bytes.
+        return _mm_or_si128(_mm_slli_epi16(hi, 4), lo);
+    }
+    static inline void store8(uint8_t *dst, half_t v) {
+        _mm_storel_epi64(reinterpret_cast<__m128i *>(dst), v);
+    }
+    static inline void store16(uint8_t *dst, half_t a, half_t b) {
+        _mm_storeu_si128(reinterpret_cast<__m128i *>(dst),
+                         _mm_unpacklo_epi64(a, b));
+    }
+#define LASM_FASTX_SIMD 1
+#endif
+
     // Packs [p, q) of ASCII bases onto the end of `rec`, dropping any byte at
     // or below ' ' (CR, LF, spaces, tabs). This is the hot loop of the reader:
-    // at ~1 byte per base it, not the I/O, bounds throughput, hence the SIMD
-    // block for the overwhelmingly common case (16 plain ACGT bases landing on
-    // an even base offset).
-    static void pack_bases(seq_record &rec, const uint8_t *p, const uint8_t *q) {
+    // it, not the I/O, bounds throughput. Plain ACGT runs go 32 bases per
+    // iteration through SIMD; any window containing whitespace, N or IUPAC
+    // codes is packed one base at a time and the vector loop resumes after it.
+    static void pack_bases(seq_record &rec, const uint8_t *p,
+                           const uint8_t *q) {
         rec.reserve_bases(rec.len + static_cast<uint32_t>(q - p));
         uint8_t *dst = rec.nibbles;
         uint32_t len = rec.len;
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-        // (c >> 1) & 3 maps A/C/T/G (either case) to 0/1/2/3; the table turns
-        // that into the nt16 one-hot nibble.
-        static const uint8_t code2nib[16] = {1, 2, 8, 4, 0, 0, 0, 0,
-                                             0, 0, 0, 0, 0, 0, 0, 0};
-        const uint8x16_t lut = vld1q_u8(code2nib);
-        while ((len & 1) == 0 && q - p >= 16) {
-            const uint8x16_t v = vld1q_u8(p);
-            const uint8x16_t lower = vorrq_u8(v, vdupq_n_u8(0x20));
-            const uint8x16_t ok = vorrq_u8(
-                vorrq_u8(vceqq_u8(lower, vdupq_n_u8('a')),
-                         vceqq_u8(lower, vdupq_n_u8('c'))),
-                vorrq_u8(vceqq_u8(lower, vdupq_n_u8('g')),
-                         vceqq_u8(lower, vdupq_n_u8('t'))));
-            if (vminvq_u8(ok) != 0xFF) {
-                // Whitespace, N, or IUPAC in this window: pack it one base at
-                // a time, then resume the vector loop.
-                const uint8_t *stop = p + 16;
-                for (; p != stop; ++p) {
-                    if (*p > ' ') pack_one(dst, len, *p);
-                }
-                continue;
-            }
-            const uint8x16_t code =
-                vandq_u8(vshrq_n_u8(v, 1), vdupq_n_u8(3));
-            const uint8x16_t nib = vqtbl1q_u8(lut, code);
-            const uint8x16_t hi = vuzp1q_u8(nib, nib);  // even bases
-            const uint8x16_t lo = vuzp2q_u8(nib, nib);  // odd bases
-            vst1_u8(dst + (len >> 1),
-                    vget_low_u8(vorrq_u8(vshlq_n_u8(hi, 4), lo)));
-            len += 16;
-            p += 16;
+#ifdef LASM_FASTX_SIMD
+        // Vector stores need an even base offset (whole output bytes); pack
+        // one base scalar to get there.
+        while ((len & 1) && p != q) {
+            if (*p > ' ') pack_one(dst, len, *p);
+            ++p;
         }
-#elif defined(__SSSE3__)
-        static const uint8_t code2nib[16] = {1, 2, 8, 4, 0, 0, 0, 0,
-                                             0, 0, 0, 0, 0, 0, 0, 0};
-        const __m128i lut =
-            _mm_loadu_si128(reinterpret_cast<const __m128i *>(code2nib));
-        // Gather the even / odd lanes of the nibble vector into the low 8
-        // bytes so a single 64-bit store emits 16 packed bases.
-        const __m128i even_idx = _mm_setr_epi8(0, 2, 4, 6, 8, 10, 12, 14, -1,
-                                               -1, -1, -1, -1, -1, -1, -1);
-        const __m128i odd_idx = _mm_setr_epi8(1, 3, 5, 7, 9, 11, 13, 15, -1,
-                                              -1, -1, -1, -1, -1, -1, -1);
-        while ((len & 1) == 0 && q - p >= 16) {
-            const __m128i v =
-                _mm_loadu_si128(reinterpret_cast<const __m128i *>(p));
-            const __m128i lower = _mm_or_si128(v, _mm_set1_epi8(0x20));
-            const __m128i ok = _mm_or_si128(
-                _mm_or_si128(_mm_cmpeq_epi8(lower, _mm_set1_epi8('a')),
-                             _mm_cmpeq_epi8(lower, _mm_set1_epi8('c'))),
-                _mm_or_si128(_mm_cmpeq_epi8(lower, _mm_set1_epi8('g')),
-                             _mm_cmpeq_epi8(lower, _mm_set1_epi8('t'))));
-            if (_mm_movemask_epi8(ok) != 0xFFFF) {
-                const uint8_t *stop = p + 16;
-                for (; p != stop; ++p) {
-                    if (*p > ' ') pack_one(dst, len, *p);
-                }
-                continue;
+        auto scalar16 = [&]() {
+            const uint8_t *stop = p + 16;
+            for (; p != stop; ++p) {
+                if (*p > ' ') pack_one(dst, len, *p);
             }
-            const __m128i code =
-                _mm_and_si128(_mm_srli_epi16(v, 1), _mm_set1_epi8(3));
-            const __m128i nib = _mm_shuffle_epi8(lut, code);
-            const __m128i hi = _mm_shuffle_epi8(nib, even_idx);
-            const __m128i lo = _mm_shuffle_epi8(nib, odd_idx);
-            // Nibbles are <= 8, so the 16-bit shift cannot carry across bytes.
-            _mm_storel_epi64(reinterpret_cast<__m128i *>(dst + (len >> 1)),
-                             _mm_or_si128(_mm_slli_epi16(hi, 4), lo));
-            len += 16;
-            p += 16;
+        };
+        while ((len & 1) == 0 && q - p >= 32) {
+            const vec_t a = vload(p);
+            const vec_t b = vload(p + 16);
+            if (all_acgt(a, b)) {
+                store16(dst + (len >> 1), pack16(a), pack16(b));
+                len += 32;
+                p += 32;
+            } else if (all_acgt(a)) {
+                store8(dst + (len >> 1), pack16(a));
+                len += 16;
+                p += 16;
+                scalar16();
+            } else {
+                scalar16();
+            }
+        }
+        while ((len & 1) == 0 && q - p >= 16) {
+            const vec_t a = vload(p);
+            if (all_acgt(a)) {
+                store8(dst + (len >> 1), pack16(a));
+                len += 16;
+                p += 16;
+            } else {
+                scalar16();
+            }
         }
 #endif
         for (; p != q; ++p) {
@@ -265,7 +317,7 @@ class fastx_reader {
         rec.len = len;
     }
 
-public:
+   public:
     // `block_size` is a tuning/testing knob: record boundaries are handled
     // incrementally, so any positive size parses identically.
     explicit fastx_reader(size_t block_size = FASTX_BLOCK_SIZE)
@@ -327,8 +379,9 @@ public:
                         // comment after it is discarded.
                         size_t w = pos_;
                         while (w < stop && base[w] > ' ') ++w;
-                        name_.append(reinterpret_cast<const char *>(base + pos_),
-                                     w - pos_);
+                        name_.append(
+                            reinterpret_cast<const char *>(base + pos_),
+                            w - pos_);
                         if (w < stop) name_done_ = true;
                     }
                     if (!nl) {

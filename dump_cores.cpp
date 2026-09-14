@@ -1,17 +1,18 @@
-#include <CLI/CLI.hpp>
+#include "dump_cores.h"
+
 #include <inttypes.h>
 #include <stdint.h>
 
+#include <CLI/CLI.hpp>
 #include <cstdio>
 #include <string>
 #include <vector>
 
 #include "asm.h"
-#include "dump_cores.h"
 #include "ext/lcptools/lcptools_ho.h"
+#include "fastx.h"
 #include "lcmer.h"
 #include "syncmer.h"
-#include "fastx.h"
 
 static input_format dump_input_format(const std::string &path) {
     const input_format f = detect_input_format(path);
@@ -63,7 +64,7 @@ static int run_dump_cores(const std::string &input_path,
     while (reader.next(rec)) {
         lcp_read lr;
         parse_cores_from_nibbles(rec.nibbles, rec.len, lcp_level, &str,
-                                    syncmer_functor, chs, lr, pos_buf);
+                                 syncmer_functor, chs, lr, pos_buf);
 
         for (size_t i = 0; i < lr.cores.size(); ++i) {
             fprintf(out, "%s\t%u\t%zu\t%" PRIu32 "\t%u\t%u\t%u\n",
