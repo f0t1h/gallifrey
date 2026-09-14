@@ -54,20 +54,17 @@ cmake --build build-prof -j
 
 ## Input
 
-`lasm hifi` accepts one or more positional read files. The format of each file
-is detected from its content, not its name:
+`lasm hifi` accepts one or more read files. Supported formats:
 
-- BAM/CRAM/SAM go through htslib (`-@/--io-threads` controls its decompression
-  threads).
-- FASTA/FASTQ, plain or gzipped, go through a native reader that scans blocks
-  and packs bases directly into the 4-bit layout the core parser consumes,
-  skipping htslib's per-record `bam1_t` rebuild and quality array (~1.9x faster
-  on uncompressed FASTQ). Gzipped FASTX is inflated by htslib's BGZF layer.
+- BAM, CRAM, SAM (unmapped reads are fine; CRAM with mapped reads needs the reference available to htslib)
+- FASTA and FASTQ, plain or gzipped
 
-Mixing formats in one invocation is supported.
+The format is detected from the file content, so any file name works. Read
+names and quality values are ignored; only sequences are used. Different
+formats can be mixed in one invocation.
 
 ```bash
-lasm hifi <input1.bam|fq|fa[.gz]> [input2 ...] -o output.gfa -l <lcp_level> --density <kmer_density>
+lasm hifi <reads1> [reads2 ...] -o output.gfa -l <lcp_level> --density <kmer_density>
 ```
 
 ## Basic Usage
@@ -114,7 +111,7 @@ Core assembly controls:
 Parallelism:
 
 - `-t, --threads`: worker thread count
-- `-@, --io-threads`: HTSlib decompression thread count per file reader
+- `-@, --io-threads`: decompression thread count per input file (BAM/CRAM/SAM and gzipped FASTA/FASTQ; no effect on uncompressed FASTA/FASTQ)
 - `--file-reading-mode`: `sequential` or `parallel`
 
 Graph cleaning:
