@@ -823,7 +823,7 @@ build_layout_sequence_from_nodes(
     gtl::flat_hash_map<size_t, lcp_read> contig_lr;
     gtl::vector<size_t> contig_order;
     contig_order.reserve(sorted_idx.size());
-    lps lps_buf = {0, 0, 0, 0};
+    core_buf lps_buf;
     // --strict-layout-labels: per-contig homopolymer-compressed core
     // fingerprints, indexed like `nodes`.
     gtl::vector<gtl::vector<u64>> core_fps;
@@ -870,7 +870,6 @@ build_layout_sequence_from_nodes(
         std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
                      " SKIPPED: no contigs with cores\n",
                      static_cast<uint64_t>(layout_idx));
-        free_lps(&lps_buf);
         return {};
     }
 
@@ -889,7 +888,6 @@ build_layout_sequence_from_nodes(
         std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
                      " SKIPPED: SCD graph empty\n",
                      static_cast<uint64_t>(layout_idx));
-        free_lps(&lps_buf);
         return {};
     }
 
@@ -901,7 +899,6 @@ build_layout_sequence_from_nodes(
         comp_paths, node_contigs, contig_core_seqs, scd.size());
 
 
-    free_lps(&lps_buf);
     return result;
 }
 // One SCD component's sequences …
@@ -1666,12 +1663,11 @@ struct EndJoin {
         }
         const int level = std::max(1, as.lcp_level - 1);
         parallel_for(ends.size(), threads, [&](size_t i) {
-            lps str = {0, 0, 0, 0};
+            core_buf str;
             ends[i].tail_cores = AssemblerT::build_lr_cores(
                 ends[i].tail, as.syncmer_functor, level, str);
             ends[i].tail_rc_cores = AssemblerT::build_lr_cores(
                 ends[i].tail_rc, as.syncmer_functor, level, str);
-            free_lps(&str);
         });
         return ends;
     }

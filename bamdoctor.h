@@ -89,14 +89,16 @@ inline int run_sam_read_testing(const std::string &input, int threads,
         sr_params, kDefaultRandomSeed};
     // Per-worker scratch (charsi/pos_scratch) is passed as arguments, not
     // captured, so the shared job closure stays race-free.
-    auto job = [&]() -> std::function<int(bam1_t *, lps *, charsi &, pos_scratch &)> {
+    auto job = [&]()
+        -> std::function<int(bam1_t *, core_buf *, charsi &, pos_scratch &)> {
         if (job_type == "read_count"){
-            return [](bam1_t *, lps *, charsi &, pos_scratch &) -> int {
+            return [](bam1_t *, core_buf *, charsi &, pos_scratch &) -> int {
                 return 1;
             };
         }
         else if (job_type == "core_count"){
-            return [&, lcp_level](bam1_t *bamdata, lps *str, charsi &chs, pos_scratch &pos_buf) -> int {
+            return [&, lcp_level](bam1_t *bamdata, core_buf *str, charsi &chs,
+                                  pos_scratch &pos_buf) -> int {
                 lcp_read lr;
                 lr.clear();
                 parse_cores_from_nibbles(bam_get_seq(bamdata), bamdata->core.l_qseq, lcp_level, str, sr, chs, lr, pos_buf);
@@ -107,7 +109,7 @@ inline int run_sam_read_testing(const std::string &input, int threads,
                 return (int)lr.cores.size();
             };
         }
-        return [](bam1_t *, lps *, charsi &, pos_scratch &) -> int {
+        return [](bam1_t *, core_buf *, charsi &, pos_scratch &) -> int {
             return 0;
         };
     }();
@@ -115,7 +117,7 @@ inline int run_sam_read_testing(const std::string &input, int threads,
     for(int i = 0; i < threads; ++i){
         workers.emplace_back([&, i](){
             bam1_t *bamdata = NULL;
-            lps str = {0, 0, 0, nullptr};
+            core_buf str;
             charsi chs;
             pos_scratch pos_buf;
             while(!done.load() || data_queue.size_approx() > 0){
@@ -128,9 +130,6 @@ inline int run_sam_read_testing(const std::string &input, int threads,
                 if(!recycle_queue.try_enqueue(bamdata)){
                     bam_destroy1(bamdata);
                 }
-            }
-            if(str.cores != nullptr){
-                free_lps(&str);
             }
         });
     }

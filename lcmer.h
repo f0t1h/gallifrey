@@ -24,16 +24,6 @@
 #include "syncmer.h"
 using SequenceContainerType = CrumbledSubSeq64;
 
-struct lcp_bit_type {
-    uint64_t hi;
-    uint64_t lo;
-
-    lcp_bit_type(uint64_t hi, uint64_t lo) : hi(hi), lo(lo) {}
-    constexpr operator uint64_t() const { return hi | lo; }
-#ifdef BITREP128bit
-    constexpr operator decltype(core::bit_rep)() const { return {hi, lo}; }
-#endif
-};
 // Makes sure we have enough scratch space
 template <class T, double GF = 2, size_t ALIGN_BLOCK_BITS = 5>
 struct charsi_base {
@@ -115,6 +105,38 @@ struct lcp_read {
         cores.clear();
         pos.clear();
         data = NULL;
+    }
+};
+
+// Cores of one LCP level (lcptools lps_soa), owning its arrays. Level-1
+// cores are the selected k-mers: label = k-mer code, span = start | end << 32
+// in base coordinates.
+struct core_buf : lps_soa {
+    core_buf() { lps_soa_init(this); }
+    ~core_buf() { lps_soa_free(this); }
+    core_buf(const core_buf &) = delete;
+    core_buf &operator=(const core_buf &) = delete;
+    uint32_t start(int64_t i) const { return static_cast<uint32_t>(span[i]); }
+    uint32_t end(int64_t i) const {
+        return static_cast<uint32_t>(span[i] >> 32);
+    }
+    // Room for n cores; grows by at least 1.5x so per-read calls stay rare.
+    void reserve(int64_t n) {
+        if (n <= capacity) return;
+        if (lps_soa_reserve(this, std::max(n, capacity + capacity / 2)) != 0) {
+            fprintf(stderr, "core_buf: out of memory\n");
+            abort();
+        }
+    }
+    // Deepens level-1 k-mer cores of `syncmer_functor` to lcp_level.
+    void deepen(const auto &syncmer_functor, int lcp_level) {
+        lps_soa_deepen(this, 2 * static_cast<int>(syncmer_functor.k()),
+                       lcp_level);
+    }
+    void append_to(lcp_read &lr) const {
+        lr.cores.insert(lr.cores.end(), label, label + size);
+        for (int64_t i = 0; i < size; ++i)
+            lr.pos.emplace_back(start(i), end(i));
     }
 };
 
@@ -449,16 +471,6 @@ struct KmerViewOnBytes {
 
     constexpr int_type get() const noexcept { return value; }
 };
-
-template <typename _T, int WIDTH = 2>
-void init_core_kmer(struct core *cr, _T Kval, uint64_t si, uint64_t ei, int k) {
-    cr->start = si;
-    cr->end = ei;
-    cr->label = 0;
-    cr->label |= Kval;
-    cr->bit_size = WIDTH * k;
-    cr->bit_rep = lcp_bit_type{0x8000000000000000, cr->label};
-}
 
 uint8_t *onehotto2bitDNA(const uint8_t *data, size_t len);
 // uint8_t *onehotto2bitDNA_bivec(const uint8_t *data, size_t len);
@@ -876,10 +888,13 @@ inline uint64_t sel_mask64(const uint8_t *s) {
 #endif
 }
 
+// Level-1 cores of an RLE stream into str (resets it): the selected k-mers.
 inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
                                     const uint32_t *rle_pos, int64_t rle_len,
-                                    int64_t seq_len, struct lps *str,
+                                    int64_t seq_len, core_buf *str,
                                     const auto &syncmer_functor) {
+    str->level = 1;
+    str->size = 0;
     const auto k = syncmer_functor.k();
     if (rle_len < k) return 0;
 
@@ -897,46 +912,34 @@ inline uint64_t parse1_rle_syncmers(const uint8_t *rle_data,
     syncmer_functor.select_live(rle_data, rle_len, scratch);
     const uint8_t *q = scratch.codes();
     const uint32_t kmask = static_cast<uint32_t>((1ULL << (2 * k)) - 1);
-    // Room for the selected k-mers only (a fraction of the windows); growing
-    // by 1.5x keeps reallocations rare across reads.
+    // Room for exactly the selected k-mers (a fraction of the windows).
     int64_t selected = 0;
     for (int64_t base = 0; base < rle_len; base += kBlock)
         selected += std::popcount(sel_mask64(sel + base));
-    if (str->capacity <=
-        selected) {  // init_lps_crumbled asserts size < capacity
-        const int64_t newcap =
-            std::max<int64_t>(selected + 1, str->capacity + str->capacity / 2);
-        struct core *p =
-            (struct core *)realloc(str->cores, newcap * sizeof(struct core));
-        if (p == nullptr) {
-            fprintf(stderr, "parse1_rle_syncmers: out of memory\n");
-            abort();
-        }
-        str->cores = p;
-        str->capacity = static_cast<int>(newcap);
-    }
-    int core_index = 0;
-    auto *cores = str->cores;
+    str->reserve(selected);
+    int64_t core_index = 0;
+    uint32_t *label = str->label;
+    uint64_t *span = str->span;
     for (int64_t base = 0; base < rle_len; base += kBlock) {
         uint64_t mask = sel_mask64(sel + base);
         while (mask) {
             const int64_t e = base + std::countr_zero(mask);
             mask &= mask - 1;
-            const uint32_t value = syncmer::live_code(q, e, kmask);
             const uint32_t si = rle_pos[e - k + 1];
             const uint32_t ei = (e + 1 < rle_len)
                                     ? rle_pos[e + 1]
                                     : static_cast<uint32_t>(seq_len);
-            init_core_kmer<uint32_t>(&(cores[core_index]), value, si, ei, k);
+            label[core_index] = syncmer::live_code(q, e, kmask);
+            span[core_index] = si | static_cast<uint64_t>(ei) << 32;
             core_index++;
         }
     }
+    str->size = core_index;
     return core_index;
 }
 
 inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
-                                     struct lps *str,
-                                     const auto &syncmer_functor,
+                                     core_buf *str, const auto &syncmer_functor,
                                      charsi &rle_buf, pos_scratch &pos_buf) {
     rle_buf.require(len);
     pos_buf.require(len);
@@ -945,10 +948,12 @@ inline uint64_t parse1_2bit_syncmers(const uint8_t *data, int64_t len,
                                syncmer_functor);
 }
 inline uint64_t parse1_CrumbledSubSeqs_syncmers(
-    const gtl::vector<SequenceContainerType> &sseqs, struct lps *str,
+    const gtl::vector<SequenceContainerType> &sseqs, core_buf *str,
     const auto &syncmer_functor) {
     if (sseqs.empty()) {
         fprintf(stderr, "Error: Empty sequence list\n");
+        str->level = 1;
+        str->size = 0;
         return 0;
     }
     // Materialize the RLE stream of the concatenated fragments in original
@@ -957,10 +962,11 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
     // run's base.
     size_t total_len = 0;
     for (const auto &s : sseqs) total_len += s.len;
-    gtl::vector<uint8_t> rle_data;
-    gtl::vector<uint32_t> rle_pos;
-    rle_data.reserve(total_len);
-    rle_pos.reserve(total_len);
+    charsi rle_data;
+    pos_scratch rle_pos;
+    rle_data.require(total_len);
+    rle_pos.require(total_len);
+    int64_t rle_len = 0;
     size_t l_so_far = 0;
     uint8_t prev_base = 255;
     for (const auto &s : sseqs) {
@@ -969,55 +975,24 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
             const uint8_t b =
                 KmerViewOnCrumbs64<uint64_t>::base_at(s.data, idx);
             if (b != prev_base) {
-                rle_data.push_back(b);
-                rle_pos.push_back(
-                    static_cast<uint32_t>(l_so_far + idx - s.skip_first_n));
+                rle_data.data[rle_len] = b;
+                rle_pos.data[rle_len] =
+                    static_cast<uint32_t>(l_so_far + idx - s.skip_first_n);
+                ++rle_len;
                 prev_base = b;
             }
         }
         l_so_far += s.len;
     }
-    return parse1_rle_syncmers(
-        rle_data.data(), rle_pos.data(), static_cast<int64_t>(rle_data.size()),
-        static_cast<int64_t>(total_len), str, syncmer_functor);
+    return parse1_rle_syncmers(rle_data.data, rle_pos.data, rle_len,
+                               static_cast<int64_t>(total_len), str,
+                               syncmer_functor);
 }
 
-inline void prepare_lps(lps *lps_ptr, size_t len) {
-    lps_ptr->level = 1;
-    const size_t needed = (size_t)(len / CONSTANT_FACTOR);
-    if (lps_ptr->cores == nullptr) {
-        lps_ptr->size = 0;
-        lps_ptr->capacity = (int)needed;
-        lps_ptr->cores = (struct core *)malloc(needed * sizeof(struct core));
-        if (lps_ptr->cores == nullptr && needed > 0) {
-            fprintf(stderr, "prepare_lps: out of memory\n");
-            abort();
-        }
-    } else {
-        if ((size_t)lps_ptr->capacity < needed) {
-            struct core *p = (struct core *)realloc(
-                lps_ptr->cores, needed * sizeof(struct core));
-            if (p == nullptr) {
-                fprintf(stderr, "prepare_lps: out of memory\n");
-                abort();
-            }
-            lps_ptr->cores = p;
-            lps_ptr->capacity = (int)needed;
-        }
-    }
-}
-inline void init_lps_crumbled(lps *lps_ptr,
+inline void init_lps_crumbled(core_buf *str,
                               const gtl::vector<SequenceContainerType> &sseqs,
                               const auto &syncmer_functor) {
-    size_t len = 0;
-
-    for (auto &sseq : sseqs) {
-        len += sseq.len;
-    }
-    prepare_lps(lps_ptr, len);
-    lps_ptr->size =
-        parse1_CrumbledSubSeqs_syncmers(sseqs, lps_ptr, syncmer_functor);
-    assert(lps_ptr->size < lps_ptr->capacity);
+    parse1_CrumbledSubSeqs_syncmers(sseqs, str, syncmer_functor);
 }
 
 // Complement of a BAM nibble (A<->T, C<->G, anything else N).
@@ -1061,28 +1036,22 @@ inline void revcomp_nibbles(const uint8_t *src, uint32_t len,
 }
 
 inline void parse_cores_from_nibbles(const uint8_t *data, size_t len,
-                                     int lcp_level, lps *str,
+                                     int lcp_level, core_buf *str,
                                      const auto &syncmer_functor, charsi &chs,
                                      lcp_read &lr, pos_scratch &pos_buf,
                                      bool reversed = false) {
     chs.require(len + kOnehotRlePad);
     pos_buf.require(len + kOnehotRlePad);
-    prepare_lps(str, len);
     if (reversed) {
         onehotto2bitDNA_bivec_chs_reverse(data, len, chs);
-        str->size = parse1_2bit_syncmers(chs.data, len, str, syncmer_functor,
-                                         chs, pos_buf);
+        parse1_2bit_syncmers(chs.data, len, str, syncmer_functor, chs, pos_buf);
     } else {
         int64_t rle_len = onehot_to_rle(data, len, chs.data, pos_buf.data);
-        str->size = parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len,
-                                        str, syncmer_functor);
+        parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len, str,
+                            syncmer_functor);
     }
-    lps_deepen(str, lcp_level);
-
-    for (int i = 0; i < str->size; ++i) {
-        lr.cores.emplace_back(str->cores[i].label);
-        lr.pos.emplace_back(str->cores[i].start, str->cores[i].end);
-    }
+    str->deepen(syncmer_functor, lcp_level);
+    str->append_to(lr);
     lr.data = data;
 }
 #endif

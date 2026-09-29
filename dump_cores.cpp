@@ -67,7 +67,7 @@ static int run_dump_cores(const std::string &input_path,
     }
 
     seq_record rec;
-    lps str = {0, 0, 0, nullptr};
+    core_buf str;
     charsi chs;
     pos_scratch pos_buf;
     int read_count = 0;
@@ -111,12 +111,10 @@ static int run_dump_cores(const std::string &input_path,
     if (reader.failed()) {
         fprintf(stderr, "Malformed FASTA/FASTQ input: %s\n",
                 input_path.c_str());
-        free_lps(&str);
         fclose(out);
         return 1;
     }
 
-    free_lps(&str);
     fclose(out);
     fprintf(stderr, "Processed %d reads, output written to %s\n", read_count,
             output_path.c_str());
