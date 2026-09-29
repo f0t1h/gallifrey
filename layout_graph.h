@@ -685,7 +685,7 @@ build_layout_sequence_from_nodes(
     gtl::flat_hash_map<size_t, lcp_read> contig_lr;
     gtl::vector<size_t> contig_order;
     contig_order.reserve(sorted_idx.size());
-    lps lps_buf = {0, 0, 0, 0};
+    core_buf lps_buf;
 
     for (size_t ci : sorted_idx) {
         const auto &raw = *nodes[ci].raw_seqs;
@@ -724,7 +724,6 @@ build_layout_sequence_from_nodes(
         std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
                      " SKIPPED: no contigs with cores\n",
                      static_cast<uint64_t>(layout_idx));
-        free_lps(&lps_buf);
         return {};
     }
 
@@ -740,7 +739,6 @@ build_layout_sequence_from_nodes(
         std::fprintf(stderr, "[layout-dag] layout=%" PRIu64
                      " SKIPPED: SCD graph empty\n",
                      static_cast<uint64_t>(layout_idx));
-        free_lps(&lps_buf);
         return {};
     }
 
@@ -752,7 +750,6 @@ build_layout_sequence_from_nodes(
         comp_paths, node_contigs, contig_core_seqs, scd.size());
 
 
-    free_lps(&lps_buf);
     return result;
 }
 // One SCD component's sequences …

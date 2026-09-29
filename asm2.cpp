@@ -302,7 +302,7 @@ struct assembler {
                              int lcmer_l) {
         uint64_t lcmer_index = 0;
         typename Ops::record *data_p = NULL;
-        lps str = {0, 0, 0, 0};
+        core_buf str;
         charsi chs;
         pos_scratch pos_buf;
         lcp_read lr;
@@ -328,7 +328,6 @@ struct assembler {
                 data_p = NULL;
             }
         }
-        free_lps(&str);
     }
 
     // Producer loop shared by every reader: takes a recycled record (or
@@ -581,30 +580,27 @@ struct assembler {
 
     static auto build_lr_cores(const gtl::vector<SequenceContainerType> &seqs,
                                const SyncmerType &syncmer_functor,
-                               int lcp_level, lps &str) -> lcp_read {
+                               int lcp_level, core_buf &str) -> lcp_read {
         lcp_read lr;
         lr.clear();
 
         init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        str.deepen(syncmer_functor, lcp_level);
 
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
+        str.append_to(lr);
         return lr;
     }
 
     static auto build_lr_cores_with_seqs(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+        const SyncmerType &syncmer_functor, int lcp_level, core_buf &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();
         gtl::vector<SequenceContainerType> core_seqs;
 
         init_lps_crumbled(&str, seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        str.deepen(syncmer_functor, lcp_level);
 
         if (str.size == 0 || seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
@@ -620,10 +616,10 @@ struct assembler {
 
         size_t prev_end = 0;  // End position of previous core
 
-        for (int i = 0; i < str.size; ++i) {
-            size_t cur_start = str.cores[i].start;
-            size_t cur_end = str.cores[i].end;
-            lr.cores.emplace_back(str.cores[i].label);
+        for (int64_t i = 0; i < str.size; ++i) {
+            size_t cur_start = str.start(i);
+            size_t cur_end = str.end(i);
+            lr.cores.emplace_back(str.label[i]);
             lr.pos.emplace_back(cur_start, cur_end);
 
             // Extract non-overlapping portion: [prev_end, cur_end)
@@ -684,7 +680,7 @@ struct assembler {
 
     static auto build_rev_lr_cores(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+        const SyncmerType &syncmer_functor, int lcp_level, core_buf &str)
         -> lcp_read {
         lcp_read lr;
         lr.clear();
@@ -694,18 +690,15 @@ struct assembler {
             rev_seqs.emplace_back(it->reverse_complement());
         }
         init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        str.deepen(syncmer_functor, lcp_level);
 
-        for (int i = 0; i < str.size; ++i) {
-            lr.cores.emplace_back(str.cores[i].label);
-            lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-        }
+        str.append_to(lr);
         return lr;
     }
 
     static auto build_rev_lr_cores_with_seqs(
         const gtl::vector<SequenceContainerType> &seqs,
-        const SyncmerType &syncmer_functor, int lcp_level, lps &str)
+        const SyncmerType &syncmer_functor, int lcp_level, core_buf &str)
         -> std::pair<lcp_read, gtl::vector<SequenceContainerType>> {
         lcp_read lr;
         lr.clear();
@@ -718,7 +711,7 @@ struct assembler {
         }
 
         init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-        lps_deepen(&str, lcp_level);
+        str.deepen(syncmer_functor, lcp_level);
 
         if (str.size == 0 || rev_seqs.empty()) {
             return {std::move(lr), std::move(core_seqs)};
@@ -734,10 +727,10 @@ struct assembler {
 
         size_t prev_end = 0;  // End position of previous core
 
-        for (int i = 0; i < str.size; ++i) {
-            size_t cur_start = str.cores[i].start;
-            size_t cur_end = str.cores[i].end;
-            lr.cores.emplace_back(str.cores[i].label);
+        for (int64_t i = 0; i < str.size; ++i) {
+            size_t cur_start = str.start(i);
+            size_t cur_end = str.end(i);
+            lr.cores.emplace_back(str.label[i]);
             lr.pos.emplace_back(cur_start, cur_end);
 
             // Extract non-overlapping portion: [prev_end, cur_end)
@@ -824,7 +817,7 @@ struct assembler {
                     return;
                 }
 
-                lps str = {0, 0, 0, 0};
+                core_buf str;
                 lcp_read lr;
                 // dbgi.dbg.for_each([&](auto &node) {
                 if (node.second.redirected()) {
@@ -839,16 +832,12 @@ struct assembler {
                     rev_seqs.emplace_back(it->reverse_complement());
                 }
                 init_lps_crumbled(&str, rev_seqs, syncmer_functor);
-                lps_deepen(&str, lcp_level);
+                str.deepen(syncmer_functor, lcp_level);
 
-                for (int i = 0; i < str.size; ++i) {
-                    lr.cores.emplace_back(str.cores[i].label);
-                    lr.pos.emplace_back(str.cores[i].start, str.cores[i].end);
-                }
+                str.append_to(lr);
                 if (lr.cores.size() < static_cast<size_t>(olc_lcmer_l + 1)) {
                     bad.fetch_add(1);
                     // good_n.fetch_sub(1);
-                    free_lps(&str);
                     return;
                 }
                 // Layout works in core-index space; find_lcmer_ranges returns
@@ -900,7 +889,6 @@ struct assembler {
                                             OLC_SKIP_FIRST(olc_lcmer_l) +
                                             OLC_SKIP_LAST(olc_lcmer_l)))
                     no_ranges.fetch_add(1);
-                free_lps(&str);
             },
             threads.work);
 
@@ -1164,12 +1152,11 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
         std::string(seq1) + std::string(seq2) + std::string(seq3);
 
     SUBCASE("build_lr_cores_with_seqs") {
-        lps lps_buf = {0, 0, 0, 0};
+        core_buf lps_buf;
         auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
             seqs, syncmer_functor, lcp_level, lps_buf);
         auto lr_original =
             assembler::build_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1207,12 +1194,11 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
     }
 
     SUBCASE("build_rev_lr_cores_with_seqs") {
-        lps lps_buf = {0, 0, 0, 0};
+        core_buf lps_buf;
         auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
             seqs, syncmer_functor, lcp_level, lps_buf);
         auto lr_original =
             assembler::build_rev_lr_cores(seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1263,10 +1249,9 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
     SUBCASE("core sequences span fragment boundaries correctly") {
         // Build cores from vector of 3 sequences
-        lps lps_buf = {0, 0, 0, 0};
+        core_buf lps_buf;
         auto [lr, core_seqs] = assembler::build_lr_cores_with_seqs(
             seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
 
         // Ensure we actually have cores to test
         REQUIRE(lr.cores.size() > 0);
@@ -1314,10 +1299,9 @@ TEST_CASE("build_lr_cores_with_seqs extracts correct sequences") {
 
     SUBCASE("rev: core sequences span fragment boundaries correctly") {
         // Build cores from vector of 3 sequences (reverse complemented)
-        lps lps_buf = {0, 0, 0, 0};
+        core_buf lps_buf;
         auto [lr, core_seqs] = assembler::build_rev_lr_cores_with_seqs(
             seqs, syncmer_functor, lcp_level, lps_buf);
-        free_lps(&lps_buf);
 
         // Build reverse-complemented concatenated reference
         gtl::vector<SequenceContainerType> rev_seqs;
@@ -2036,9 +2020,9 @@ TEST_CASE("Live syncmer selection matches the per-k-mer rule") {
             pos[i] = static_cast<uint32_t>(2 * i);
         }
         const int64_t seq_len = 2 * n + 1;
-        lps str = {0, 0, 0, nullptr};
-        // got/c are read only by asserts, which DOCTEST_CONFIG_DISABLE (the
-        // lasm target) compiles away.
+        core_buf str;
+        // got is read only by asserts, which DOCTEST_CONFIG_DISABLE (the lasm
+        // target) compiles away.
         [[maybe_unused]] const uint64_t got =
             parse1_rle_syncmers(rle.data(), pos.data(), n, seq_len, &str, rule);
         uint64_t want = 0;
@@ -2050,15 +2034,13 @@ TEST_CASE("Live syncmer selection matches the per-k-mer rule") {
                 !rule.is_submer(static_cast<uint32_t>(v)))
                 continue;
             REQUIRE(want < got);
-            [[maybe_unused]] const core &c = str.cores[want];
-            CHECK(c.label == v);
-            CHECK(c.start == pos[e - k + 1]);
-            CHECK(c.end == ((e + 1 < n) ? pos[e + 1] : seq_len));
+            CHECK(str.label[want] == v);
+            CHECK(str.start(want) == pos[e - k + 1]);
+            CHECK(str.end(want) == ((e + 1 < n) ? pos[e + 1] : seq_len));
             ++want;
         }
         CHECK(got == want);
         CHECK(want > 0);
-        free(str.cores);
     };
     for (unsigned k : {5u, 8u, 11u, 16u}) {
         for (unsigned s : {1u, 2u, 3u, 4u, 6u, 9u, 12u}) {

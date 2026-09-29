@@ -336,8 +336,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
     SUBCASE(
         "Compare two windowing functions to see if they produce the same "
         "lcmers") {
-        lps str1 = {0, 0, 0, nullptr};
-        lps str2 = {0, 0, 0, nullptr};
+        core_buf str1;
+        core_buf str2;
         using SYNCMER_HASHER = syncmer::MurMur;
         using SyncmerType =
             syncmer::GenericSubmerRule<uint32_t, SYNCMER_HASHER>;
@@ -360,11 +360,8 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
         init_lps_crumbled(&str2, ss, fnctr);
         // Deepen to the same level as the read path (parse_cores_from_nibbles
         // deepens internally); comparing different levels is meaningless.
-        lps_deepen(&str2, LCP_LEVEL);
-        for (int i = 0; i < str2.size; ++i) {
-            lr2.cores.emplace_back(str2.cores[i].label);
-            lr2.pos.emplace_back(str2.cores[i].start, str2.cores[i].end);
-        }
+        str2.deepen(fnctr, LCP_LEVEL);
+        str2.append_to(lr2);
         REQUIRE(lr.cores.size() == lr2.cores.size());
         for (size_t i = 0; i < lr.cores.size(); ++i) {
             INFO("core index ", i);
@@ -372,8 +369,6 @@ TEST_CASE("BAM Read Parsing With Crumbs") {
             CHECK(lr.pos[i].first == lr2.pos[i].first);
             CHECK(lr.pos[i].second == lr2.pos[i].second);
         }
-        free(str1.cores);
-        free(str2.cores);
     }
 
     bam_destroy1(rec);
@@ -419,8 +414,8 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
     spara.smer.s = 2;  // closed syncmer: selects ~2/5 of the windows
     SyncmerType fnctr(spara, 7);
 
-    lps str1 = {0, 0, 0, nullptr};
-    lps str2 = {0, 0, 0, nullptr};
+    core_buf str1;
+    core_buf str2;
     charsi chs;
     pos_scratch pos_buf;
     lcp_read lr;
@@ -432,10 +427,7 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
                     CrumbledSubSeq64::from_ascii{});
     lcp_read lr2;
     init_lps_crumbled(&str2, ss, fnctr);
-    for (int i = 0; i < str2.size; ++i) {
-        lr2.cores.emplace_back(str2.cores[i].label);
-        lr2.pos.emplace_back(str2.cores[i].start, str2.cores[i].end);
-    }
+    str2.append_to(lr2);
 
     REQUIRE(!lr.cores.empty());
     REQUIRE(lr.cores.size() == lr2.cores.size());
@@ -453,8 +445,62 @@ TEST_CASE("BAM and crumbled parsers agree on homopolymer-rich sequence") {
         CHECK(lr.pos[i].second - lr.pos[i].first >=
               static_cast<uint64_t>(spara.k));
     }
-    free(str1.cores);
-    free(str2.cores);
+}
+
+TEST_CASE("core_buf deepening matches lcptools lps_deepen on a read") {
+    samFile *fp = sam_open(kTestSingleBam, "r");
+    REQUIRE_MESSAGE(fp != NULL, "Failed to open BAM file: ", kTestSingleBam);
+    bam_hdr_t *hdr = sam_hdr_read(fp);
+    bam1_t *rec = bam_init1();
+    REQUIRE(sam_read1(fp, hdr, rec) > 0);
+    const uint8_t *seq = bam_get_seq(rec);
+    const int64_t len = rec->core.l_qseq;
+
+    using SyncmerType = syncmer::GenericSubmerRule<uint32_t, syncmer::MurMur>;
+    for (int k : {6, 11, 16}) {
+        decltype(asm_config::syncmer) spara;
+        spara.k = k;
+        spara.apply_default_rule();
+        SyncmerType fnctr(spara, 1453);
+        charsi chs;
+        pos_scratch pos_buf;
+        chs.require(len + kOnehotRlePad);
+        pos_buf.require(len + kOnehotRlePad);
+        const int64_t rle_len = onehot_to_rle(seq, len, chs.data, pos_buf.data);
+        for (int level : {2, 3, 4, 5, 6}) {
+            INFO("k ", k, " level ", level);
+            core_buf got;
+            parse1_rle_syncmers(chs.data, pos_buf.data, rle_len, len, &got,
+                                fnctr);
+            REQUIRE(got.size > 100);
+            // Reference: the same level-1 k-mer cores as struct core.
+            struct lps ref;
+            ref.level = 1;
+            ref.size = static_cast<int>(got.size);
+            ref.capacity = ref.size;
+            ref.cores = (struct core *)malloc(ref.size * sizeof(struct core));
+            for (int i = 0; i < ref.size; ++i)
+                init_core4(&ref.cores[i], 2 * k,
+                           0x8000000000000000ULL | got.label[i], got.label[i],
+                           got.start(i), got.end(i));
+            lps_deepen(&ref, level);
+            got.deepen(fnctr, level);
+            REQUIRE(got.level == ref.level);
+            REQUIRE(got.size == ref.size);
+            for (int i = 0; i < ref.size; ++i) {
+                INFO("core ", i);
+                CHECK(got.label[i] == ref.cores[i].label);
+                CHECK(got.start(i) == ref.cores[i].start);
+                CHECK(got.end(i) == ref.cores[i].end);
+                CHECK(got.bit_rep[i] == ref.cores[i].bit_rep);
+                CHECK(got.bit_size[i] == ref.cores[i].bit_size);
+            }
+            free(ref.cores);
+        }
+    }
+    bam_destroy1(rec);
+    bam_hdr_destroy(hdr);
+    sam_close(fp);
 }
 
 // Reference scalar-only two-pass: decode then RLE.
@@ -758,8 +804,8 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
         seq_record sr;
         REQUIRE(reader.next(sr));
 
-        lps str1 = {0, 0, 0, nullptr};
-        lps str2 = {0, 0, 0, nullptr};
+        core_buf str1;
+        core_buf str2;
         charsi chs1, chs2;
         pos_scratch pos1, pos2;
         lcp_read lr_bam, lr_fastx;
@@ -774,8 +820,6 @@ TEST_CASE("FASTX reader agrees with the htslib path") {
                         lr_bam.cores.size() * sizeof(uint32_t)),
                  0);
         CHECK(lr_fastx.pos == lr_bam.pos);
-        free_lps(&str1);
-        free_lps(&str2);
         free(sr.nibbles);
     }
 
