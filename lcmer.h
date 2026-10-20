@@ -13,11 +13,17 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <gtl/vector.hpp>
 #include <iterator>
 #include <string>
 #include <type_traits>
+#include <utility>
+
+#include <sys/mman.h>
 
 #include "ext/lcptools/lcptools_ho.h"
 #include "nibble2base.hpp"
@@ -108,25 +114,110 @@ struct lcp_read {
     }
 };
 
-// Cores of one LCP level (lcptools lps_soa), owning its arrays. Level-1
-// cores are the selected k-mers: label = k-mer code, span = start | end << 32
-// in base coordinates.
+// One allocation holding a parse's scratch arrays, 64-byte aligned. Large
+// slabs are mapped directly, so releasing one returns its memory to the OS at
+// once; from malloc they would come from the arenas, which keep the freed
+// space (on CHM13 the overlap scan's parse buffers left ~1 GB more free heap
+// than main).
+struct parse_slab {
+    static constexpr size_t kMapBytes = size_t{1} << 20;
+    std::byte *p = nullptr;
+    size_t bytes = 0;
+    bool mapped = false;
+    parse_slab() = default;
+    parse_slab(const parse_slab &) = delete;
+    parse_slab &operator=(const parse_slab &) = delete;
+    ~parse_slab() { release(); }
+    // At least n bytes; the old contents are not kept.
+    std::byte *ensure(size_t n) {
+        if (n <= bytes) return p;
+        release();
+        n = (n + 63) & ~size_t{63};
+        void *q;
+        if (n >= kMapBytes) {
+            q = mmap(nullptr, n, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (q == MAP_FAILED) q = nullptr;
+            mapped = true;
+        } else {
+            q = aligned_alloc(64, n);
+            mapped = false;
+        }
+        if (q == nullptr) {
+            fprintf(stderr, "parse_slab: out of memory\n");
+            abort();
+        }
+        p = static_cast<std::byte *>(q);
+        bytes = n;
+        return p;
+    }
+    void release() {
+        if (p == nullptr) return;
+        if (mapped) {
+            munmap(p, bytes);
+        } else {
+            free(p);
+        }
+        p = nullptr;
+        bytes = 0;
+    }
+};
+
+// Cores of one LCP level (lcptools lps_soa). Level-1 cores are the selected
+// k-mers: label = k-mer code, span = start | end << 32 in base coordinates.
+// All lps_soa arrays are carved from one slab, and the run-length stream of
+// crumbled input (parse1_CrumbledSubSeqs_syncmers) lives in a second one.
 struct core_buf : lps_soa {
+    parse_slab cores_mem;
+    parse_slab rle_mem;
     core_buf() { lps_soa_init(this); }
-    ~core_buf() { lps_soa_free(this); }
     core_buf(const core_buf &) = delete;
     core_buf &operator=(const core_buf &) = delete;
     uint32_t start(int64_t i) const { return static_cast<uint32_t>(span[i]); }
     uint32_t end(int64_t i) const {
         return static_cast<uint32_t>(span[i] >> 32);
     }
-    // Room for n cores; grows by at least 1.5x so per-read calls stay rare.
+    // Room for n cores, dropping the current ones (called before a parse
+    // writes its level-1 cores); grows by at least 1.5x so per-read calls
+    // stay rare.
     void reserve(int64_t n) {
         if (n <= capacity) return;
-        if (lps_soa_reserve(this, std::max(n, capacity + capacity / 2)) != 0) {
-            fprintf(stderr, "core_buf: out of memory\n");
-            abort();
-        }
+        const int64_t c = std::max(n, capacity + capacity / 2);
+        const size_t uc = static_cast<size_t>(c);
+        const size_t words = uc / 64 + 2;  // pair masks, as lps_soa_reserve
+        auto aligned = [](size_t b) { return (b + 63) & ~size_t{63}; };
+        const size_t b32 = aligned(uc * sizeof(uint32_t));
+        const size_t b64 = aligned(uc * sizeof(uint64_t));
+        const size_t b8 = aligned(uc);
+        const size_t bcode = aligned(uc + 64);  // code has 64 bytes of padding
+        const size_t bmask = aligned(words * sizeof(uint64_t));
+        std::byte *m =
+            cores_mem.ensure(2 * b32 + 5 * b64 + 2 * b8 + bcode + 3 * bmask);
+        auto take = [&m](auto *&ptr, size_t b) {
+            ptr = reinterpret_cast<std::remove_reference_t<decltype(ptr)>>(m);
+            m += b;
+        };
+        take(label, b32);
+        take(span, b64);
+        take(bit_rep, b64);
+        take(bit_size, b8);
+        take(label_next, b32);
+        take(span_next, b64);
+        take(bit_rep_next, b64);
+        take(bit_size_next, b8);
+        take(code, bcode);
+        take(key, b64);
+        take(eq, bmask);
+        take(gt, bmask);
+        take(lt, bmask);
+        capacity = c;
+    }
+    // Run-length scratch for n bases: {bases, positions}.
+    std::pair<uint8_t *, uint32_t *> rle_scratch(size_t n) {
+        const size_t pos_bytes = (n * sizeof(uint32_t) + 63) & ~size_t{63};
+        std::byte *m = rle_mem.ensure(pos_bytes + n);
+        return {reinterpret_cast<uint8_t *>(m + pos_bytes),
+                reinterpret_cast<uint32_t *>(m)};
     }
     // Deepens level-1 k-mer cores of `syncmer_functor` to lcp_level.
     void deepen(const auto &syncmer_functor, int lcp_level) {
@@ -962,10 +1053,7 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
     // run's base.
     size_t total_len = 0;
     for (const auto &s : sseqs) total_len += s.len;
-    charsi rle_data;
-    pos_scratch rle_pos;
-    rle_data.require(total_len);
-    rle_pos.require(total_len);
+    const auto [rle_data, rle_pos] = str->rle_scratch(total_len);
     int64_t rle_len = 0;
     size_t l_so_far = 0;
     uint8_t prev_base = 255;
@@ -975,8 +1063,8 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
             const uint8_t b =
                 KmerViewOnCrumbs64<uint64_t>::base_at(s.data, idx);
             if (b != prev_base) {
-                rle_data.data[rle_len] = b;
-                rle_pos.data[rle_len] =
+                rle_data[rle_len] = b;
+                rle_pos[rle_len] =
                     static_cast<uint32_t>(l_so_far + idx - s.skip_first_n);
                 ++rle_len;
                 prev_base = b;
@@ -984,7 +1072,7 @@ inline uint64_t parse1_CrumbledSubSeqs_syncmers(
         }
         l_so_far += s.len;
     }
-    return parse1_rle_syncmers(rle_data.data, rle_pos.data, rle_len,
+    return parse1_rle_syncmers(rle_data, rle_pos, rle_len,
                                static_cast<int64_t>(total_len), str,
                                syncmer_functor);
 }
